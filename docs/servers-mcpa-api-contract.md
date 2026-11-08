@@ -227,7 +227,7 @@ Master-key rotation replaces the master key without customer-visible downtime:
 
 1. Add the new key to `MCPA_MASTER_KEYS` and set `MCPA_ACTIVE_KEY_ID` to it. Keep the old key.
 2. Restart or roll the server. New and refreshed secrets now use the new key, and both keys remain readable.
-3. Run `mcpa-api rotate-master-key`. It rewraps each data key under the active master key in bounded batches with row-level concurrency control. It does not re-encrypt payloads and does not block calls or refreshes. It is idempotent and can resume after interruption.
+3. Run `mcpa-api rotate-master-key`. It rewraps each data key under the active master key in bounded, ID-ordered batches with row-level concurrency control. It makes one final pass for rows re-sealed under an old key by concurrent writers and reports any old-key rows still present. It does not re-encrypt payloads and does not block calls or refreshes. It is idempotent and can resume after interruption.
 4. Verify that no row references the old key ID. The command reports the number of rows that still reference another key ID.
 5. Remove the old key from `MCPA_MASTER_KEYS` and restart.
 

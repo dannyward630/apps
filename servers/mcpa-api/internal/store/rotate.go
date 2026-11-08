@@ -48,16 +48,23 @@ func RotateMasterKey(ctx context.Context, s *Store, kr *crypto.Keyring, batchSiz
 	}
 	report := RotationReport{Rewrapped: map[string]int{}, Remaining: map[string]map[string]int{}}
 	for _, t := range sealedTables {
-		for {
-			n, err := rotateBatch(ctx, s, kr, t, batchSize)
-			if err != nil {
-				return report, fmt.Errorf("rotate %s: %w", t.name, err)
+		// The second pass catches rows that a concurrent writer re-sealed under
+		// an old key after the first pass had already advanced beyond their IDs.
+		// Bound the sweep to one pass; Remaining reports later races as before.
+		for pass := 0; pass < 2; pass++ {
+			lastID := uuid.Nil
+			for {
+				n, nextID, err := rotateBatch(ctx, s, kr, t, batchSize, lastID)
+				if err != nil {
+					return report, fmt.Errorf("rotate %s: %w", t.name, err)
+				}
+				if n == 0 {
+					break
+				}
+				lastID = nextID
+				report.Rewrapped[t.name] += n
+				log.Info("rewrapped data keys", "table", t.name, "rows", n, "total", report.Rewrapped[t.name], "active_key_id", kr.ActiveKeyID())
 			}
-			report.Rewrapped[t.name] += n
-			if n == 0 {
-				break
-			}
-			log.Info("rewrapped data keys", "table", t.name, "rows", n, "total", report.Rewrapped[t.name], "active_key_id", kr.ActiveKeyID())
 		}
 		remaining, err := countByKeyID(ctx, s, t.name, kr.ActiveKeyID())
 		if err != nil {
@@ -70,11 +77,11 @@ func RotateMasterKey(ctx context.Context, s *Store, kr *crypto.Keyring, batchSiz
 	return report, nil
 }
 
-func rotateBatch(ctx context.Context, s *Store, kr *crypto.Keyring, t sealedTable, batchSize int) (int, error) {
+func rotateBatch(ctx context.Context, s *Store, kr *crypto.Keyring, t sealedTable, batchSize int, after uuid.UUID) (int, uuid.UUID, error) {
 	n := 0
+	lastID := after
 	err := s.InTx(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, fmt.Sprintf(`SELECT id, %s, key_id, wrapped_key, key_nonce, nonce, ciphertext
-			FROM %s WHERE key_id <> $1 ORDER BY id LIMIT $2 FOR UPDATE`, t.resourceColumn, t.name), kr.ActiveKeyID(), batchSize)
+		rows, err := tx.Query(ctx, rotationBatchSQL(t), kr.ActiveKeyID(), batchSize, after)
 		if err != nil {
 			return err
 		}
@@ -99,6 +106,7 @@ func rotateBatch(ctx context.Context, s *Store, kr *crypto.Keyring, t sealedTabl
 				return fmt.Errorf("row %s under key %q: %w", id, sl.KeyID, err)
 			}
 			items = append(items, item{id: id, old: sl.KeyID, sealed: out})
+			lastID = id
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -113,7 +121,12 @@ func rotateBatch(ctx context.Context, s *Store, kr *crypto.Keyring, t sealedTabl
 		n = len(items)
 		return nil
 	})
-	return n, err
+	return n, lastID, err
+}
+
+func rotationBatchSQL(t sealedTable) string {
+	return fmt.Sprintf(`SELECT id, %s, key_id, wrapped_key, key_nonce, nonce, ciphertext
+		FROM %s WHERE id > $3 AND key_id <> $1 ORDER BY id LIMIT $2 FOR UPDATE`, t.resourceColumn, t.name)
 }
 
 func countByKeyID(ctx context.Context, s *Store, table, active string) (map[string]int, error) {

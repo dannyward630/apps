@@ -5,6 +5,7 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -21,6 +22,23 @@ import (
 	"github.com/delinoio/apps/servers/mcpa-api/internal/crypto"
 	"github.com/delinoio/apps/servers/mcpa-api/internal/store"
 )
+
+type resealOnRotationLog struct {
+	once      sync.Once
+	callback  func() error
+	err       error
+	triggered bool
+}
+
+func (w *resealOnRotationLog) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("table=mcp_grants")) {
+		w.once.Do(func() {
+			w.triggered = true
+			w.err = w.callback()
+		})
+	}
+	return len(p), nil
+}
 
 // openTestStore connects to the disposable TEST_DATABASE_URL database,
 // resets its schema and applies the migrations.
@@ -405,6 +423,57 @@ func TestMasterKeyRotationCoversMCPGrants(t *testing.T) {
 	plain, err := both.Open(got.Tokens, crypto.MCPGrantAAD(g.ID.String()))
 	if err != nil || string(plain) != `{"refresh_token":"rt"}` {
 		t.Fatalf("open = %q, %v", plain, err)
+	}
+}
+
+func TestRotationFinalSweepCatchesOldKeyReseal(t *testing.T) {
+	s := openTestStore(t)
+	m := store.NewMCPOAuth(s)
+	ctx := context.Background()
+	oldKey, newKey := make([]byte, 32), make([]byte, 32)
+	_, _ = rand.Read(oldKey)
+	_, _ = rand.Read(newKey)
+	old, err := crypto.NewKeyring(map[string][]byte{"old": oldKey}, "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		g := newGrant(t, old, time.Now().Add(time.Hour))
+		if err := m.InsertGrant(ctx, g, store.MCPCode{
+			CodeHash: digest(fmt.Sprintf("reseal-%d", i)), ClientID: "client", RedirectURI: "r",
+			CodeChallenge: "c", ExpireTime: time.Now().Add(time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	both, err := crypto.NewKeyring(map[string][]byte{"old": oldKey, "new": newKey}, "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := &resealOnRotationLog{callback: func() error {
+		var id string
+		if err := s.Pool.QueryRow(ctx, `SELECT id::text FROM mcp_grants WHERE key_id = 'new' LIMIT 1`).Scan(&id); err != nil {
+			return err
+		}
+		sealed, err := old.Seal([]byte(`{"refresh_token":"rt"}`), crypto.MCPGrantAAD(id))
+		if err != nil {
+			return err
+		}
+		_, err = s.Pool.Exec(ctx, `UPDATE mcp_grants SET key_id = $2, wrapped_key = $3,
+			key_nonce = $4, nonce = $5, ciphertext = $6 WHERE id = $1::uuid`,
+			id, sealed.KeyID, sealed.WrappedKey, sealed.KeyNonce, sealed.Nonce, sealed.Ciphertext)
+		return err
+	}}
+	report, err := store.RotateMasterKey(ctx, s, both, 1, slog.New(slog.NewTextHandler(writer, nil)))
+	if err != nil || writer.err != nil || !writer.triggered {
+		t.Fatalf("rotate error = %v, reseal error = %v, triggered = %v", err, writer.err, writer.triggered)
+	}
+	if report.Rewrapped["mcp_grants"] != 3 || len(report.Remaining) != 0 {
+		t.Fatalf("report = %+v, want two original rows and one reseal", report)
+	}
+	var remaining int
+	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM mcp_grants WHERE key_id <> 'new'`).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("remaining old keys = %d, %v", remaining, err)
 	}
 }
 
