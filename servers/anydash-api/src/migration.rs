@@ -2,10 +2,16 @@
 //! Explicit forward migrations. `migrate` applies them; serving only verifies the schema.
 use sqlx::PgPool;
 
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "00001_foundation",
-    include_str!("../migrations/00001_foundation.sql"),
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "00001_foundation",
+        include_str!("../migrations/00001_foundation.sql"),
+    ),
+    (
+        "00002_rotated_refresh_device_index",
+        include_str!("../migrations/00002_rotated_refresh_device_index.sql"),
+    ),
+];
 
 pub async fn migrate(db: &PgPool) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;

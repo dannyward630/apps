@@ -7,6 +7,55 @@ use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use support::{Fixture, at, id};
 
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn every_foreign_key_has_a_supporting_index() {
+    let f = Fixture::setup().await;
+    let unsupported: Vec<String> = sqlx::query_scalar(
+        "SELECT c.conrelid::regclass::text || '.' || c.conname
+         FROM pg_constraint c
+         WHERE c.contype = 'f' AND c.connamespace = current_schema()::regnamespace
+           AND NOT EXISTS (
+             SELECT 1 FROM pg_index i
+             WHERE i.indrelid = c.conrelid AND i.indisvalid AND i.indisready
+               AND i.indpred IS NULL AND i.indexprs IS NULL
+               AND i.indnkeyatts >= cardinality(c.conkey)
+               AND NOT EXISTS (
+                 SELECT 1 FROM generate_subscripts(c.conkey, 1) AS position
+                 WHERE i.indkey[position - 1] <> c.conkey[position]
+               )
+           )
+         ORDER BY 1",
+    )
+    .fetch_all(&f.db)
+    .await
+    .unwrap();
+    assert!(
+        unsupported.is_empty(),
+        "foreign keys without leading indexes: {unsupported:?}"
+    );
+
+    let mut tx = f.db.begin().await.unwrap();
+    sqlx::query("SET LOCAL enable_seqscan = off")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (COSTS OFF) DELETE FROM device_rotated_refresh_tokens WHERE device_id = $1",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("Index Scan")
+            && line.contains("device_rotated_refresh_tokens_device")),
+        "delete did not use the device index: {plan:?}"
+    );
+    tx.rollback().await.unwrap();
+    f.cleanup().await;
+}
+
 fn bucket_start(back: Duration) -> chrono::DateTime<Utc> {
     anydash_api::time::floor_bucket(Utc::now() - back)
 }
