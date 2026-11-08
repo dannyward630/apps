@@ -487,6 +487,28 @@ func TestKimiDeviceFlow(t *testing.T) {
 	}
 }
 
+func TestUpdatePendingNextPoll(t *testing.T) {
+	now := fixedNow
+	for _, tc := range []struct {
+		name     string
+		interval int
+		initial  time.Duration
+		want     time.Duration
+	}{
+		{name: "slow_down", interval: 10, initial: 5 * time.Second, want: 10 * time.Second},
+		{name: "authorization_pending", interval: 5, initial: 5 * time.Second, want: 5 * time.Second},
+		{name: "preserve_later_poll", interval: 5, initial: 12 * time.Second, want: 12 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sec := flowSecret{IntervalSeconds: tc.interval, NextPollUnixMilli: now.Add(tc.initial).UnixMilli()}
+			updatePendingNextPoll(now, &sec)
+			if want := now.Add(tc.want).UnixMilli(); sec.NextPollUnixMilli != want {
+				t.Fatalf("next poll = %d, want %d", sec.NextPollUnixMilli, want)
+			}
+		})
+	}
+}
+
 func TestBrowserTLSClientRequiresHTTPS(t *testing.T) {
 	c := NewBrowserTLSClient(time.Second)
 	if _, err := c.Get("http://127.0.0.1:1/"); err == nil {

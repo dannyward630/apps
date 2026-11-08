@@ -641,6 +641,7 @@ func (b *Broker) GetProviderOAuthFlow(ctx context.Context, p *auth.Principal, re
 	if tok == nil {
 		// Still pending: release the claim and keep any interval change.
 		sec.ClaimedUntilUnixMilli = 0
+		updatePendingNextPoll(now, &sec)
 		sealed, err := b.seal(f, sec)
 		if err != nil {
 			return nil, apperr.Internal(err)
@@ -651,6 +652,10 @@ func (b *Broker) GetProviderOAuthFlow(ctx context.Context, p *auth.Principal, re
 		return flowProto(f), nil
 	}
 	return b.register(ctx, p, f, *tok)
+}
+
+func updatePendingNextPoll(now time.Time, sec *flowSecret) {
+	sec.NextPollUnixMilli = max(sec.NextPollUnixMilli, now.Add(time.Duration(max(sec.IntervalSeconds, 1))*time.Second).UnixMilli())
 }
 
 // clientConfigured reports whether the provider's OAuth client is available.
