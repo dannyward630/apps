@@ -27,6 +27,22 @@
       "outputs": ["dist/**"],
       "inputs": ["$TURBO_DEFAULT$", ".env*"]
     },
+    "@apps/anydash#build": {
+      "outputs": ["dist/**"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        ".env*",
+        "$TURBO_ROOT$/packages/anydash/install/**"
+      ]
+    },
+    "@apps/anydash#build:frontend": {
+      "outputs": ["dist/**"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        ".env*",
+        "$TURBO_ROOT$/packages/anydash/install/**"
+      ]
+    },
     "test": {
       "cache": false
     },
