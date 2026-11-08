@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 use crate::{Server, audit, repository};
 use chrono::{DateTime, Utc};
+use connectrpc::ErrorCode;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use server_common::{Fault, Result, integer, now, string, uuid};
@@ -25,98 +26,164 @@ impl Server {
     /// Runs one maintenance cycle as of `now`. Production uses [`Server::maintain`]; tests pass a
     /// fixed instant to exercise the audit retention boundary deterministically.
     pub async fn maintain_at(&self, now: DateTime<Utc>) -> Result<()> {
-        let spaces: Vec<uuid::Uuid> = sqlx::query_scalar(
+        let mut failures = 0;
+        let mut failed_repositories = 0;
+        let spaces: Result<Vec<uuid::Uuid>> = sqlx::query_scalar(
             "SELECT DISTINCT space_id FROM git_tracker_repositories ORDER BY space_id",
         )
         .fetch_all(&self.db)
-        .await?;
-        for batch in spaces.chunks(100) {
-            let ids: Vec<_> = batch.iter().map(ToString::to_string).collect();
-            let deleted = match self.authority.finalized(&ids).await {
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!(category = "authorization", "tenant lifecycle unavailable");
-                    continue;
+        .await
+        .map_err(Fault::from);
+        match spaces {
+            Ok(spaces) => {
+                for batch in spaces.chunks(100) {
+                    let ids: Vec<_> = batch.iter().map(ToString::to_string).collect();
+                    let deleted = match self.authority.finalized(&ids).await {
+                        Ok(v) => v,
+                        Err(_) => {
+                            tracing::warn!(
+                                category = "authorization",
+                                "tenant lifecycle unavailable"
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(fault) = self.delete_finalized_spaces(&deleted).await {
+                        self.maintenance_failure(&fault, "maintenance_space_batch_failed");
+                        failures += 1;
+                    }
                 }
-            };
-            let deleted: Vec<_> = deleted.iter().map(|id| uuid(id)).collect::<Result<_>>()?;
-            let mut tx = self.db.begin().await?;
-            for table in [
-                "git_tracker_repositories",
-                "git_tracker_audit",
-                "git_tracker_links",
-            ] {
-                sqlx::query(&format!("DELETE FROM {table} WHERE space_id=ANY($1)"))
-                    .bind(&deleted)
-                    .execute(&mut *tx)
-                    .await?;
             }
-            tx.commit().await?;
+            Err(fault) => {
+                self.maintenance_failure(&fault, "maintenance_space_listing_failed");
+                failures += 1;
+            }
         }
-        let ids: Vec<uuid::Uuid> =
+        let ids: Result<Vec<uuid::Uuid>> =
             sqlx::query_scalar("SELECT id FROM git_tracker_repositories ORDER BY id")
                 .fetch_all(&self.db)
-                .await?;
-        for id in ids {
-            let mut tx = self.db.begin().await?;
-            let (repo, mut state) = repository(&mut tx, &id.to_string()).await?;
-            if repo.connected {
-                match self.github.metadata(&repo).await {
-                    Ok(v) if integer(&v, "id") != 0 => {
-                        let public = v["private"] == false;
-                        let name = string(&v, "full_name");
-                        if repo.public != public || repo.full_name != name {
-                            sqlx::query("UPDATE git_tracker_repositories SET public=$2,full_name=$3 WHERE id=$1").bind(id).bind(public).bind(name).execute(&mut *tx).await?;
-                            audit(
-                                &mut tx,
-                                &repo.space_id,
-                                "repository_metadata_changed",
-                                &server_common::id(),
-                            )
-                            .await?;
-                        }
-                    }
-                    other => {
-                        match other {
-                            Err(fault) => self.record_failure(&fault),
-                            Ok(_) => self
-                                .metrics
-                                .events
-                                .with_label_values(&["github", "failure"])
-                                .inc(),
-                        }
-                        tracing::warn!(category = "github", "repository synchronization failed");
+                .await
+                .map_err(Fault::from);
+        match ids {
+            Ok(ids) => {
+                for id in ids {
+                    if let Err(fault) = self.maintain_repository(id, now).await {
+                        self.maintenance_failure(&fault, "maintenance_repository_failed");
+                        failures += 1;
+                        failed_repositories += 1;
                     }
                 }
             }
-            let count = state.interrupt(now);
-            if count > 0 {
-                sqlx::query("UPDATE git_tracker_repositories SET state=$2 WHERE id=$1")
-                    .bind(id)
-                    .bind(serde_json::to_value(state)?)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            tx.commit().await?;
-            if count > 0 {
-                self.metrics
-                    .events
-                    .with_label_values(&["execution", "interrupted"])
-                    .inc_by(count as u64);
-                tracing::info!(count, "executions interrupted");
+            Err(fault) => {
+                self.maintenance_failure(&fault, "maintenance_repository_listing_failed");
+                failures += 1;
             }
         }
         match audit_cutoff(now, self.audit_retention) {
             Some(cutoff) => {
-                sqlx::query("DELETE FROM git_tracker_audit WHERE created_at<$1")
+                if let Err(error) = sqlx::query("DELETE FROM git_tracker_audit WHERE created_at<$1")
                     .bind(cutoff)
                     .execute(&self.db)
-                    .await?;
+                    .await
+                {
+                    let fault = Fault::from(error);
+                    self.maintenance_failure(&fault, "maintenance_audit_retention_failed");
+                    failures += 1;
+                }
             }
             None => tracing::debug!(
                 retention_seconds = self.audit_retention.num_seconds(),
                 "audit expiration skipped: retention predates PostgreSQL timestamptz range"
             ),
+        }
+        if failures > 0 {
+            let mut fault = Fault::unavailable();
+            fault.message = format!(
+                "maintenance failed for {failed_repositories} repositories and {} other operations",
+                failures - failed_repositories
+            );
+            return Err(fault);
+        }
+        Ok(())
+    }
+
+    fn maintenance_failure(&self, _fault: &Fault, category: &'static str) {
+        // Each failed operation is counted here. The aggregate result has an application source,
+        // so the caller's generic failure recording cannot count the same operation twice.
+        let mut persistence = Fault::unavailable();
+        persistence.source = server_common::error::FaultSource::Persistence;
+        self.record_failure(&persistence);
+        tracing::warn!(category, "maintenance operation failed");
+    }
+
+    async fn delete_finalized_spaces(&self, deleted: &[String]) -> Result<()> {
+        let deleted: Vec<_> = deleted.iter().map(|id| uuid(id)).collect::<Result<_>>()?;
+        let mut tx = self.db.begin().await?;
+        for table in [
+            "git_tracker_repositories",
+            "git_tracker_audit",
+            "git_tracker_links",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE space_id=ANY($1)"))
+                .bind(&deleted)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn maintain_repository(&self, id: uuid::Uuid, now: DateTime<Utc>) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        let (repo, mut state) = match repository(&mut tx, &id.to_string()).await {
+            Ok(value) => value,
+            Err(fault) if fault.code == ErrorCode::NotFound => return Ok(()),
+            Err(fault) => return Err(fault),
+        };
+        if repo.connected {
+            match self.github.metadata(&repo).await {
+                Ok(v) if integer(&v, "id") != 0 => {
+                    let public = v["private"] == false;
+                    let name = string(&v, "full_name");
+                    if repo.public != public || repo.full_name != name {
+                        sqlx::query("UPDATE git_tracker_repositories SET public=$2,full_name=$3 WHERE id=$1").bind(id).bind(public).bind(name).execute(&mut *tx).await?;
+                        audit(
+                            &mut tx,
+                            &repo.space_id,
+                            "repository_metadata_changed",
+                            &server_common::id(),
+                        )
+                        .await?;
+                    }
+                }
+                other => {
+                    match other {
+                        Err(fault) => self.record_failure(&fault),
+                        Ok(_) => self
+                            .metrics
+                            .events
+                            .with_label_values(&["github", "failure"])
+                            .inc(),
+                    }
+                    tracing::warn!(category = "github", "repository synchronization failed");
+                }
+            }
+        }
+        let count = state.interrupt(now);
+        if count > 0 {
+            sqlx::query("UPDATE git_tracker_repositories SET state=$2 WHERE id=$1")
+                .bind(id)
+                .bind(serde_json::to_value(state)?)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        if count > 0 {
+            self.metrics
+                .events
+                .with_label_values(&["execution", "interrupted"])
+                .inc_by(count as u64);
+            tracing::info!(count, "executions interrupted");
         }
         Ok(())
     }

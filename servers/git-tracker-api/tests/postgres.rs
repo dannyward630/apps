@@ -621,6 +621,7 @@ struct Fixture {
     admin: sqlx::PgPool,
     space: String,
     commit: String,
+    finalized: Arc<std::sync::Mutex<Vec<String>>>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -673,11 +674,14 @@ async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
         gate: std::sync::Mutex::new(None),
         resolve_gate: std::sync::Mutex::new(None),
     });
+    let finalized = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let delcore_requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let delcore_mock = delcore_requests.clone();
     let (commit_mock, actor_mock, github_mock) = (commit.clone(), actor.clone(), github.clone());
+    let finalized_mock = finalized.clone();
     let mock = Router::new().fallback(move |r: Request| {
         let (commit, actor, github) = (commit_mock.clone(), actor_mock.clone(), github_mock.clone());
+        let finalized = finalized_mock.clone();
         let delcore_requests = delcore_mock.clone();
         async move {
             let p = r.uri().path().to_owned();
@@ -733,7 +737,11 @@ async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
                 "/delcore.v1.DelcoreService/ListMembers" if auth == "Bearer manager" => json!({}),
                 "/delcore.v1.DelcoreService/Authorize" => json!({"allowed":true}),
                 "/delcore.v1.DelcoreService/CheckTenantLifecycle" => {
-                    json!({"finalizedTenantIds":[]})
+                    let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let requested = request["tenantIds"].as_array().unwrap();
+                    let available = finalized.lock().unwrap();
+                    json!({"finalizedTenantIds":available.iter().filter(|id| requested.iter().any(|value| value.as_str() == Some(id.as_str()))).collect::<Vec<_>>()})
                 }
                 "/user" => json!({"id":7}),
                 // Discovery deliberately reports the repository as public so a stale snapshot
@@ -815,6 +823,7 @@ async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
         admin,
         space,
         commit,
+        finalized,
         _tasks: vec![mock_task, task],
     }
 }
@@ -1460,6 +1469,171 @@ async fn postgres_connect_keeps_private_visibility_committed_by_webhook() {
 #[ignore = "requires a disposable TEST_DATABASE_URL"]
 async fn postgres_connect_keeps_private_visibility_committed_by_maintenance() {
     connect_does_not_restore_anonymous_access(Interleaving::Maintenance).await;
+}
+
+async fn insert_maintenance_repository(
+    f: &Fixture,
+    id: uuid::Uuid,
+    space: uuid::Uuid,
+    state: Value,
+) {
+    sqlx::query("INSERT INTO git_tracker_repositories (id,github_id,space_id,full_name,installation_id,public,connected,state) VALUES ($1,$2,$3,'fixture/repo','1',false,false,$4)")
+        .bind(id)
+        .bind(i64::from(id.as_bytes()[15]) + 100)
+        .bind(space)
+        .bind(state)
+        .execute(&f.server.db)
+        .await
+        .unwrap();
+}
+
+fn stale_maintenance_state() -> Value {
+    use delino_protocol::gittracker::v1::{Execution, ExecutionState::EXECUTION_STATE_MEASURING};
+    use git_tracker_api::measurement::{Baseline, Record, State};
+    let stale = chrono::Utc::now() - chrono::Duration::hours(7);
+    let record = Record {
+        removed: Default::default(),
+        execution: Execution {
+            state: EXECUTION_STATE_MEASURING.into(),
+            ..Default::default()
+        },
+        last_data: stale,
+        cutoff: stale,
+        ancestors: Vec::new(),
+        base: Baseline::default(),
+        push: false,
+        baselines: Default::default(),
+    };
+    let mut state = State::default();
+    state.records.insert("run".into(), record);
+    serde_json::to_value(state).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_maintenance_isolates_corrupt_repository_and_expires_audit() {
+    let f = fixture().await;
+    let space = uuid::Uuid::now_v7();
+    let ids = [
+        uuid::Uuid::parse_str("019a0000-0000-7000-8000-000000000001").unwrap(),
+        uuid::Uuid::parse_str("019a0000-0000-7000-8000-000000000002").unwrap(),
+        uuid::Uuid::parse_str("019a0000-0000-7000-8000-000000000003").unwrap(),
+    ];
+    insert_maintenance_repository(&f, ids[0], space, json!("broken")).await;
+    for id in &ids[1..] {
+        insert_maintenance_repository(&f, *id, space, stale_maintenance_state()).await;
+    }
+    let audit_id = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO git_tracker_audit VALUES($1,$2,'fixture',$3,'2000-01-01T00:00:00Z')")
+        .bind(audit_id)
+        .bind(space)
+        .bind(uuid::Uuid::now_v7())
+        .execute(&f.server.db)
+        .await
+        .unwrap();
+    let failures = f
+        .server
+        .metrics
+        .events
+        .with_label_values(&["persistence", "failure"]);
+    let before = failures.get();
+    for cycle in 1..=2 {
+        let error = f.server.maintain().await.unwrap_err();
+        assert!(error.message.contains("1 repositories"), "{error}");
+        f.server.record_failure(&error);
+        assert_eq!(failures.get(), before + cycle);
+    }
+    for id in &ids[1..] {
+        let state: Value =
+            sqlx::query_scalar("SELECT state FROM git_tracker_repositories WHERE id=$1")
+                .bind(id)
+                .fetch_one(&f.server.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            state["records"]["run"]["execution"]["state"],
+            "EXECUTION_STATE_INTERRUPTED"
+        );
+    }
+    let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM git_tracker_audit WHERE id=$1")
+        .bind(audit_id)
+        .fetch_one(&f.server.db)
+        .await
+        .unwrap();
+    assert_eq!(audit_count, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_maintenance_skips_repository_deleted_after_listing() {
+    let f = fixture().await;
+    let space = uuid::Uuid::now_v7();
+    let first = uuid::Uuid::parse_str("019a0000-0000-7000-8000-000000000011").unwrap();
+    let disappeared = uuid::Uuid::parse_str("019a0000-0000-7000-8000-000000000012").unwrap();
+    for id in [first, disappeared] {
+        insert_maintenance_repository(&f, id, space, json!({})).await;
+    }
+    let mut lock = f.server.db.begin().await.unwrap();
+    sqlx::query("SELECT id FROM git_tracker_repositories WHERE id=$1 FOR UPDATE")
+        .bind(first)
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap();
+    let server = f.server.clone();
+    let cycle = tokio::spawn(async move { server.maintain().await });
+    f.wait_for_lock_waiter().await;
+    sqlx::query("DELETE FROM git_tracker_repositories WHERE id=$1")
+        .bind(disappeared)
+        .execute(&f.server.db)
+        .await
+        .unwrap();
+    lock.commit().await.unwrap();
+    cycle.await.unwrap().unwrap();
+    assert_eq!(
+        f.server
+            .metrics
+            .events
+            .with_label_values(&["persistence", "failure"])
+            .get(),
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_maintenance_isolates_finalized_space_batches() {
+    let f = fixture().await;
+    let mut spaces = Vec::new();
+    for i in 1..=101 {
+        let id = uuid::Uuid::parse_str(&format!("019a0000-0000-7000-8000-{i:012x}")).unwrap();
+        let space = uuid::Uuid::parse_str(&format!("019b0000-0000-7000-8000-{i:012x}")).unwrap();
+        insert_maintenance_repository(&f, id, space, json!({})).await;
+        spaces.push(space.to_string());
+    }
+    *f.finalized.lock().unwrap() = spaces.clone();
+    sqlx::query(&format!("CREATE FUNCTION fail_first_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.space_id = '{}'::uuid THEN RAISE EXCEPTION 'fixture'; END IF; RETURN OLD; END $$", spaces[0]))
+        .execute(&f.server.db)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_first_cleanup BEFORE DELETE ON git_tracker_repositories FOR EACH ROW EXECUTE FUNCTION fail_first_cleanup()")
+        .execute(&f.server.db)
+        .await
+        .unwrap();
+    let error = f.server.maintain().await.unwrap_err();
+    assert!(error.message.contains("1 other operations"), "{error}");
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM git_tracker_repositories")
+        .fetch_one(&f.server.db)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 100);
+    assert_eq!(
+        f.server
+            .metrics
+            .events
+            .with_label_values(&["persistence", "failure"])
+            .get(),
+        1
+    );
 }
 
 #[tokio::test]
