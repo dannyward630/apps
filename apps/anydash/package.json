@@ -40,7 +40,7 @@
     "@lynx-js/rspeedy": "0.18.3",
     "@lynx-js/testing-environment": "0.4.0",
     "@lynx-js/types": "4.3.0",
-    "@lynx-js/web-elements": "0.12.15",
+    "@lynx-js/web-elements": "0.12.16",
     "@rstest/core": "0.12.4",
     "@types/node": "24.19.2",
     "@types/react": "19.2.14",
