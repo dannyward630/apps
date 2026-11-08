@@ -267,6 +267,21 @@ func lockLive(ctx context.Context, tx pgx.Tx, resourceID, flowID uuid.UUID) (sto
 	return r, f, s, err
 }
 
+// recheckStart holds the resource lock while checking the current role. A
+// device provider call runs outside the transaction, so its caller checks
+// before that call and again before inserting the flow.
+func recheckStart(ctx context.Context, tx pgx.Tx, p *auth.Principal, resourceID uuid.UUID) error {
+	r, err := store.LockResource(ctx, tx, resourceID)
+	if err != nil {
+		return err
+	}
+	if r.Deleted() {
+		return apperr.FailedPrecondition("the resource was deleted")
+	}
+	_, err = authz.Recheck(ctx, tx, p, r, mcpav1.ResourceRole_RESOURCE_ROLE_MANAGE)
+	return err
+}
+
 // StartProviderOAuth creates a flow. Authorization-code flows return the
 // consent URL; device flows return the user code and verification URI.
 func (b *Broker) StartProviderOAuth(ctx context.Context, p *auth.Principal, res store.Resource, req *mcpav1.StartProviderOAuthRequest) (*mcpav1.ProviderOAuthFlow, error) {
@@ -297,6 +312,11 @@ func (b *Broker) StartProviderOAuth(ctx context.Context, p *auth.Principal, res 
 		f.AuthorizationURL = spec.authURL(b, state, challenge)
 		f.ExpireTime = now.Add(authorizationCodeLifetime)
 	case mcpav1.OauthFlowKind_OAUTH_FLOW_KIND_DEVICE_CODE:
+		if err := b.db.InTx(ctx, func(tx pgx.Tx) error {
+			return recheckStart(ctx, tx, p, res.ID)
+		}); err != nil {
+			return nil, dbErr(err)
+		}
 		reqCtx, cancel := context.WithTimeout(ctx, b.timeout)
 		start, err := spec.startDevice(reqCtx, b)
 		cancel()
@@ -315,12 +335,8 @@ func (b *Broker) StartProviderOAuth(ctx context.Context, p *auth.Principal, res 
 		return nil, apperr.Internal(err)
 	}
 	err = b.db.InTx(ctx, func(tx pgx.Tx) error {
-		r, err := store.LockResource(ctx, tx, res.ID)
-		if err != nil {
+		if err := recheckStart(ctx, tx, p, res.ID); err != nil {
 			return err
-		}
-		if r.Deleted() {
-			return apperr.FailedPrecondition("the resource was deleted")
 		}
 		f, err = store.InsertOAuthFlow(ctx, tx, f, sealed)
 		return err
