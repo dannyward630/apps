@@ -66,6 +66,8 @@ All surfaces are served from the public API origin.
 
 Only the `/r/{resource_id}/...` surface is metered. Management, console, authentication, OAuth, MCP and operational traffic is free and creates no billing event.
 
+Connect management requests accept at most 256 KiB per decoded message and 1 MiB for the entire HTTP request body on the wire, including compressed bodies. Oversized requests fail with `resource_exhausted` before authentication.
+
 Every response carries `X-Mcpa-Request-Id`, including the 404 and 405 responses that the router generates before a route runs. The value is assigned before routing and stays the same for the whole request. On the call surface its value is the UUID v7 call record ID. Connect errors also carry the `trace_id` in `mcpa.v1.ErrorDetail`.
 
 ### Console session and CSRF

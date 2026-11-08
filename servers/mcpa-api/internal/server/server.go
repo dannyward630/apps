@@ -32,6 +32,14 @@ import (
 // replaces it with the call record ID.
 const RequestIDHeader = "X-Mcpa-Request-Id"
 
+const (
+	// The decoded limit exceeds every valid management field combination.
+	// Connect applies it after decompression, before the interceptor authenticates.
+	managementMessageMaxBytes = 256 << 10
+	// The outer limit also bounds compressed bytes before Connect reads them.
+	managementWireMaxBytes = 1 << 20
+)
+
 // Mount is an HTTP route contributed by a later layer, for example
 // "/r/{resource_id}/", "/mcp", "/oauth/" or "/.well-known/". Pattern uses
 // net/http ServeMux syntax. Surface labels metrics and spans. The handler is
@@ -68,8 +76,10 @@ func New(cfg Config) http.Handler {
 	mux := http.NewServeMux()
 	s := &server{cfg: cfg}
 
-	path, connectHandler := mcpav1connect.NewMcpaServiceHandler(cfg.Service, append(handlerCodecs(), connect.WithInterceptors(s.interceptor()))...)
-	mux.Handle(path, s.wrap(obs.SurfaceManagement, s.browserPolicy(connectHandler, false)))
+	path, connectHandler := mcpav1connect.NewMcpaServiceHandler(cfg.Service, append(handlerCodecs(),
+		connect.WithReadMaxBytes(managementMessageMaxBytes), managementCompression(), connect.WithInterceptors(s.interceptor()))...)
+	mux.Handle(path, s.wrap(obs.SurfaceManagement, s.browserPolicy(s.managementBodyLimit(
+		http.MaxBytesHandler(connectHandler, managementWireMaxBytes)), false)))
 
 	cfg.Web.Register(mux, func(h http.Handler) http.Handler {
 		return s.wrap(obs.SurfaceAuth, s.browserPolicy(h, true))
@@ -233,6 +243,30 @@ func (s *server) browserPolicy(next http.Handler, navigation bool) http.Handler 
 			}
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// managementBodyLimit logs transport-level rejections that occur before the
+// authentication interceptor. Only bounded metadata is recorded.
+func (s *server) managementBodyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := &statusWriter{ResponseWriter: w}
+		// Connect-Go drains the rest of an oversized plain unary body after
+		// WithReadMaxBytes rejects it. Return a read error at the limit so it
+		// cannot read the remaining body. Other protocols keep their framing.
+		if r.Header.Get("Content-Encoding") == "" &&
+			(strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") ||
+				strings.HasPrefix(r.Header.Get("Content-Type"), "application/proto")) {
+			http.MaxBytesHandler(next, managementMessageMaxBytes).ServeHTTP(sw, r)
+		} else {
+			next.ServeHTTP(sw, r)
+		}
+		if sw.status == http.StatusTooManyRequests {
+			s.cfg.Log.InfoContext(r.Context(), "management request body rejected",
+				"procedure", r.URL.Path,
+				"message_limit_bytes", managementMessageMaxBytes,
+				"wire_limit_bytes", managementWireMaxBytes)
+		}
 	})
 }
 
