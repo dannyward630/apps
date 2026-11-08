@@ -76,6 +76,12 @@ func New(ctx context.Context, cfg *config.Serve, log *slog.Logger, metrics *obs.
 		db.Close()
 		return nil, err
 	}
+	keyCheckCtx, cancelKeyCheck := context.WithTimeout(ctx, cfg.DependencyTimeout)
+	defer cancelKeyCheck()
+	if err := store.CheckSealedKeyIDs(keyCheckCtx, db, keys.KeyIDs()); err != nil {
+		db.Close()
+		return nil, err
+	}
 	dc, err := delcore.New(delcore.Config{
 		BaseURL:      cfg.DelcoreURL,
 		TokenURL:     cfg.LogtoTokenURL,
