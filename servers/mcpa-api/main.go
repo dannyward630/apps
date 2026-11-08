@@ -250,7 +250,7 @@ func migrate(ctx context.Context, lookup config.Lookup, log *slog.Logger) error 
 	if err != nil {
 		return err
 	}
-	db, err := store.Open(ctx, cfg.URL, cfg.DependencyTimeout, store.ModeMaintenance)
+	db, err := store.Open(ctx, string(cfg.URL), cfg.DependencyTimeout, store.ModeMaintenance)
 	if err != nil {
 		return err
 	}
@@ -272,7 +272,7 @@ func checkSchema(ctx context.Context, lookup config.Lookup, log *slog.Logger) er
 	if err != nil {
 		return err
 	}
-	db, err := store.Open(ctx, cfg.URL, cfg.DependencyTimeout, store.ModeMaintenance)
+	db, err := store.Open(ctx, string(cfg.URL), cfg.DependencyTimeout, store.ModeMaintenance)
 	if err != nil {
 		return err
 	}
@@ -293,11 +293,11 @@ func rotateMasterKey(ctx context.Context, lookup config.Lookup, log *slog.Logger
 	if err != nil {
 		return err
 	}
-	keys, err := crypto.NewKeyring(keyCfg.MasterKeys, keyCfg.ActiveKeyID)
+	keys, err := crypto.NewKeyring(keyCfg.RawMasterKeys(), keyCfg.ActiveKeyID)
 	if err != nil {
 		return fmt.Errorf("master keys: %w", err)
 	}
-	db, err := store.Open(ctx, dbCfg.URL, dbCfg.DependencyTimeout, store.ModeMaintenance)
+	db, err := store.Open(ctx, string(dbCfg.URL), dbCfg.DependencyTimeout, store.ModeMaintenance)
 	if err != nil {
 		return err
 	}

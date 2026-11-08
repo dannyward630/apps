@@ -64,11 +64,11 @@ type App struct {
 // binary's migrations and builds every component. It never migrates. It does
 // not contact Logto or Delcore; those are reached lazily per request.
 func New(ctx context.Context, cfg *config.Serve, log *slog.Logger, metrics *obs.Metrics) (*App, error) {
-	keys, err := crypto.NewKeyring(cfg.MasterKeys, cfg.ActiveKeyID)
+	keys, err := crypto.NewKeyring(cfg.RawMasterKeys(), cfg.ActiveKeyID)
 	if err != nil {
 		return nil, fmt.Errorf("master keys: %w", err)
 	}
-	db, err := store.Open(ctx, cfg.URL, cfg.DependencyTimeout, store.ModeServe)
+	db, err := store.Open(ctx, string(cfg.URL), cfg.DependencyTimeout, store.ModeServe)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +91,7 @@ func New(ctx context.Context, cfg *config.Serve, log *slog.Logger, metrics *obs.
 		db.Close()
 		return nil, err
 	}
-	logto := auth.NewLogto(cfg.LogtoIssuer, cfg.ConsoleClientID, cfg.ConsoleClientSecret, &http.Client{Timeout: cfg.DependencyTimeout})
+	logto := auth.NewLogto(cfg.LogtoIssuer, cfg.ConsoleClientID, string(cfg.ConsoleClientSecret), &http.Client{Timeout: cfg.DependencyTimeout})
 	sessions := auth.NewSessions(auth.SessionsConfig{
 		Store:           db,
 		Keys:            keys,
@@ -171,7 +171,7 @@ func (a *App) Handler() http.Handler {
 		Metrics:       a.Metrics,
 		Log:           a.Log,
 		WebOrigin:     a.Config.WebOrigin,
-		MetricsToken:  a.Config.MetricsToken,
+		MetricsToken:  string(a.Config.MetricsToken),
 		Ready:         a.Store.CheckSchema,
 		Mounts:        a.mounts,
 	})

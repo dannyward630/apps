@@ -29,6 +29,7 @@ import (
 
 	delcorev1 "github.com/delinoio/apps/protos/delcore/v1"
 	"github.com/delinoio/apps/protos/delcore/v1/delcorev1connect"
+	"github.com/delinoio/apps/servers/mcpa-api/internal/config"
 	"github.com/delinoio/apps/servers/mcpa-api/internal/obs"
 	"github.com/delinoio/apps/servers/mcpa-api/internal/pricing"
 )
@@ -58,7 +59,7 @@ type Config struct {
 	BaseURL      string
 	TokenURL     string
 	ClientID     string
-	ClientSecret string
+	ClientSecret config.Redacted
 	// Resource is the Logto resource indicator of the Delcore API.
 	Resource string
 	// ServiceID is the Delcore service ID of mcpa.
@@ -68,12 +69,12 @@ type Config struct {
 	// CacheTTL is how long allowed results and ACTIVE states are cached.
 	CacheTTL time.Duration
 	// HTTPClient defaults to a client with Timeout.
-	HTTPClient *http.Client
-	Metrics    *obs.Metrics
+	HTTPClient *http.Client `json:"-"`
+	Metrics    *obs.Metrics `json:"-"`
 	// Now defaults to time.Now. Tests replace it to expire cache entries.
-	Now func() time.Time
+	Now func() time.Time `json:"-"`
 	// TokenSource overrides the client-credentials source in tests.
-	TokenSource oauth2.TokenSource
+	TokenSource oauth2.TokenSource `json:"-"`
 }
 
 // Client calls Delcore.
@@ -114,7 +115,7 @@ func New(cfg Config) (*Client, error) {
 	if tokens == nil {
 		cc := clientcredentials.Config{
 			ClientID:       cfg.ClientID,
-			ClientSecret:   cfg.ClientSecret,
+			ClientSecret:   string(cfg.ClientSecret),
 			TokenURL:       cfg.TokenURL,
 			Scopes:         []string{M2MScopes},
 			EndpointParams: map[string][]string{"resource": {cfg.Resource}},

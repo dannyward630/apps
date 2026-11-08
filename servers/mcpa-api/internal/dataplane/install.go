@@ -35,7 +35,7 @@ type InstallOptions struct {
 func Install(a *app.App, opts InstallOptions) (*DataPlane, error) {
 	geminiClient := opts.OAuth.GeminiCLIClient
 	if geminiClient == (provideroauth.GoogleOAuthClient{}) {
-		geminiClient = provideroauth.GoogleOAuthClient{ClientID: a.Config.GeminiCLIOAuthClientID, ClientSecret: a.Config.GeminiCLIOAuthClientSecret}
+		geminiClient = provideroauth.GoogleOAuthClient{ClientID: a.Config.GeminiCLIOAuthClientID, ClientSecret: string(a.Config.GeminiCLIOAuthClientSecret)}
 	}
 	dp, err := New(Config{
 		Store: a.Store, Keys: a.Keys, Delcore: a.Delcore, Metrics: a.Metrics, Log: a.Log,
@@ -51,7 +51,7 @@ func Install(a *app.App, opts InstallOptions) (*DataPlane, error) {
 	oauth.Store, oauth.Keys, oauth.Listener, oauth.Log = a.Store, a.Keys, dp.Sync, a.Log
 	oauth.GeminiCLIClient = geminiClient
 	if oauth.AntigravityClient == (provideroauth.GoogleOAuthClient{}) {
-		oauth.AntigravityClient = provideroauth.GoogleOAuthClient{ClientID: a.Config.AntigravityOAuthClientID, ClientSecret: a.Config.AntigravityOAuthClientSecret}
+		oauth.AntigravityClient = provideroauth.GoogleOAuthClient{ClientID: a.Config.AntigravityOAuthClientID, ClientSecret: string(a.Config.AntigravityOAuthClientSecret)}
 	}
 	if oauth.Now == nil {
 		oauth.Now = opts.Now

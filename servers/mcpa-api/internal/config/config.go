@@ -73,15 +73,24 @@ type Logging struct {
 
 // Database holds the settings used by every subcommand that touches PostgreSQL.
 type Database struct {
-	URL string
+	URL Redacted
 	// DependencyTimeout bounds each database and Delcore call.
 	DependencyTimeout time.Duration
 }
 
 // Keys holds the credential master keys.
 type Keys struct {
-	MasterKeys  map[string][]byte
+	MasterKeys  map[string]Secret
 	ActiveKeyID string
+}
+
+// RawMasterKeys passes key bytes to the encryption boundary.
+func (k Keys) RawMasterKeys() map[string][]byte {
+	keys := make(map[string][]byte, len(k.MasterKeys))
+	for id, key := range k.MasterKeys {
+		keys[id] = []byte(key)
+	}
+	return keys
 }
 
 // Serve is the complete configuration of `mcpa-api serve`.
@@ -106,11 +115,11 @@ type Serve struct {
 	ServiceID     string
 	LogtoTokenURL string
 	ClientID      string
-	ClientSecret  string
+	ClientSecret  Redacted
 
 	LogtoIssuer         string
 	ConsoleClientID     string
-	ConsoleClientSecret string
+	ConsoleClientSecret Redacted
 	APIResource         string
 	MCPResource         string
 	MFAClaim            string
@@ -121,14 +130,14 @@ type Serve struct {
 	// provider OAuth flows. Optional: an unset pair disables that provider's
 	// OAuth connection. The secrets are never logged.
 	GeminiCLIOAuthClientID       string
-	GeminiCLIOAuthClientSecret   string
+	GeminiCLIOAuthClientSecret   Redacted
 	AntigravityOAuthClientID     string
-	AntigravityOAuthClientSecret string
+	AntigravityOAuthClientSecret Redacted
 
 	AuthorizeCacheTTL  time.Duration
 	CheckpointInterval time.Duration
 	OutboxInterval     time.Duration
-	MetricsToken       string
+	MetricsToken       Redacted
 
 	// TracingEnabled is true when OTEL_EXPORTER_OTLP_ENDPOINT is set.
 	TracingEnabled bool
@@ -312,13 +321,13 @@ func (p *parser) logging() Logging {
 }
 
 func (p *parser) database() Database {
-	d := Database{URL: p.secret("DATABASE_URL")}
+	d := Database{URL: Redacted(p.secret("DATABASE_URL"))}
 	d.DependencyTimeout = p.duration("DEPENDENCY_TIMEOUT", false, 5*time.Second)
 	return d
 }
 
 func (p *parser) keys() Keys {
-	k := Keys{MasterKeys: map[string][]byte{}}
+	k := Keys{MasterKeys: map[string]Secret{}}
 	raw := p.secret("MCPA_MASTER_KEYS")
 	k.ActiveKeyID = p.required("MCPA_ACTIVE_KEY_ID")
 	if raw == "" {
@@ -332,18 +341,30 @@ func (p *parser) keys() Keys {
 	if len(encoded) == 0 {
 		p.fail("MCPA_MASTER_KEYS must contain at least one key")
 	}
-	for id, value := range encoded {
+	ids := make([]string, 0, len(encoded))
+	for id := range encoded {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for index, id := range ids {
+		value := encoded[id]
 		if !validKeyID(id) {
-			p.fail("MCPA_MASTER_KEYS key IDs must match [A-Za-z0-9._-]{1,64}")
+			p.fail("MCPA_MASTER_KEYS entry %d key ID must match [A-Za-z0-9._-]{1,64}", index+1)
 			continue
 		}
 		key, err := decodeKey(value)
 		if err != nil {
-			// Never include the key material in the error.
-			p.fail("MCPA_MASTER_KEYS[%q] must be a base64url encoded 32-byte key", id)
+			// A swapped key and ID can make the map key itself secret material.
+			entry := fmt.Sprintf("entry %d", index+1)
+			if len(id) <= 16 {
+				if _, err := decodeKey(id); err != nil {
+					entry += fmt.Sprintf(" (%q)", id)
+				}
+			}
+			p.fail("MCPA_MASTER_KEYS %s must be a base64url encoded 32-byte key", entry)
 			continue
 		}
-		k.MasterKeys[id] = key
+		k.MasterKeys[id] = Secret(key)
 	}
 	if k.ActiveKeyID != "" && len(k.MasterKeys) > 0 {
 		if _, ok := k.MasterKeys[k.ActiveKeyID]; !ok {
@@ -436,11 +457,11 @@ func LoadServe(lookup Lookup) (*Serve, error) {
 	}
 	s.LogtoTokenURL = p.absoluteURL("LOGTO_TOKEN_URL", true)
 	s.ClientID = p.required("CLIENT_ID")
-	s.ClientSecret = p.secret("CLIENT_SECRET")
+	s.ClientSecret = Redacted(p.secret("CLIENT_SECRET"))
 
 	s.LogtoIssuer = p.absoluteURL("LOGTO_ISSUER", true)
 	s.ConsoleClientID = p.required("MCPA_LOGTO_CLIENT_ID")
-	s.ConsoleClientSecret = p.secret("MCPA_LOGTO_CLIENT_SECRET")
+	s.ConsoleClientSecret = Redacted(p.secret("MCPA_LOGTO_CLIENT_SECRET"))
 	s.APIResource = p.required("MCPA_API_RESOURCE")
 	s.MCPResource = p.required("MCPA_MCP_RESOURCE")
 	if s.APIResource != "" && s.APIResource == s.MCPResource {
@@ -449,8 +470,11 @@ func LoadServe(lookup Lookup) (*Serve, error) {
 	if s.DelcoreResource != "" && (s.DelcoreResource == s.APIResource || s.DelcoreResource == s.MCPResource) {
 		p.fail("DELCORE_RESOURCE must differ from the mcpa API and MCP resources")
 	}
-	s.GeminiCLIOAuthClientID, s.GeminiCLIOAuthClientSecret = p.optionalPair("MCPA_GEMINI_CLI_OAUTH_CLIENT_ID", "MCPA_GEMINI_CLI_OAUTH_CLIENT_SECRET")
-	s.AntigravityOAuthClientID, s.AntigravityOAuthClientSecret = p.optionalPair("MCPA_ANTIGRAVITY_OAUTH_CLIENT_ID", "MCPA_ANTIGRAVITY_OAUTH_CLIENT_SECRET")
+	var secret string
+	s.GeminiCLIOAuthClientID, secret = p.optionalPair("MCPA_GEMINI_CLI_OAUTH_CLIENT_ID", "MCPA_GEMINI_CLI_OAUTH_CLIENT_SECRET")
+	s.GeminiCLIOAuthClientSecret = Redacted(secret)
+	s.AntigravityOAuthClientID, secret = p.optionalPair("MCPA_ANTIGRAVITY_OAUTH_CLIENT_ID", "MCPA_ANTIGRAVITY_OAUTH_CLIENT_SECRET")
+	s.AntigravityOAuthClientSecret = Redacted(secret)
 	s.MFAClaim = p.optional("MCPA_MFA_CLAIM")
 	if s.MFAClaim == "" {
 		s.MFAClaim = DefaultMFAClaim
@@ -461,7 +485,8 @@ func LoadServe(lookup Lookup) (*Serve, error) {
 	s.AuthorizeCacheTTL = p.duration("MCPA_AUTHORIZE_CACHE_TTL", true, 0)
 	s.CheckpointInterval = p.duration("MCPA_CHECKPOINT_INTERVAL", true, 0)
 	s.OutboxInterval = p.duration("MCPA_OUTBOX_INTERVAL", true, 0)
-	s.MetricsToken, _ = lookup("MCPA_METRICS_TOKEN")
+	metricsToken, _ := lookup("MCPA_METRICS_TOKEN")
+	s.MetricsToken = Redacted(metricsToken)
 	s.TracingEnabled = p.optional("OTEL_EXPORTER_OTLP_ENDPOINT") != "" || p.optional("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") != ""
 
 	if len(p.errs) > 0 {

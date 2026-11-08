@@ -3,12 +3,113 @@
 package config_test
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/delinoio/apps/servers/mcpa-api/internal/config"
 )
+
+func TestMasterKeyErrorsDoNotExposeSwappedKey(t *testing.T) {
+	key := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x8b}, 32))
+	vars := serveSettings()
+	vars["MCPA_MASTER_KEYS"] = fmt.Sprintf(`{%q:"k1"}`, key)
+	_, err := config.LoadServe(lookup(vars))
+	if err == nil || !strings.Contains(err.Error(), "MCPA_MASTER_KEYS entry 1") {
+		t.Fatalf("error = %v, want numbered MCPA_MASTER_KEYS entry", err)
+	}
+	for i := 0; i+8 <= len(key); i++ {
+		if strings.Contains(err.Error(), key[i:i+8]) {
+			t.Fatal("configuration error contains master-key material")
+		}
+	}
+
+	for name, raw := range map[string]string{
+		"short key":       `{"k1":"not-base64"}`,
+		"invalid ID":      `{"bad!id":"not-base64"}`,
+		"empty key value": `{"k1":""}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			vars["MCPA_MASTER_KEYS"] = raw
+			_, err := config.LoadServe(lookup(vars))
+			if err == nil || !strings.Contains(err.Error(), "MCPA_MASTER_KEYS entry 1") {
+				t.Fatalf("error = %v, want numbered MCPA_MASTER_KEYS entry", err)
+			}
+		})
+	}
+	vars["MCPA_MASTER_KEYS"] = fmt.Sprintf(`{"k1":%q}`, key)
+	if _, err := config.LoadServe(lookup(vars)); err != nil {
+		t.Fatalf("valid master key rejected: %v", err)
+	}
+}
+
+func TestConfigFormattingRedactsSecrets(t *testing.T) {
+	vars := serveSettings()
+	vars["DATABASE_URL"] = "postgres://distinct-db-secret@localhost/mcpa"
+	vars["MCPA_MASTER_KEYS"] = `{"visible-key-id":"` + base64.RawURLEncoding.EncodeToString([]byte("distinct-master-key-bytes-32!!xx")) + `"}`
+	vars["MCPA_ACTIVE_KEY_ID"] = "visible-key-id"
+	vars["CLIENT_SECRET"] = "distinct-machine-secret"
+	vars["MCPA_LOGTO_CLIENT_SECRET"] = "distinct-console-secret"
+	vars["MCPA_GEMINI_CLI_OAUTH_CLIENT_ID"] = "gemini-id"
+	vars["MCPA_GEMINI_CLI_OAUTH_CLIENT_SECRET"] = "distinct-gemini-secret"
+	vars["MCPA_ANTIGRAVITY_OAUTH_CLIENT_ID"] = "antigravity-id"
+	vars["MCPA_ANTIGRAVITY_OAUTH_CLIENT_SECRET"] = "distinct-antigravity-secret"
+	vars["MCPA_METRICS_TOKEN"] = "distinct-metrics-secret"
+	cfg, err := config.LoadServe(lookup(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var outputs []string
+	for _, value := range []any{cfg, *cfg, cfg.Database, cfg.Keys} {
+		outputs = append(outputs, fmt.Sprintf("%v", value), fmt.Sprintf("%+v", value), fmt.Sprintf("%#v", value))
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		outputs = append(outputs, string(encoded))
+		for _, makeHandler := range []func(*bytes.Buffer) slog.Handler{
+			func(out *bytes.Buffer) slog.Handler { return slog.NewTextHandler(out, nil) },
+			func(out *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(out, nil) },
+		} {
+			var out bytes.Buffer
+			slog.New(makeHandler(&out)).Info("config", slog.Any("value", value))
+			outputs = append(outputs, out.String())
+		}
+	}
+	for _, output := range outputs {
+		for _, secret := range []string{
+			"distinct-db-secret", "distinct-master-key-bytes-32!!xx",
+			"distinct-machine-secret", "distinct-console-secret", "distinct-gemini-secret",
+			"distinct-antigravity-secret", "distinct-metrics-secret",
+		} {
+			if strings.Contains(output, secret) {
+				t.Fatalf("formatted config exposes %q: %s", secret, output)
+			}
+		}
+		if !strings.Contains(output, "[REDACTED]") {
+			t.Fatalf("formatted config lacks redaction: %s", output)
+		}
+	}
+	for _, output := range outputs[:3] {
+		if !strings.Contains(output, "visible-key-id") || !strings.Contains(output, "gemini-id") {
+			t.Fatalf("formatted Serve loses nonsecret fields: %s", output)
+		}
+	}
+	if got := string(cfg.Database.URL); got != vars["DATABASE_URL"] {
+		t.Fatal("database URL changed during parsing")
+	}
+	if got := string(cfg.ClientSecret); got != vars["CLIENT_SECRET"] {
+		t.Fatal("client secret changed during parsing")
+	}
+	if got := string(cfg.MasterKeys["visible-key-id"]); got != "distinct-master-key-bytes-32!!xx" {
+		t.Fatal("master key changed during parsing")
+	}
+}
 
 func TestNormalizeOrigin(t *testing.T) {
 	tests := []struct {
