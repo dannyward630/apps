@@ -32,14 +32,12 @@ type pendingCheckpoint struct {
 
 // checkpointer drives the metering checkpoints of one call.
 type checkpointer struct {
-	sink     MeterSink
-	metrics  *Metrics
-	logger   *slog.Logger
-	interval time.Duration
-	timeout  time.Duration
-	// finalAttempts bounds commit attempts for the final checkpoint.
-	finalAttempts int
-	retryDelay    time.Duration
+	sink       MeterSink
+	metrics    *Metrics
+	logger     *slog.Logger
+	interval   time.Duration
+	timeout    time.Duration
+	retryDelay time.Duration
 }
 
 // run commits periodic checkpoints until stop is closed.
@@ -70,15 +68,14 @@ func (cp *checkpointer) commit(ctx context.Context, call *callState, record func
 	if state.finalCommitted {
 		return true
 	}
-	attempts := 1
-	if final {
-		attempts = max(cp.finalAttempts, 1)
-	}
 	if state.pending != nil {
-		if !cp.send(ctx, call, state, state.pending, attempts) {
+		if !cp.send(ctx, call, state, state.pending) {
 			return false
 		}
 		state.pending = nil
+		if state.finalCommitted {
+			return true
+		}
 	}
 	req := call.requestBytes.Load()
 	resp := call.responseBytes.Load()
@@ -104,7 +101,7 @@ func (cp *checkpointer) commit(ctx context.Context, call *callState, record func
 	// The checkpoint is billed state from here on: on failure it is resent
 	// unchanged with the same sequence number.
 	state.billedReq, state.billedResp = req, resp
-	if !cp.send(ctx, call, state, next, attempts) {
+	if !cp.send(ctx, call, state, next) {
 		state.pending = next
 		return false
 	}
@@ -114,32 +111,26 @@ func (cp *checkpointer) commit(ctx context.Context, call *callState, record func
 	return true
 }
 
-func (cp *checkpointer) send(ctx context.Context, call *callState, state *checkpointState, p *pendingCheckpoint, attempts int) bool {
-	for attempt := 1; attempt <= attempts; attempt++ {
-		sinkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cp.timeout)
-		err := cp.sink.Checkpoint(sinkCtx, call.id, p.deltaReq, p.deltaResp, p.final, p.record)
-		cancel()
-		if err == nil {
-			cp.metrics.billed(p.deltaReq, p.deltaResp)
-			if p.final {
-				state.finalCommitted = true
-			}
-			return true
+func (cp *checkpointer) send(ctx context.Context, call *callState, state *checkpointState, p *pendingCheckpoint) bool {
+	sinkCtx, cancel := context.WithTimeout(ctx, cp.timeout)
+	err := cp.sink.Checkpoint(sinkCtx, call.id, p.deltaReq, p.deltaResp, p.final, p.record)
+	cancel()
+	if err == nil {
+		cp.metrics.billed(p.deltaReq, p.deltaResp)
+		if p.final {
+			state.finalCommitted = true
 		}
-		cp.metrics.checkpointFailure()
-		// Uncommitted bytes are lost if the process stops before a later
-		// checkpoint commits them, so every failure alerts.
-		cp.logger.Error("metering checkpoint failed",
-			slog.Bool("alert", true),
-			slog.String("call_id", call.id),
-			slog.Int64("checkpoint_seq", p.record.CheckpointSeq),
-			slog.Bool("final", p.final),
-			slog.Int("attempt", attempt),
-			slog.String("error", err.Error()),
-		)
-		if attempt < attempts && cp.retryDelay > 0 {
-			time.Sleep(cp.retryDelay * time.Duration(attempt))
-		}
+		return true
 	}
+	cp.metrics.checkpointFailure()
+	// Uncommitted bytes are lost if the process stops before a later
+	// checkpoint commits them, so every failure alerts.
+	cp.logger.Error("metering checkpoint failed",
+		slog.Bool("alert", true),
+		slog.String("call_id", call.id),
+		slog.Int64("checkpoint_seq", p.record.CheckpointSeq),
+		slog.Bool("final", p.final),
+		slog.String("error", err.Error()),
+	)
 	return false
 }

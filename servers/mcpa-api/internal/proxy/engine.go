@@ -133,6 +133,8 @@ type Engine struct {
 	cp        *checkpointer
 	ctx       context.Context
 	cancel    context.CancelFunc
+	// retryWG tracks final checkpoints retained after their responses finish.
+	retryWG sync.WaitGroup
 	// janitorDone is closed when the janitor goroutine has exited. It is nil
 	// when the janitor is disabled.
 	janitorDone chan struct{}
@@ -221,13 +223,12 @@ func New(opts Options) (*Engine, error) {
 		relay:     relay,
 		persister: newAsyncPersister(opts.Tokens, logger, opts.CheckpointTimeout),
 		cp: &checkpointer{
-			sink:          opts.Sink,
-			metrics:       opts.Metrics,
-			logger:        logger,
-			interval:      opts.CheckpointInterval,
-			timeout:       opts.CheckpointTimeout,
-			finalAttempts: 3,
-			retryDelay:    100 * time.Millisecond,
+			sink:       opts.Sink,
+			metrics:    opts.Metrics,
+			logger:     logger,
+			interval:   opts.CheckpointInterval,
+			timeout:    opts.CheckpointTimeout,
+			retryDelay: 100 * time.Millisecond,
 		},
 		ctx:      ctx,
 		cancel:   cancel,
@@ -273,6 +274,17 @@ func (e *Engine) CloseContext(ctx context.Context) error {
 		rt.shutdown()
 	}
 	e.cancel()
+	// No new retry can be registered after closed is set. Cancel the sink
+	// context, then wait for retained calls within the shutdown deadline.
+	retriesDone := make(chan struct{})
+	go func() {
+		e.retryWG.Wait()
+		close(retriesDone)
+	}()
+	select {
+	case <-retriesDone:
+	case <-ctx.Done():
+	}
 	// The janitor exits on the cancelled context. It takes e.mu only briefly
 	// and observes closed, so waiting here cannot deadlock.
 	if e.janitorDone != nil {
@@ -283,6 +295,34 @@ func (e *Engine) CloseContext(ctx context.Context) error {
 		e.logger.Warn("closing the upstream relay failed", slog.String("error", err.Error()))
 	}
 	return nil
+}
+
+// retryFinalCheckpoint retains a failed final checkpoint until it commits or
+// the engine stops. The checkpoint state keeps its sequence and deltas across
+// attempts, including when a periodic checkpoint failed before call end.
+func (e *Engine) retryFinalCheckpoint(call *callState, record func(bool) CallRecordUpdate) {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
+	e.retryWG.Add(1)
+	e.mu.Unlock()
+	go func() {
+		defer e.retryWG.Done()
+		ticker := time.NewTicker(e.cp.retryDelay)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-e.ctx.Done():
+				return
+			case <-ticker.C:
+				if e.cp.commit(e.ctx, call, record, true) {
+					return
+				}
+			}
+		}
+	}()
 }
 
 // ValidateCredential reports whether the engine can use cred.

@@ -305,12 +305,11 @@ func TestPeriodicCheckpointSkipsInvalidCallKeyRejection(t *testing.T) {
 				t.Fatal(err)
 			}
 			cp := &checkpointer{
-				sink:          sink,
-				metrics:       metrics,
-				logger:        slog.New(slog.NewTextHandler(bytes.NewBuffer(nil), nil)),
-				interval:      time.Hour,
-				timeout:       time.Second,
-				finalAttempts: 1,
+				sink:     sink,
+				metrics:  metrics,
+				logger:   slog.New(slog.NewTextHandler(bytes.NewBuffer(nil), nil)),
+				interval: time.Hour,
+				timeout:  time.Second,
 			}
 			call := &callState{id: "c-invalid-key"}
 			record := func(bool) CallRecordUpdate { return CallRecordUpdate{CallID: call.id} }

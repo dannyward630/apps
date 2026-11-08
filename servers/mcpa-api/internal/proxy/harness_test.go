@@ -231,6 +231,7 @@ type checkpointEntry struct {
 	deltaReq  int64
 	deltaResp int64
 	final     bool
+	committed bool
 	record    CallRecordUpdate
 }
 
@@ -247,11 +248,17 @@ func newRecordingSink() *recordingSink {
 }
 
 func (s *recordingSink) Checkpoint(_ context.Context, callID string, deltaReq, deltaResp int64, final bool, record CallRecordUpdate) error {
+	failed := false
+	for remaining := s.failNext.Load(); remaining > 0; remaining = s.failNext.Load() {
+		if s.failNext.CompareAndSwap(remaining, remaining-1) {
+			failed = true
+			break
+		}
+	}
 	s.mu.Lock()
-	s.entries = append(s.entries, checkpointEntry{callID: callID, deltaReq: deltaReq, deltaResp: deltaResp, final: final, record: record})
+	s.entries = append(s.entries, checkpointEntry{callID: callID, deltaReq: deltaReq, deltaResp: deltaResp, final: final, committed: !failed, record: record})
 	s.mu.Unlock()
-	if s.failNext.Load() > 0 {
-		s.failNext.Add(-1)
+	if failed {
 		return errors.New("sink unavailable")
 	}
 	if final {
@@ -276,13 +283,12 @@ func (s *recordingSink) waitFinal(t *testing.T, callID string) CallRecordUpdate 
 	}
 }
 
-// final returns the committed final record. Failed attempts are recorded too,
-// so the last final entry is the committed one.
+// final returns the committed final record.
 func (s *recordingSink) final(callID string) (CallRecordUpdate, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := len(s.entries) - 1; i >= 0; i-- {
-		if s.entries[i].callID == callID && s.entries[i].final {
+		if s.entries[i].callID == callID && s.entries[i].final && s.entries[i].committed {
 			return s.entries[i].record, true
 		}
 	}
@@ -296,7 +302,7 @@ func (s *recordingSink) committed(callID string) []checkpointEntry {
 	defer s.mu.Unlock()
 	bySeq := map[int64]checkpointEntry{}
 	for _, entry := range s.entries {
-		if entry.callID == callID {
+		if entry.callID == callID && entry.committed {
 			bySeq[entry.record.CheckpointSeq] = entry
 		}
 	}

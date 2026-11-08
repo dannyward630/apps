@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	mcpav1 "github.com/delinoio/apps/protos/mcpa/v1"
@@ -195,6 +196,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer e.relay.CloseCall(call.id)
 	cw := newCountingResponseWriter(w, call)
 	var result outcome
+	var finalLatency time.Duration
 	record := func(final bool) CallRecordUpdate {
 		call.mu.Lock()
 		update := CallRecordUpdate{
@@ -214,13 +216,13 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			update.Status = result.status
 			update.ProviderStatusClass = result.statusClass
 			update.ErrorClass = result.errorClass
-			update.Latency = e.opts.Now().Sub(call.start)
+			update.Latency = finalLatency
 		}
 		return update
 	}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Go(func() { e.cp.run(ctx, call, record, stop) })
+	wg.Go(func() { e.cp.run(context.WithoutCancel(ctx), call, record, stop) })
 
 	// A provider response that exceeds the size limit is cut off by the
 	// metering transport or, for the SDK Claude client, by its relay tunnel.
@@ -229,6 +231,9 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	e.relay.watchCall(call.id, callWatch{exempt: call.isStreaming, onLimit: call.markResponseTooLarge})
 	e.serveCall(cw, r, call, rt, rest)
 	cw.finish()
+	// Freeze persisted latency when the response finishes. Periodic checkpoint
+	// retries and delayed final-record construction can continue after this point.
+	finalLatency = e.opts.Now().Sub(call.start)
 
 	close(stop)
 	wg.Wait()
@@ -251,8 +256,12 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result = classify(call.outcomeInput(ctx.Err() != nil, cw.statusCode()))
-	latency := e.opts.Now().Sub(call.start)
-	e.cp.commit(ctx, call, record, true)
+	latency := finalLatency
+	// Complete one final attempt before returning. A failed checkpoint remains
+	// owned by the engine so the response does not wait for retry sleeps.
+	if !e.cp.commit(context.WithoutCancel(ctx), call, record, true) {
+		e.retryFinalCheckpoint(call, record)
+	}
 
 	call.mu.Lock()
 	provider := call.provider
