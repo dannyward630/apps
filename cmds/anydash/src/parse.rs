@@ -62,10 +62,10 @@ fn codex_usage(v: &Value) -> Result<[u64; 4], Unreadable> {
         required(v, "output_tokens")?,
     ])
 }
-/// Codex `input_tokens` already includes cached tokens, so uncached input subtracts them.
+/// Codex `input_tokens` includes cache reads and writes, so uncached input excludes both.
 const fn codex_tokens(u: [u64; 4]) -> Tokens {
     Tokens {
-        input: u[0].saturating_sub(u[1]),
+        input: u[0].saturating_sub(u[1]).saturating_sub(u[2]),
         cache_read: u[1],
         cache_write: u[2],
         output: u[3],

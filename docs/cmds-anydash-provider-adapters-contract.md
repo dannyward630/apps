@@ -64,7 +64,7 @@ Local session usage covers Codex and Claude Code.
 - The collector auto-detects the default paths and the official environment variable overrides. Codex: `$CODEX_HOME/sessions/YYYY/MM/DD/*.jsonl` (default `$CODEX_HOME` is `~/.codex`), compressed `.jsonl.zst` files, and `archived_sessions/`. Claude Code: `~/.claude/projects/**/*.jsonl`, `$XDG_CONFIG_HOME/claude`, and `CLAUDE_CONFIG_DIR`, which can hold comma-separated values. Users can add paths and disable detected paths.
 - Metrics per device and in total: session count, input, output, cache-read and cache-write tokens, and estimated cost.
 - Parsing rules:
-  - Codex `total_token_usage` is cumulative per session. Compute each delta from the previous total. Codex `input_tokens` already includes cached tokens.
+  - Codex `total_token_usage` is cumulative per session. Compute each delta from the previous total. Codex `input_tokens` includes cache reads and cache writes.
   - Claude Code entries are deduplicated by `message.id` + `requestId`. When duplicates exist, keep the entry with the larger token total.
   - Records that the parser cannot read are skipped. Readable records are still aggregated. Each device and tool shows a "partial aggregation" state with the count of skipped records and asks the user to update the collector.
 - On first connection, the collector backfills the last 90 days of local sessions. Claude Code deletes transcripts after 30 days by default (`cleanupPeriodDays`), so backfill is limited to the files that still exist.

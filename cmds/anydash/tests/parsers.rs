@@ -8,7 +8,7 @@ use anydash::{
     store::{FileCursor, Store, Tokens},
     time,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{io::Write as _, path::Path};
 fn now() -> i64 {
     time::parse("2026-10-31T12:00:00Z").unwrap()
@@ -28,6 +28,20 @@ fn codex_token(
                  "last_token_usage": {"input_tokens": 7, "cached_input_tokens": 2, "output_tokens": 1}},
         "rate_limits": rate_limits}})
     .to_string()
+}
+fn codex_token_with_cache_write(
+    ts: &str,
+    input: u64,
+    cached: u64,
+    write: Option<u64>,
+    output: u64,
+) -> String {
+    let mut value: Value =
+        serde_json::from_str(&codex_token(ts, input, cached, output, None)).unwrap();
+    if let Some(write) = write {
+        value["payload"]["info"]["total_token_usage"]["cache_write_input_tokens"] = json!(write);
+    }
+    value.to_string()
 }
 fn codex_session(lines: &[String]) -> String {
     lines.iter().fold(String::new(), |mut s, l| {
@@ -100,6 +114,80 @@ fn codex_cumulative_deltas_and_cached_input() {
         matches!(sessions[0], Event::Session { model, at, .. } if model == UNKNOWN_MODEL && *at == time::parse("2026-10-31T10:01:00Z").unwrap())
     );
     assert!(matches!(sessions[1], Event::Session { model, .. } if model == "gpt-5.5"));
+}
+#[test]
+fn codex_cache_writes_are_not_uncached_input() {
+    let mut state = CodexState::default();
+    let mut events = vec![];
+    parse::codex_line(
+        &codex_token_with_cache_write("2026-10-31T10:02:00Z", 100, 40, Some(60), 10),
+        &mut state,
+        "file",
+        0,
+        &mut events,
+    )
+    .unwrap();
+    let first = events.iter().find_map(|event| match event {
+        Event::Tokens { tokens, .. } => Some(*tokens),
+        _ => None,
+    });
+    assert_eq!(
+        first,
+        Some(Tokens {
+            input: 0,
+            cache_read: 40,
+            cache_write: 60,
+            output: 10,
+        })
+    );
+    assert_eq!(first.unwrap().total(), 110);
+
+    events.clear();
+    parse::codex_line(
+        &codex_token_with_cache_write("2026-10-31T10:03:00Z", 101, 40, Some(65), 11),
+        &mut state,
+        "file",
+        0,
+        &mut events,
+    )
+    .unwrap();
+    assert_eq!(
+        events.iter().find_map(|event| match event {
+            Event::Tokens { tokens, .. } => Some(*tokens),
+            _ => None,
+        }),
+        Some(Tokens {
+            input: 0,
+            cache_read: 0,
+            cache_write: 5,
+            output: 1,
+        })
+    );
+
+    for write in [None, Some(0)] {
+        let mut state = CodexState::default();
+        let mut events = vec![];
+        parse::codex_line(
+            &codex_token_with_cache_write("2026-10-31T10:02:00Z", 100, 40, write, 10),
+            &mut state,
+            "file",
+            0,
+            &mut events,
+        )
+        .unwrap();
+        assert_eq!(
+            events.iter().find_map(|event| match event {
+                Event::Tokens { tokens, .. } => Some(*tokens),
+                _ => None,
+            }),
+            Some(Tokens {
+                input: 60,
+                cache_read: 40,
+                cache_write: 0,
+                output: 10,
+            })
+        );
+    }
 }
 #[test]
 fn codex_rate_limits_extraction_and_unknown_plan() {
