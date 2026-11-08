@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,6 +161,130 @@ func TestProviderErrorsPassThroughWithoutRetry(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestModelSupportErrorsDoNotSuspendCredential(t *testing.T) {
+	for _, tc := range []struct {
+		name, message string
+		status        int
+	}{
+		{"unsupported 400", "model not supported", http.StatusBadRequest},
+		{"unsupported 422", "unsupported model", http.StatusUnprocessableEntity},
+		{"ordinary 400", "ordinary bad request", http.StatusBadRequest},
+		{"unauthorized", "invalid credential", http.StatusUnauthorized},
+		{"forbidden", "forbidden", http.StatusForbidden},
+		{"rate limited", "rate limited", http.StatusTooManyRequests},
+		{"server error", "server error", http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, `{"error":{"message":"`+tc.message+`","type":"upstream_error"}}`)
+			})
+			resourceID := newResourceID()
+			key := h.addKey(resourceID)
+			h.addCredential(compatCredential(resourceID, up.URL(), "sk-local", "m1"))
+			for range 2 {
+				res := h.call(http.MethodPost, "/r/"+resourceID+"/v1/chat/completions", key, chatBody, nil)
+				if res.resp.StatusCode != tc.status || !strings.Contains(string(res.body), tc.message) {
+					t.Fatalf("status %d body %s, want %d and %q", res.resp.StatusCode, res.body, tc.status, tc.message)
+				}
+				record := h.sink.waitFinal(t, res.callID)
+				if record.Status == mcpav1.CallStatus_CALL_STATUS_NO_CREDENTIAL {
+					t.Fatalf("credential lost: %+v", record)
+				}
+			}
+			if got := up.hits.Load(); got != 2 {
+				t.Fatalf("provider hits %d, want 2", got)
+			}
+		})
+	}
+}
+
+func TestModelSupportErrorThenSuccess(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			h := newHarness(t)
+			var calls int
+			up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.ReadAll(r.Body)
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				if calls == 1 {
+					w.WriteHeader(status)
+					_, _ = io.WriteString(w, `{"error":{"message":"model not supported"}}`)
+				} else {
+					_, _ = io.WriteString(w, openAIChatResponse("m1", "available"))
+				}
+			})
+			resourceID := newResourceID()
+			key := h.addKey(resourceID)
+			cred := compatCredential(resourceID, up.URL(), "sk-local", "m1")
+			h.addCredential(cred)
+			first := h.call(http.MethodPost, "/r/"+resourceID+"/v1/chat/completions", key, chatBody, nil)
+			if first.resp.StatusCode != status || !strings.Contains(string(first.body), "model not supported") {
+				t.Fatalf("first response: %d %s", first.resp.StatusCode, first.body)
+			}
+			firstRecord := h.sink.waitFinal(t, first.callID)
+			if firstRecord.Status != mcpav1.CallStatus_CALL_STATUS_PROVIDER_ERROR || firstRecord.ProviderStatusClass != mcpav1.StatusClass_STATUS_CLASS_4XX {
+				t.Fatalf("first record: %+v", firstRecord)
+			}
+			h.engine.mu.Lock()
+			rt := h.engine.runtimes[resourceID]
+			h.engine.mu.Unlock()
+			auth, ok := rt.manager.GetByID(cred.ID)
+			if !ok || auth.ModelStates["m1"] == nil || !auth.ModelStates["m1"].NextRetryAfter.IsZero() {
+				t.Fatalf("model state still has cooldown: %+v", auth)
+			}
+			second := h.call(http.MethodPost, "/r/"+resourceID+"/v1/chat/completions", key, chatBody, nil)
+			if second.resp.StatusCode != http.StatusOK || !strings.Contains(string(second.body), "available") {
+				t.Fatalf("second response: %d %s", second.resp.StatusCode, second.body)
+			}
+			secondRecord := h.sink.waitFinal(t, second.callID)
+			if secondRecord.Status != mcpav1.CallStatus_CALL_STATUS_SUCCEEDED || up.hits.Load() != 2 {
+				t.Fatalf("second record: %+v, provider hits %d", secondRecord, up.hits.Load())
+			}
+		})
+	}
+}
+
+func TestModelSupportConcurrentResultsLeaveCredentialAvailable(t *testing.T) {
+	h := newHarness(t)
+	var ready sync.WaitGroup
+	var seen atomic.Int64
+	ready.Add(8)
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		if seen.Add(1) <= 8 {
+			ready.Done()
+			ready.Wait()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"model not supported"}}`)
+	})
+	resourceID := newResourceID()
+	key := h.addKey(resourceID)
+	h.addCredential(compatCredential(resourceID, up.URL(), "sk-local", "m1"))
+	var group sync.WaitGroup
+	for range 8 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			res := h.call(http.MethodPost, "/r/"+resourceID+"/v1/chat/completions", key, chatBody, nil)
+			if res.resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("concurrent response: %d %s", res.resp.StatusCode, res.body)
+			}
+		}()
+	}
+	group.Wait()
+	res := h.call(http.MethodPost, "/r/"+resourceID+"/v1/chat/completions", key, chatBody, nil)
+	if res.resp.StatusCode != http.StatusBadRequest || up.hits.Load() != 9 {
+		t.Fatalf("later response: %d %s; provider hits %d", res.resp.StatusCode, res.body, up.hits.Load())
 	}
 }
 

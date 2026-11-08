@@ -527,7 +527,7 @@ func (e *Engine) runtime(ctx context.Context, resourceID string) (*resourceRunti
 func (e *Engine) build(ctx context.Context, rt *resourceRuntime) {
 	rt.logger = e.logger.With(slog.String("resource_id", rt.id))
 	rt.store = newResourceStore(rt.id, e.persister)
-	manager := coreauth.NewManager(rt.store, &coreauth.RoundRobinSelector{}, nil)
+	manager := coreauth.NewManager(rt.store, &coreauth.RoundRobinSelector{}, &modelSupportCooldownHook{rt: rt})
 	manager.SetConfig(e.cfg)
 	// One attempt, one credential, no cooldown wait (no retry across accounts
 	// or providers).
