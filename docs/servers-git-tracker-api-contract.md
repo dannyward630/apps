@@ -18,6 +18,7 @@ External individuals and organizations, CI jobs and service operators.
 
 ### Identity, spaces, authorization, and visibility
 
+- Validate nonempty space IDs as canonical lowercase UUID v7 values before Delcore calls. Reject noncanonical IDs as invalid-argument without recording a server error; preserve Delcore invalid-argument responses as client errors.
 - Sign in with the shared Delino account and link a GitHub account. Logto owns identity; Delcore owns shared personal and organization tenants, memberships, and service permissions. Do not create a separate Git Tracker organization or membership system.
 - Use Git Tracker service roles: View, Edit, and Manage. View permits reads; Edit permits measurement uploads and completion; Manage additionally permits repository connection, token management, and repository/dataset/execution deletion. YAML configuration is supplied with the execution; there is no separate web configuration editor.
 - Authorization is space-wide. A member with Git Tracker read permission can read all connected repository measurements in that space.

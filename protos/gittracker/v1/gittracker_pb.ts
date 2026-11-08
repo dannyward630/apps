@@ -396,6 +396,8 @@ export type Repository = Message<"gittracker.v1.Repository"> & {
   id: string;
 
   /**
+   * Canonical lowercase UUID v7 of the owning Delino space.
+   *
    * @generated from field: string space_id = 2;
    */
   spaceId: string;
@@ -438,6 +440,8 @@ export const RepositorySchema: GenMessage<Repository> = /*@__PURE__*/
  */
 export type ConnectRepositoryRequest = Message<"gittracker.v1.ConnectRepositoryRequest"> & {
   /**
+   * Required canonical lowercase UUID v7 of the Delino space.
+   *
    * @generated from field: string space_id = 1;
    */
   spaceId: string;
@@ -482,6 +486,8 @@ export const ConnectRepositoryResponseSchema: GenMessage<ConnectRepositoryRespon
  */
 export type ListRepositoriesRequest = Message<"gittracker.v1.ListRepositoriesRequest"> & {
   /**
+   * Canonical lowercase UUID v7 of the Delino space; empty lists public repositories.
+   *
    * @generated from field: string space_id = 1;
    */
   spaceId: string;

@@ -611,6 +611,7 @@ struct Fixture {
     http: reqwest::Client,
     base: String,
     github: Arc<GitHubMock>,
+    delcore_requests: Arc<std::sync::atomic::AtomicU64>,
     schema: String,
     admin: sqlx::PgPool,
     space: String,
@@ -658,11 +659,17 @@ async fn fixture() -> Fixture {
         fail_metadata: false.into(),
         gate: std::sync::Mutex::new(None),
     });
+    let delcore_requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let delcore_mock = delcore_requests.clone();
     let (commit_mock, actor_mock, github_mock) = (commit.clone(), actor.clone(), github.clone());
     let mock = Router::new().fallback(move |r: Request| {
         let (commit, actor, github) = (commit_mock.clone(), actor_mock.clone(), github_mock.clone());
+        let delcore_requests = delcore_mock.clone();
         async move {
             let p = r.uri().path().to_owned();
+            if p.starts_with("/delcore.v1.DelcoreService/") {
+                delcore_requests.fetch_add(1, Ordering::SeqCst);
+            }
             let auth = r
                 .headers()
                 .get("authorization")
@@ -756,6 +763,7 @@ async fn fixture() -> Fixture {
         http,
         base,
         github,
+        delcore_requests,
         schema,
         admin,
         space,
@@ -891,6 +899,47 @@ impl Fixture {
             1
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_space_id_validation_precedes_delcore_requests() {
+    use std::sync::atomic::Ordering;
+
+    let fixture = fixture().await;
+    let invalid = [
+        "x".to_owned(),
+        fixture.space.to_uppercase(),
+        "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+    ];
+    for space in invalid {
+        for (method, body) in [
+            ("ListRepositories", json!({"spaceId":space})),
+            (
+                "ConnectRepository",
+                json!({"spaceId":space,"fullName":"owner/repo","githubAccessToken":"fixture"}),
+            ),
+        ] {
+            let before = fixture.delcore_requests.load(Ordering::SeqCst);
+            let (status, response) = fixture.call(method, "Bearer manager", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method}: {response}");
+            assert_eq!(response["code"], "invalid_argument", "{method}: {response}");
+            assert_eq!(fixture.delcore_requests.load(Ordering::SeqCst), before);
+        }
+    }
+    assert!(fixture.row().await.is_none());
+
+    let (status, listed) = fixture
+        .call(
+            "ListRepositories",
+            "Bearer manager",
+            json!({"spaceId":fixture.space}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert!(fixture.delcore_requests.load(Ordering::SeqCst) > 0);
+    let (status, connected) = fixture.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
 }
 
 fn webhook_event() -> (String, Vec<u8>) {

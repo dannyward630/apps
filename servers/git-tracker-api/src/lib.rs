@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use server_common::{
     Fault, Result,
     authority::{Authority, Role},
-    integer, now, string, uuid,
+    canonical_id, integer, now, string, uuid,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool, Row};
@@ -208,6 +208,9 @@ impl Server {
         if op == Op::ListRepositories {
             let space = string(&q, "spaceId");
             if !space.is_empty() {
+                if !canonical_id(space) {
+                    return Err(Fault::invalid("invalid space ID"));
+                }
                 self.authority
                     .allow(authorization, space, Role::View)
                     .await?
@@ -419,6 +422,9 @@ impl Server {
     }
     async fn connect_repository(&self, h: &str, q: &Value, trace: &str) -> Result<Value> {
         let space = string(q, "spaceId");
+        if !canonical_id(space) {
+            return Err(Fault::invalid("invalid space ID"));
+        }
         let space_id = uuid(space)?;
         self.authority.allow(h, space, Role::Manage).await?;
         self.authority.manager(h, space).await?;

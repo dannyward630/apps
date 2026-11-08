@@ -1026,14 +1026,15 @@ func (x *Comparison) GetBaselineUnit() string {
 }
 
 type Repository struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	Id                 string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	SpaceId            string                 `protobuf:"bytes,2,opt,name=space_id,json=spaceId,proto3" json:"space_id,omitempty"`
-	FullName           string                 `protobuf:"bytes,3,opt,name=full_name,json=fullName,proto3" json:"full_name,omitempty"`
-	Public             bool                   `protobuf:"varint,4,opt,name=public,proto3" json:"public,omitempty"`
-	Connected          bool                   `protobuf:"varint,5,opt,name=connected,proto3" json:"connected,omitempty"`
-	InstallationId     string                 `protobuf:"bytes,6,opt,name=installation_id,json=installationId,proto3" json:"installation_id,omitempty"`
-	GithubRepositoryId string                 `protobuf:"bytes,7,opt,name=github_repository_id,json=githubRepositoryId,proto3" json:"github_repository_id,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Id    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Canonical lowercase UUID v7 of the owning Delino space.
+	SpaceId            string `protobuf:"bytes,2,opt,name=space_id,json=spaceId,proto3" json:"space_id,omitempty"`
+	FullName           string `protobuf:"bytes,3,opt,name=full_name,json=fullName,proto3" json:"full_name,omitempty"`
+	Public             bool   `protobuf:"varint,4,opt,name=public,proto3" json:"public,omitempty"`
+	Connected          bool   `protobuf:"varint,5,opt,name=connected,proto3" json:"connected,omitempty"`
+	InstallationId     string `protobuf:"bytes,6,opt,name=installation_id,json=installationId,proto3" json:"installation_id,omitempty"`
+	GithubRepositoryId string `protobuf:"bytes,7,opt,name=github_repository_id,json=githubRepositoryId,proto3" json:"github_repository_id,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -1118,10 +1119,11 @@ func (x *Repository) GetGithubRepositoryId() string {
 }
 
 type ConnectRepositoryRequest struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	SpaceId           string                 `protobuf:"bytes,1,opt,name=space_id,json=spaceId,proto3" json:"space_id,omitempty"`
-	FullName          string                 `protobuf:"bytes,2,opt,name=full_name,json=fullName,proto3" json:"full_name,omitempty"`
-	GithubAccessToken string                 `protobuf:"bytes,3,opt,name=github_access_token,json=githubAccessToken,proto3" json:"github_access_token,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Required canonical lowercase UUID v7 of the Delino space.
+	SpaceId           string `protobuf:"bytes,1,opt,name=space_id,json=spaceId,proto3" json:"space_id,omitempty"`
+	FullName          string `protobuf:"bytes,2,opt,name=full_name,json=fullName,proto3" json:"full_name,omitempty"`
+	GithubAccessToken string `protobuf:"bytes,3,opt,name=github_access_token,json=githubAccessToken,proto3" json:"github_access_token,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1222,8 +1224,9 @@ func (x *ConnectRepositoryResponse) GetRepository() *Repository {
 }
 
 type ListRepositoriesRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SpaceId       string                 `protobuf:"bytes,1,opt,name=space_id,json=spaceId,proto3" json:"space_id,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Canonical lowercase UUID v7 of the Delino space; empty lists public repositories.
+	SpaceId       string `protobuf:"bytes,1,opt,name=space_id,json=spaceId,proto3" json:"space_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

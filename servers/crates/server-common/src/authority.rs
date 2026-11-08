@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 use crate::{Fault, Result, canonical_id, string};
+use connectrpc::ErrorCode;
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -121,6 +122,7 @@ impl Authority {
             return Err(match string(&value, "code") {
                 "unauthenticated" => Fault::unauthenticated(),
                 "permission_denied" => Fault::denied(),
+                "invalid_argument" => Fault::invalid("invalid argument"),
                 _ => Fault::unavailable(),
             });
         }
@@ -207,7 +209,13 @@ impl Authority {
                     json!({"tenantId":space,"userId":user,"capability":capability,"paid":false}),
                 )
                 .await
-                .map_err(|_| Fault::unavailable())?;
+                .map_err(|fault| {
+                    if fault.code == ErrorCode::InvalidArgument {
+                        fault
+                    } else {
+                        Fault::unavailable()
+                    }
+                })?;
             if v["allowed"] == true {
                 return Ok(());
             }
@@ -344,6 +352,11 @@ mod tests {
                 ErrorCode::PermissionDenied,
             ),
             (
+                StatusCode::BAD_REQUEST,
+                r#"{"code":"invalid_argument"}"#,
+                ErrorCode::InvalidArgument,
+            ),
+            (
                 StatusCode::SERVICE_UNAVAILABLE,
                 r#"{"code":"unavailable"}"#,
                 ErrorCode::Unavailable,
@@ -362,5 +375,78 @@ mod tests {
                 .expect_err(body);
             assert_eq!(fault.code, code, "{status} {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn allow_preserves_invalid_argument_without_changing_other_outcomes() {
+        let reply = Arc::new(Mutex::new((StatusCode::OK, json!({"allowed": true}))));
+        let authorize_reply = reply.clone();
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            let reply = authorize_reply.clone();
+            async move {
+                match request.uri().path() {
+                    "/token" => (
+                        StatusCode::OK,
+                        Json(json!({"access_token":"fixture","expires_in":3600})),
+                    ),
+                    "/delcore.v1.DelcoreService/GetCurrentUser" => (
+                        StatusCode::OK,
+                        Json(json!({"userId":"01900000-0000-7000-8000-000000000001"})),
+                    ),
+                    "/delcore.v1.DelcoreService/Authorize" => {
+                        let (status, body) = reply.lock().unwrap().clone();
+                        (status, Json(body))
+                    }
+                    _ => (StatusCode::NOT_FOUND, Json(json!({"code":"not_found"}))),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let authority = Authority::new(
+            reqwest::Client::new(),
+            url.clone(),
+            format!("{url}/token"),
+            "resource".into(),
+            "client".into(),
+            "secret".into(),
+        );
+        let space = "01900000-0000-7000-8000-000000000002";
+        let cases = [
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"code":"invalid_argument"}),
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"code":"unavailable"}),
+                ErrorCode::Unavailable,
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                json!({"code":"permission_denied"}),
+                ErrorCode::Unavailable,
+            ),
+            (
+                StatusCode::OK,
+                json!({"allowed":false}),
+                ErrorCode::PermissionDenied,
+            ),
+        ];
+        for (status, body, expected) in cases {
+            *reply.lock().unwrap() = (status, body);
+            let fault = authority
+                .allow("Bearer manager", space, Role::View)
+                .await
+                .expect_err("authorization must fail");
+            assert_eq!(fault.code, expected, "{status}");
+        }
+        *reply.lock().unwrap() = (StatusCode::OK, json!({"allowed":true}));
+        authority
+            .allow("Bearer manager", space, Role::View)
+            .await
+            .unwrap();
     }
 }

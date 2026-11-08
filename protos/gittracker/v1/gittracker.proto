@@ -99,6 +99,7 @@ enum ComparisonStatus {
 }
 message Repository {
   string id = 1;
+  // Canonical lowercase UUID v7 of the owning Delino space.
   string space_id = 2;
   string full_name = 3;
   bool public = 4;
@@ -107,6 +108,7 @@ message Repository {
   string github_repository_id = 7;
 }
 message ConnectRepositoryRequest {
+  // Required canonical lowercase UUID v7 of the Delino space.
   string space_id = 1;
   string full_name = 2;
   string github_access_token = 3;
@@ -115,6 +117,7 @@ message ConnectRepositoryResponse {
   Repository repository = 1;
 }
 message ListRepositoriesRequest {
+  // Canonical lowercase UUID v7 of the Delino space; empty lists public repositories.
   string space_id = 1;
 }
 message ListRepositoriesResponse {
