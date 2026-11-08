@@ -231,10 +231,17 @@ pub async fn enqueue_deletion(
 
 /// Ends every lease held by a device immediately.
 pub async fn end_device_leases(db: &mut PgConnection, device: Uuid) -> Result<()> {
-    sqlx::query(
-        "UPDATE connections SET last_holder_device_id=lease_device_id,lease_device_id=NULL,lease_expires_at=NULL WHERE lease_device_id=$1",
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM connections WHERE lease_device_id=$1 ORDER BY id FOR UPDATE",
     )
     .bind(device)
+    .fetch_all(&mut *db)
+    .await?;
+    sqlx::query(
+        "UPDATE connections SET last_holder_device_id=lease_device_id,lease_device_id=NULL,lease_expires_at=NULL WHERE id=ANY($2) AND lease_device_id=$1",
+    )
+    .bind(device)
+    .bind(&ids)
     .execute(db)
     .await?;
     Ok(())

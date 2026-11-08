@@ -6,6 +6,190 @@ use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use support::{Fixture, at, id};
 
+async fn shared_leases(expired: bool) -> (Fixture, String, String, String, [String; 3]) {
+    let f = Fixture::setup().await;
+    let person = f.person("lease-order");
+    f.connect(&person).await;
+    let (_, other_token, _) = f.enroll(&person, "other", "").await;
+    let (holder, holder_token, _) = f.enroll(&person, "holder", "").await;
+    let other = f.device(&other_token);
+    let holder_call = f.device(&holder_token);
+    let mut connections = Vec::new();
+    for provider in ["PROVIDER_CODEX", "PROVIDER_CLAUDE_CODE", "PROVIDER_VERCEL"] {
+        let connection = f
+            .ok(
+                &holder_call,
+                "ConnectionService/CreateConnection",
+                json!({"requestId":id(),"provider":provider}),
+            )
+            .await["connection"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        connections.push(connection);
+    }
+    connections.sort();
+    let [c1, c0, c2] = connections.try_into().unwrap();
+    for connection in [&c1, &c2] {
+        f.ok(
+            &other,
+            "ConnectionService/RegisterConnectionDevice",
+            json!({"connectionId":connection}),
+        )
+        .await;
+    }
+    let expiry = if expired {
+        "now()-interval '1 minute'"
+    } else {
+        "now()+interval '5 minutes'"
+    };
+    // Make heap order oppose ID order; the old unordered UPDATE locked c2 before c1.
+    for connection in [&c2, &c0, &c1] {
+        f.exec(&format!(
+            "UPDATE connections SET lease_epoch=1,lease_device_id='{holder}',\
+             lease_acquired_at=now()-interval '10 minutes',lease_expires_at={expiry},\
+             last_holder_device_id='{holder}' WHERE id='{connection}'"
+        ))
+        .await;
+    }
+    let physical: Vec<String> =
+        sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM connections ORDER BY ctid")
+            .fetch_all(&f.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
+    assert_eq!(physical, vec![c2.clone(), c0.clone(), c1.clone()]);
+    let user_authorization = f.user(&person).authorization.unwrap();
+    (f, user_authorization, other_token, holder, [c1, c0, c2])
+}
+
+async fn wait_for_lease_lock_waiters(f: &Fixture, expected: i64) {
+    for _ in 0..300 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT a.pid) FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid \
+             WHERE a.application_name=current_schema() AND NOT l.granted",
+        )
+        .fetch_one(&f.db)
+        .await
+        .unwrap();
+        if waiting >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("expected {expected} blocked connection transactions");
+}
+
+async fn lease_clear_and_heartbeat_complete(expired: bool) {
+    let (f, user_authorization, other_token, holder, [c1, c0, c2]) = shared_leases(expired).await;
+    let barrier = f
+        .lock_row(&format!(
+            "SELECT id FROM connections WHERE id='{c0}' FOR UPDATE"
+        ))
+        .await;
+    let clear = if expired {
+        let server = f.server.clone();
+        tokio::spawn(async move {
+            anydash_api::worker::run(&server, Job::LeaseExpiry, Utc::now(), true)
+                .await
+                .unwrap();
+            None
+        })
+    } else {
+        let base = f.base.clone();
+        let body = json!({"deviceId":holder}).to_string();
+        tokio::spawn(async move {
+            let response = reqwest::Client::new()
+                .post(format!("{base}/anydash.v1.DeviceService/DeleteDevice"))
+                .header("content-type", "application/json")
+                .header("x-anydash-client-kind", "CLIENT_KIND_WEB")
+                .header("x-anydash-client-version", "1.0.0")
+                .header("authorization", user_authorization)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            Some((response.status(), response.text().await.unwrap()))
+        })
+    };
+    wait_for_lease_lock_waiters(&f, 1).await;
+    let base = f.base.clone();
+    let heartbeat = tokio::spawn(async move {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/anydash.v1.CollectorService/Heartbeat"))
+            .header("content-type", "application/json")
+            .header("x-anydash-client-kind", "CLIENT_KIND_CLI")
+            .header("x-anydash-client-version", "1.0.0")
+            .bearer_auth(other_token)
+            .body(json!({"readyConnectionIds":[c1,c2]}).to_string())
+            .send()
+            .await
+            .unwrap();
+        (response.status(), response.text().await.unwrap())
+    });
+    wait_for_lease_lock_waiters(&f, 2).await;
+    barrier.commit().await.unwrap();
+    let clear_result = tokio::time::timeout(std::time::Duration::from_secs(10), clear)
+        .await
+        .unwrap()
+        .unwrap();
+    if let Some((status, body)) = clear_result {
+        assert!(status.is_success(), "DeleteDevice failed: {status}: {body}");
+    }
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(10), heartbeat)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.is_success(), "Heartbeat failed: {status}: {body}");
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM connections WHERE lease_device_id='{holder}'"
+        ))
+        .await,
+        0
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM connections WHERE last_holder_device_id='{holder}'"
+        ))
+        .await,
+        3
+    );
+    for provider in ["codex", "claude_code", "vercel"] {
+        assert_eq!(
+            f.server
+                .metrics
+                .lease_failovers
+                .with_label_values(&[provider])
+                .get(),
+            u64::from(expired),
+            "{provider} failover count"
+        );
+    }
+    if expired {
+        assert_eq!(
+            f.count("SELECT count(*) FROM worker_job_runs WHERE job='lease_expiry' AND last_success_at IS NOT NULL AND last_failure_at IS NULL")
+                .await,
+            1
+        );
+    }
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn delete_device_and_shared_heartbeat_keep_connection_lock_order() {
+    lease_clear_and_heartbeat_complete(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn lease_expiry_and_shared_heartbeat_keep_connection_lock_order() {
+    lease_clear_and_heartbeat_complete(true).await;
+}
+
 fn used(dimension: &str, percent: f64) -> Value {
     json!({"kind":"METRIC_KIND_SUBSCRIPTION_USED_PERCENT","dimension":dimension,"value":{"state":"METRIC_STATE_VALUE","percent":percent},"temporality":"METRIC_TEMPORALITY_INSTANTANEOUS"})
 }

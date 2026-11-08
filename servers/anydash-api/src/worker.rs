@@ -238,13 +238,22 @@ pub fn label<E: Enumeration>(e: E, prefix: &str) -> String {
 }
 
 async fn lease_expiry(s: &Server, now: DateTime<Utc>) -> anyhow::Result<()> {
-    let expired: Vec<i16> = sqlx::query_scalar(
-        "UPDATE connections SET last_holder_device_id=lease_device_id,lease_device_id=NULL,lease_expires_at=NULL \
-         WHERE lease_device_id IS NOT NULL AND lease_expires_at<=$1 RETURNING provider",
+    let mut tx = s.db.begin().await?;
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM connections WHERE lease_device_id IS NOT NULL AND lease_expires_at<=$1 ORDER BY id FOR UPDATE",
     )
     .bind(now)
-    .fetch_all(&s.db)
+    .fetch_all(&mut *tx)
     .await?;
+    let expired: Vec<i16> = sqlx::query_scalar(
+        "UPDATE connections SET last_holder_device_id=lease_device_id,lease_device_id=NULL,lease_expires_at=NULL \
+         WHERE id=ANY($2) AND lease_device_id IS NOT NULL AND lease_expires_at<=$1 RETURNING provider",
+    )
+    .bind(now)
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
     for provider in expired {
         let p: Provider = crate::rpc::enum_of(provider);
         s.metrics
