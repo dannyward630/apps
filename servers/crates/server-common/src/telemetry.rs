@@ -4,6 +4,13 @@ use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts, Registry, TextEncoder,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
 #[derive(Clone, Copy)]
 pub enum Service {
     DevBase,
@@ -91,6 +98,13 @@ impl Metrics {
     }
 }
 pub fn init() -> anyhow::Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>> {
+    init_with_default(LogFormat::Text)
+}
+
+pub fn init_with_default(
+    default_format: LogFormat,
+) -> anyhow::Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>> {
+    let format = select_format(std::env::var("LOG_FORMAT").ok().as_deref(), default_format)?;
     let provider = if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
         || std::env::var_os("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some()
     {
@@ -112,22 +126,65 @@ pub fn init() -> anyhow::Result<Option<opentelemetry_sdk::trace::SdkTracerProvid
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let registry = tracing_subscriber::registry().with(filter).with(layer);
-    match std::env::var("LOG_FORMAT").unwrap_or_default().as_str() {
-        "json" => registry
+    match format {
+        LogFormat::Json => registry
             .with(
                 tracing_subscriber::fmt::layer()
                     .json()
                     .with_writer(std::io::stderr),
             )
             .init(),
-        "" | "text" => registry
+        LogFormat::Text => registry
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_ansi(std::env::var("NO_COLOR").unwrap_or_default().is_empty())
                     .with_writer(std::io::stderr),
             )
             .init(),
-        _ => anyhow::bail!("LOG_FORMAT must be text or json"),
     }
     Ok(provider)
+}
+
+fn select_format(value: Option<&str>, default_format: LogFormat) -> anyhow::Result<LogFormat> {
+    match value {
+        None | Some("") => Ok(default_format),
+        Some("text") => Ok(LogFormat::Text),
+        Some("json") => Ok(LogFormat::Json),
+        Some(_) => anyhow::bail!("LOG_FORMAT must be text or json"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogFormat, select_format};
+
+    #[test]
+    fn selects_service_default_and_explicit_override() {
+        assert_eq!(
+            select_format(None, LogFormat::Json).unwrap(),
+            LogFormat::Json
+        );
+        assert_eq!(
+            select_format(Some(""), LogFormat::Json).unwrap(),
+            LogFormat::Json
+        );
+        assert_eq!(
+            select_format(None, LogFormat::Text).unwrap(),
+            LogFormat::Text
+        );
+        assert_eq!(
+            select_format(Some("text"), LogFormat::Json).unwrap(),
+            LogFormat::Text
+        );
+        assert_eq!(
+            select_format(Some("json"), LogFormat::Text).unwrap(),
+            LogFormat::Json
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_explicit_format() {
+        let error = select_format(Some("xml"), LogFormat::Json).unwrap_err();
+        assert_eq!(error.to_string(), "LOG_FORMAT must be text or json");
+    }
 }

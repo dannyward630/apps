@@ -15,7 +15,8 @@ async fn run() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--dev-env") {
         server_common::config::load_dev_env()?;
     }
-    let telemetry = server_common::telemetry::init()?;
+    let telemetry =
+        server_common::telemetry::init_with_default(server_common::telemetry::LogFormat::Json)?;
     let command = std::env::args()
         .skip(1)
         .find(|a| !a.starts_with("--"))
