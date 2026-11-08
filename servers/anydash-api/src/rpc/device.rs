@@ -665,6 +665,38 @@ async fn reject_charged(tx: Transaction<'_, Postgres>, rejection: ApiError) -> A
     }
 }
 
+async fn revoke_reused_refresh_token(
+    mut tx: Transaction<'_, Postgres>,
+    call: &Call,
+    device: Uuid,
+    user: Uuid,
+) -> Result<ApiError> {
+    sqlx::query("UPDATE devices SET credential_state=$2 WHERE id=$1")
+        .bind(device)
+        .bind(e16(DeviceCredentialState::ReuseRevoked))
+        .execute(&mut *tx)
+        .await?;
+    end_device_leases(&mut tx, device).await?;
+    record(
+        &mut tx,
+        call,
+        Event {
+            kind: ActivityKind::DeviceCredentialsRevoked,
+            actor_device: Some(device),
+            subject_user: Some(user),
+            device: Some(device),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    tracing::warn!(device_id = %device, "refresh token reuse detected; device credentials revoked");
+    Ok(ApiError::new(
+        ErrorReason::RefreshTokenReused,
+        "refresh token reuse detected; device credentials were revoked",
+    ))
+}
+
 pub async fn refresh_device_token(
     s: &Server,
     call: &Call,
@@ -744,30 +776,7 @@ pub async fn refresh_device_token(
     if deleted.is_some() || i32::from(state) != DeviceCredentialState::Active.to_i32() {
         return Err(reject_charged(tx, inactive()).await);
     }
-    sqlx::query("UPDATE devices SET credential_state=$2 WHERE id=$1")
-        .bind(device)
-        .bind(e16(DeviceCredentialState::ReuseRevoked))
-        .execute(&mut *tx)
-        .await?;
-    end_device_leases(&mut tx, device).await?;
-    record(
-        &mut tx,
-        call,
-        Event {
-            kind: ActivityKind::DeviceCredentialsRevoked,
-            actor_device: Some(device),
-            subject_user: Some(user),
-            device: Some(device),
-            ..Default::default()
-        },
-    )
-    .await?;
-    tx.commit().await?;
-    tracing::warn!(device_id = %device, "refresh token reuse detected; device credentials revoked");
-    Err(ApiError::new(
-        ErrorReason::RefreshTokenReused,
-        "refresh token reuse detected; device credentials were revoked",
-    ))
+    Err(revoke_reused_refresh_token(tx, call, device, user).await?)
 }
 
 pub async fn revoke_device_credentials(
@@ -782,20 +791,56 @@ pub async fn revoke_device_credentials(
                 return Err(ApiError::unauthenticated());
             }
             refresh_token_gate(s, call).await?;
+            let digest = crate::sha256(q.refresh_token.as_bytes());
             let mut tx = s.db.begin().await?;
-            let user: Option<Uuid> = sqlx::query_scalar(
-                "SELECT d.user_id FROM device_credentials c JOIN devices d ON d.id=c.device_id WHERE c.device_id=$1 AND c.refresh_token_sha256=$2 FOR UPDATE OF d",
+            let row: Option<(i16, Option<DateTime<Utc>>, Uuid)> = sqlx::query_as(
+                "SELECT credential_state,deleted_at,user_id FROM devices WHERE id=$1 FOR UPDATE",
             )
             .bind(device)
-            .bind(crate::sha256(q.refresh_token.as_bytes()))
             .fetch_optional(&mut *tx)
             .await?;
-            let Some(user) = user else {
+            let Some((state, deleted, user)) = row else {
                 drop(tx);
                 return Err(invalid_refresh_token(s, call).await);
             };
+            let current: Option<DateTime<Utc>> = sqlx::query_scalar(
+                "SELECT refresh_expires_at FROM device_credentials WHERE device_id=$1 AND refresh_token_sha256=$2",
+            )
+            .bind(device)
+            .bind(&digest)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if current.is_none() {
+                let reused: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM device_rotated_refresh_tokens WHERE refresh_token_sha256=$1 AND device_id=$2)",
+                )
+                .bind(&digest)
+                .bind(device)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !reused {
+                    drop(tx);
+                    return Err(invalid_refresh_token(s, call).await);
+                }
+            }
             if let Err(e) = charge_device_token(&mut tx, device).await {
                 return Err(reject_charged(tx, e).await);
+            }
+            if deleted.is_some() || i32::from(state) != DeviceCredentialState::Active.to_i32() {
+                return Err(reject_charged(tx, inactive()).await);
+            }
+            let Some(expires) = current else {
+                return Err(revoke_reused_refresh_token(tx, call, device, user).await?);
+            };
+            if expires <= call.now {
+                sqlx::query("UPDATE devices SET credential_state=$2 WHERE id=$1")
+                    .bind(device)
+                    .bind(e16(DeviceCredentialState::Expired))
+                    .execute(&mut *tx)
+                    .await?;
+                end_device_leases(&mut tx, device).await?;
+                tx.commit().await?;
+                return Err(inactive());
             }
             sqlx::query("DELETE FROM device_credentials WHERE device_id=$1")
                 .bind(device)

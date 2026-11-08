@@ -1132,6 +1132,269 @@ async fn refresh_token_requests_need_one_pooled_connection() {
     f.cleanup().await;
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn collector_logout_authenticates_rotated_and_inactive_refresh_tokens() {
+    let f = Fixture::setup().await;
+    let person = f.person("logout");
+    f.connect(&person).await;
+    let user = f.user(&person);
+    let anonymous = f.anonymous();
+    let invalid_window = "SELECT COALESCE(sum(count),0)::int8 FROM rate_limit_windows WHERE scope=2 AND subject='invalid-refresh:127.0.0.1'";
+
+    let (reused_device, _, refresh1) = f.enroll(&person, "reused", "").await;
+    let lease = id();
+    f.exec(&format!(
+        "INSERT INTO connections(id,user_id,provider,display_name,account_label,account_fingerprint,created_at,lease_device_id,lease_expires_at) \
+         VALUES('{lease}','{}',1,'fixture','','fixture',now(),'{reused_device}',now()+interval '5 minutes')",
+        person.user_id
+    ))
+    .await;
+    let rotated = f
+        .ok(
+            &anonymous,
+            "DeviceService/RefreshDeviceToken",
+            json!({"deviceId":reused_device,"refreshToken":refresh1}),
+        )
+        .await;
+    let refresh2 = rotated["credentials"]["refreshToken"].as_str().unwrap();
+    let access2 = rotated["credentials"]["accessToken"].as_str().unwrap();
+    f.fail(
+        &anonymous,
+        "DeviceService/RevokeDeviceCredentials",
+        json!({"deviceId":reused_device,"refreshToken":refresh1}),
+        "ERROR_REASON_REFRESH_TOKEN_REUSED",
+    )
+    .await;
+    assert_eq!(
+        f.count(&format!(
+            "SELECT COALESCE(sum(count),0)::int8 FROM rate_limit_windows WHERE scope=2 AND subject='{reused_device}'"
+        ))
+        .await,
+        2
+    );
+    assert_eq!(f.count(invalid_window).await, 0);
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM connections WHERE id='{lease}' AND lease_device_id IS NULL AND lease_expires_at IS NULL"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM device_credentials WHERE device_id='{reused_device}'"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM device_rotated_refresh_tokens WHERE device_id='{reused_device}'"
+        ))
+        .await,
+        1
+    );
+    let activity = f.ok(&user, "AccountService/ListActivity", json!({})).await;
+    assert_eq!(
+        activity["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event["deviceId"] == reused_device
+                    && event["kind"] == "ACTIVITY_KIND_DEVICE_CREDENTIALS_REVOKED"
+            })
+            .count(),
+        1
+    );
+    f.fail(
+        &anonymous,
+        "DeviceService/RevokeDeviceCredentials",
+        json!({"deviceId":reused_device,"refreshToken":refresh2}),
+        "ERROR_REASON_DEVICE_CREDENTIALS_INACTIVE",
+    )
+    .await;
+    assert_eq!(
+        f.count(&format!(
+            "SELECT COALESCE(sum(count),0)::int8 FROM rate_limit_windows WHERE scope=2 AND subject='{reused_device}'"
+        ))
+        .await,
+        3
+    );
+    let devices = f.ok(&user, "DeviceService/ListDevices", json!({})).await;
+    let reused = devices["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == reused_device)
+        .unwrap();
+    assert_eq!(
+        reused["credentialState"],
+        "DEVICE_CREDENTIAL_STATE_REUSE_REVOKED"
+    );
+    f.fail(
+        &f.device(access2),
+        "CollectorService/Heartbeat",
+        json!({}),
+        "ERROR_REASON_DEVICE_CREDENTIALS_INACTIVE",
+    )
+    .await;
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM device_credentials WHERE device_id='{reused_device}'"
+        ))
+        .await,
+        1
+    );
+
+    let (revoked_device, revoked_access, revoked_refresh) =
+        f.enroll(&person, "user revoked", "").await;
+    f.ok(
+        &user,
+        "DeviceService/RevokeDeviceCredentials",
+        json!({"deviceId":revoked_device}),
+    )
+    .await;
+    f.fail(
+        &anonymous,
+        "DeviceService/RevokeDeviceCredentials",
+        json!({"deviceId":revoked_device,"refreshToken":revoked_refresh}),
+        "ERROR_REASON_DEVICE_CREDENTIALS_INACTIVE",
+    )
+    .await;
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM device_credentials WHERE device_id='{revoked_device}'"
+        ))
+        .await,
+        1
+    );
+    f.fail(
+        &f.device(&revoked_access),
+        "CollectorService/Heartbeat",
+        json!({}),
+        "ERROR_REASON_DEVICE_CREDENTIALS_INACTIVE",
+    )
+    .await;
+
+    let (expired_device, expired_access, expired_refresh) = f.enroll(&person, "expired", "").await;
+    let expired_lease = id();
+    f.exec(&format!(
+        "INSERT INTO connections(id,user_id,provider,display_name,account_label,account_fingerprint,created_at,lease_device_id,lease_expires_at) \
+         VALUES('{expired_lease}','{}',1,'fixture','','fixture',now(),'{expired_device}',now()+interval '5 minutes')",
+        person.user_id
+    ))
+    .await;
+    f.exec(&format!(
+        "UPDATE device_credentials SET refresh_expires_at=now()-interval '1 second' WHERE device_id='{expired_device}'"
+    ))
+    .await;
+    f.fail(
+        &anonymous,
+        "DeviceService/RevokeDeviceCredentials",
+        json!({"deviceId":expired_device,"refreshToken":expired_refresh}),
+        "ERROR_REASON_DEVICE_CREDENTIALS_INACTIVE",
+    )
+    .await;
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM connections WHERE id='{expired_lease}' AND lease_device_id IS NULL AND lease_expires_at IS NULL"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM device_credentials WHERE device_id='{expired_device}'"
+        ))
+        .await,
+        1
+    );
+    f.fail(
+        &anonymous,
+        "DeviceService/RevokeDeviceCredentials",
+        json!({"deviceId":expired_device,"refreshToken":expired_refresh}),
+        "ERROR_REASON_DEVICE_CREDENTIALS_INACTIVE",
+    )
+    .await;
+    f.fail(
+        &f.device(&expired_access),
+        "CollectorService/Heartbeat",
+        json!({}),
+        "ERROR_REASON_DEVICE_CREDENTIALS_INACTIVE",
+    )
+    .await;
+
+    let (deleted_device, _, deleted_refresh) = f.enroll(&person, "deleted", "").await;
+    f.ok(
+        &user,
+        "DeviceService/DeleteDevice",
+        json!({"deviceId":deleted_device}),
+    )
+    .await;
+    f.fail(
+        &anonymous,
+        "DeviceService/RevokeDeviceCredentials",
+        json!({"deviceId":deleted_device,"refreshToken":deleted_refresh}),
+        "ERROR_REASON_DEVICE_CREDENTIALS_INACTIVE",
+    )
+    .await;
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM device_credentials WHERE device_id='{deleted_device}'"
+        ))
+        .await,
+        1
+    );
+
+    let (active_device, _, active_refresh) = f.enroll(&person, "active", "").await;
+    let forged = format!("adr_{}", "A".repeat(43));
+    f.fail(
+        &anonymous,
+        "DeviceService/RevokeDeviceCredentials",
+        json!({"deviceId":active_device,"refreshToken":forged}),
+        "ERROR_REASON_UNAUTHENTICATED",
+    )
+    .await;
+    assert_eq!(f.count(invalid_window).await, 1);
+    assert_eq!(
+        f.count(&format!(
+            "SELECT COALESCE(sum(count),0)::int8 FROM rate_limit_windows WHERE scope=2 AND subject='{active_device}'"
+        ))
+        .await,
+        0
+    );
+    f.ok(
+        &anonymous,
+        "DeviceService/RevokeDeviceCredentials",
+        json!({"deviceId":active_device,"refreshToken":active_refresh}),
+    )
+    .await;
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM device_credentials WHERE device_id='{active_device}'"
+        ))
+        .await,
+        0
+    );
+    let devices = f.ok(&user, "DeviceService/ListDevices", json!({})).await;
+    for (device, state) in [
+        (&revoked_device, "DEVICE_CREDENTIAL_STATE_REUSE_REVOKED"),
+        (&expired_device, "DEVICE_CREDENTIAL_STATE_EXPIRED"),
+        (&active_device, "DEVICE_CREDENTIAL_STATE_LOGGED_OUT"),
+    ] {
+        let found = devices["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == *device)
+            .unwrap();
+        assert_eq!(found["credentialState"], state);
+    }
+    f.cleanup().await;
+}
+
 /// Polling maps only a missing enrollment to UNAUTHENTICATED. The collector treats that reason as
 /// a permanent invalidation, so a database failure must stay a retryable server error.
 #[tokio::test]
