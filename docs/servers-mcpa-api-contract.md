@@ -29,12 +29,13 @@ On graceful shutdown, the server stops accepting HTTP requests and lets admitted
 
 The binary is `mcpa-api`, built from `./servers/mcpa-api`. It has these subcommands:
 
-| Subcommand                   | Behavior                                                                                                                                                      |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mcpa-api serve [--dev-env]` | Serve all HTTP surfaces and run the background workers. `--dev-env` loads `servers/mcpa-api/.env` when present; process variables, including empty ones, win. |
-| `mcpa-api migrate`           | Apply the embedded SQL migrations explicitly.                                                                                                                 |
-| `mcpa-api check-schema`      | Exit non-zero when the database schema differs from the binary's expected version.                                                                            |
-| `mcpa-api rotate-master-key` | Rewrap every stored data key under the active master key, in batches, without downtime.                                                                       |
+| Subcommand                                              | Behavior                                                                                                                                                      |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mcpa-api serve [--dev-env]`                            | Serve all HTTP surfaces and run the background workers. `--dev-env` loads `servers/mcpa-api/.env` when present; process variables, including empty ones, win. |
+| `mcpa-api migrate`                                      | Apply the embedded SQL migrations explicitly.                                                                                                                 |
+| `mcpa-api check-schema`                                 | Exit non-zero when the database schema differs from the binary's expected version.                                                                            |
+| `mcpa-api rotate-master-key`                            | Rewrap every stored data key under the active master key, in batches, without downtime.                                                                       |
+| `mcpa-api requeue-outbox --reason cardinality_exceeded` | Restore matching poisoned usage rows to pending in batches of 1000 and report the count.                                                                      |
 
 ## Users and Operators
 
@@ -282,15 +283,16 @@ Billable bytes are the request bytes that Managed CPA writes to the provider plu
 - **Checkpoints.** Each call registers an in-flight meter. Every `MCPA_CHECKPOINT_INTERVAL`, and at call end, the server commits the unbilled delta of request and response bytes in one transaction. The transaction updates the call record's cumulative bytes and the daily aggregate, and inserts one outbox row when the delta is non-zero.
 - **Event identity.** The event key is `mcpa:<call_id>:<checkpoint_seq>`. The event carries `service_id` `MCPA_SERVICE_ID`, event type `mcpa.traffic`, `occurred_at` equal to the call's start time at microsecond precision, and the attributes `bytes` (canonical integer decimal of the delta total) and `resource_id`. Each row keeps one Delcore request key, which every delivery reuses.
 - **Crash recovery.** After a crash, only committed checkpoints are billed, exactly once by event key. Bytes after the last checkpoint are not billed. A failed checkpoint is retried at the next interval, increments `mcpa_metering_checkpoint_failures_total` and writes an `alert` error log. Checkpoint failure never blocks the stream.
-- **Delivery.** A worker in the same process runs every `MCPA_OUTBOX_INTERVAL`. It deletes expired rows, then selects up to 100 due pending rows, oldest first, and calls `IngestEvent`.
+- **Delivery.** A worker in the same process runs every `MCPA_OUTBOX_INTERVAL`. It deletes expired rows, then processes up to 20 claims of 100 due pending rows each, oldest first, and calls `IngestEvent`. A cycle stops early when a claim returns fewer than 100 rows.
   - An accepted event or an identical replay deletes the row.
-  - `ERROR_REASON_INVALID_INPUT`, `ERROR_REASON_INVALID_ATTRIBUTE`, `ERROR_REASON_EVENT_IDENTITY_CONFLICT` and `ERROR_REASON_REPORTING_WINDOW_CLOSED` mark the row `poisoned`. A poisoned row is never sent again, is kept until expiry and raises an alert.
-  - Any other result, including transport failures, timeouts, `NO_MATCHING_METER` and `CARDINALITY_EXCEEDED`, keeps the row pending with exponential backoff. The backoff starts at `MCPA_OUTBOX_INTERVAL` and doubles up to one hour.
+  - `ERROR_REASON_INVALID_INPUT`, `ERROR_REASON_INVALID_ATTRIBUTE`, `ERROR_REASON_EVENT_IDENTITY_CONFLICT`, `ERROR_REASON_REPORTING_WINDOW_CLOSED` and `ERROR_REASON_CARDINALITY_EXCEEDED` mark the row `poisoned`. A poisoned row is never sent again, is kept until expiry and raises an alert.
+  - Any other result, including transport failures, timeouts and `NO_MATCHING_METER`, keeps the row pending with exponential backoff. The backoff starts at `MCPA_OUTBOX_INTERVAL` and doubles up to one hour.
   - The worker reads a Delcore reason only from a `delcore.v1.ErrorDetail`. It never logs Delcore response bodies.
 - **Expiry.** A row expires 30 days after its creation. The expiry is fixed at insertion and is never extended. Before each send, the worker deletes an expired row without sending it and counts it. The charge is then lost and is never estimated.
 - **Lateness.** `occurred_at` precedes row creation by up to the call duration. Operators must configure Delcore's `USAGE_LATENESS_SECONDS` to at least 30 days plus the longest expected call duration plus one hour of backoff, and keep `REPORTING_GRACE_SECONDS` above it.
 - **Tenant deletion.** Each cycle asks `GetTenantStates` about the tenants of due rows and deletes the rows of tenants that are explicitly `DELETED`.
 - **Resource deletion.** Pending rows of deleted resources are still delivered.
+- **Cardinality recovery.** Delcore groups this meter by `resource_id`. Operators size `MAX_METER_GROUPS` above the maximum resources one tenant can touch in one billing period. After Delcore has capacity and is ready to accept the same event content, run `mcpa-api requeue-outbox --reason cardinality_exceeded`. The command restores only unexpired rows poisoned with that reason, in transactions of at most 1000 rows, and reports the total. The next worker cycle sends them with their original event and request keys.
 
 ### Budgets
 

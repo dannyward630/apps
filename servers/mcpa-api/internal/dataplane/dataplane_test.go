@@ -51,7 +51,7 @@ func TestClassifyDeliveryReadsDelcoreReasons(t *testing.T) {
 		{reasonError(connect.CodeAlreadyExists, delcorev1.ErrorReason_ERROR_REASON_EVENT_IDENTITY_CONFLICT), "event_identity_conflict", true},
 		{reasonError(connect.CodeFailedPrecondition, delcorev1.ErrorReason_ERROR_REASON_REPORTING_WINDOW_CLOSED), "reporting_window_closed", true},
 		{reasonError(connect.CodeFailedPrecondition, delcorev1.ErrorReason_ERROR_REASON_NO_MATCHING_METER), "no_matching_meter", false},
-		{reasonError(connect.CodeResourceExhausted, delcorev1.ErrorReason_ERROR_REASON_CARDINALITY_EXCEEDED), "cardinality_exceeded", false},
+		{reasonError(connect.CodeResourceExhausted, delcorev1.ErrorReason_ERROR_REASON_CARDINALITY_EXCEEDED), "cardinality_exceeded", true},
 		{connect.NewError(connect.CodeUnavailable, errors.New("down")), "unavailable", false},
 		{connect.NewError(connect.CodeUnauthenticated, errors.New("bad token")), "unauthenticated", false},
 		{connect.NewError(connect.CodePermissionDenied, errors.New("no scope")), "rejected", false},

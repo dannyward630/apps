@@ -13,6 +13,14 @@ import (
 // OutboxState is the delivery state of an outbox row.
 type OutboxState int16
 
+// OutboxPoisonReason identifies an operator-recoverable poisoned category.
+type OutboxPoisonReason string
+
+const OutboxPoisonCardinalityExceeded OutboxPoisonReason = "cardinality_exceeded"
+
+// OutboxRequeueBatchSize bounds one recovery transaction.
+const OutboxRequeueBatchSize = 1000
+
 // Outbox states stored in usage_outbox.state.
 const (
 	OutboxPending  OutboxState = 1
@@ -92,6 +100,25 @@ func PoisonOutbox(ctx context.Context, db DB, id uuid.UUID, at time.Time, catego
 	_, err := db.Exec(ctx, `UPDATE usage_outbox SET state = 2, attempts = attempts + 1, last_attempt_at = $2, last_error = $3
 		WHERE id = $1`, id, at, TruncateUTF8(category, 64))
 	return err
+}
+
+// RequeuePoisonedOutbox restores one bounded batch of matching poisoned rows.
+// SKIP LOCKED lets concurrent operator commands make progress without replaying
+// the same row. The next worker cycle may claim the rows immediately.
+func RequeuePoisonedOutbox(ctx context.Context, db *Store, reason OutboxPoisonReason, at time.Time) (int64, error) {
+	var count int64
+	err := db.InTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `WITH batch AS (
+			SELECT id FROM usage_outbox
+			WHERE state = $1 AND last_error = $2 AND expires_at > $3
+			ORDER BY id LIMIT $4 FOR UPDATE SKIP LOCKED
+		)
+		UPDATE usage_outbox AS o SET state = $5, next_attempt_at = $3
+		FROM batch WHERE o.id = batch.id`, OutboxPoisoned, string(reason), at, OutboxRequeueBatchSize, OutboxPending)
+		count = tag.RowsAffected()
+		return err
+	})
+	return count, err
 }
 
 // DeleteOutboxForTenants removes the rows of tenants that Delcore reported

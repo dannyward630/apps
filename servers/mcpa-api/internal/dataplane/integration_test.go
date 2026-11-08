@@ -652,6 +652,89 @@ func TestIntegrationOutboxRetryPoisonAndExpiry(t *testing.T) {
 	}
 }
 
+func TestIntegrationOutboxCardinalityPoisonAndRequeueInOneCycle(t *testing.T) {
+	e := newEnv(t)
+	var logs bytes.Buffer
+	e.dp.Outbox.log = slog.New(slog.NewJSONHandler(&logs, nil))
+	tenantB := uuid.NewString()
+	seed := func(tenant string, count int, due time.Time, prefix string) {
+		t.Helper()
+		_, err := e.db.Pool.Exec(e.ctx, `INSERT INTO usage_outbox
+			(id, event_key, request_key, tenant_id, resource_id, occurred_at, bytes,
+			 next_attempt_at, create_time, expires_at)
+			SELECT gen_random_uuid(), $1 || n::text, gen_random_uuid(), $2,
+			       gen_random_uuid(), $3::timestamptz, 1, $4::timestamptz,
+			       $3::timestamptz, $3::timestamptz + interval '30 days'
+			FROM generate_series(1, $5) AS n`, prefix, tenant, e.clock.Now().Add(-time.Minute), due, count)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(e.tenant, 1500, e.clock.Now().Add(-time.Second), "cardinality-a-")
+	seed(tenantB, 10, e.clock.Now(), "accepted-b-")
+	e.dc.set(func(f *fakeDelcore) {
+		f.ingestErr = func(event *delcorev1.Event) error {
+			if event.GetTenantId() == e.tenant {
+				return reasonError(connect.CodeResourceExhausted, delcorev1.ErrorReason_ERROR_REASON_CARDINALITY_EXCEEDED)
+			}
+			return nil
+		}
+	})
+	res, err := e.dp.Outbox.Cycle(e.ctx)
+	if err != nil || res.Poisoned != 1500 || res.Delivered != 10 || res.Retried != 0 {
+		t.Fatalf("single cycle = %+v, %v", res, err)
+	}
+	if got := e.scalar(`SELECT count(*) FROM usage_outbox WHERE tenant_id = $1 AND state = 2 AND last_error = 'cardinality_exceeded'`, e.tenant); got != 1500 {
+		t.Fatalf("poisoned A rows = %d", got)
+	}
+	if got := e.scalar(`SELECT count(*) FROM usage_outbox WHERE tenant_id = $1`, tenantB); got != 0 {
+		t.Fatalf("undelivered B rows = %d", got)
+	}
+	if got := testutil.ToFloat64(e.dp.metrics.outboxPoisoned); got != 1500 {
+		t.Fatalf("poisoned gauge = %v", got)
+	}
+	if got := testutil.ToFloat64(e.dp.metrics.outboxFailures.WithLabelValues("cardinality_exceeded")); got != 1500 {
+		t.Fatalf("cardinality failure counter = %v", got)
+	}
+	if !strings.Contains(logs.String(), `"alert":true`) || !strings.Contains(logs.String(), `"category":"cardinality_exceeded"`) {
+		t.Fatal("cardinality poison did not raise an alert log")
+	}
+	before := e.dc.count("IngestEvent")
+	if res, err := e.dp.Outbox.Cycle(e.ctx); err != nil || res.Poisoned != 0 || e.dc.count("IngestEvent") != before {
+		t.Fatalf("poisoned rows were retried: %+v, %v", res, err)
+	}
+
+	// Another poison reason must remain parked while the operator restores A.
+	seed(tenantB, 1, e.clock.Now(), "other-poison-")
+	if _, err := e.db.Pool.Exec(e.ctx, `UPDATE usage_outbox SET state = 2, last_error = 'invalid_attribute' WHERE event_key = 'other-poison-1'`); err != nil {
+		t.Fatal(err)
+	}
+	var requeued int64
+	var batches []int64
+	for {
+		n, err := store.RequeuePoisonedOutbox(e.ctx, e.db, store.OutboxPoisonCardinalityExceeded, e.clock.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		requeued += n
+		batches = append(batches, n)
+		if n < store.OutboxRequeueBatchSize {
+			break
+		}
+	}
+	if requeued != 1500 || len(batches) != 2 || batches[0] != 1000 || batches[1] != 500 || e.scalar(`SELECT count(*) FROM usage_outbox WHERE state = 2 AND last_error = 'invalid_attribute'`) != 1 {
+		t.Fatalf("requeued %d rows in %v or changed another poison reason", requeued, batches)
+	}
+	e.dc.set(func(f *fakeDelcore) { f.ingestErr = nil })
+	res, err = e.dp.Outbox.Cycle(e.ctx)
+	if err != nil || res.Delivered != 1500 || res.Poisoned != 0 {
+		t.Fatalf("requeued delivery = %+v, %v", res, err)
+	}
+	if got := e.scalar(`SELECT count(*) FROM usage_outbox`); got != 1 {
+		t.Fatalf("remaining other-reason row = %d", got)
+	}
+}
+
 func TestIntegrationOutboxReplicasClaimDisjointRows(t *testing.T) {
 	e := newEnv(t)
 	for range 150 {

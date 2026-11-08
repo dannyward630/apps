@@ -21,8 +21,11 @@ import (
 
 // Outbox delivery limits.
 const (
-	// OutboxBatchSize is the number of rows sent per cycle.
+	// OutboxBatchSize is the maximum rows in one claim.
 	OutboxBatchSize = 100
+	// outboxMaxBatchesPerCycle bounds one cycle while allowing fresh tenants
+	// behind a large run of permanently rejected rows to be reached.
+	outboxMaxBatchesPerCycle = 20
 	// OutboxMaxBackoff caps the exponential retry backoff.
 	OutboxMaxBackoff = time.Hour
 	// outboxLease keeps a claimed row from being claimed again while its
@@ -88,7 +91,8 @@ func poisonReason(r delcorev1.ErrorReason) bool {
 	case delcorev1.ErrorReason_ERROR_REASON_INVALID_INPUT,
 		delcorev1.ErrorReason_ERROR_REASON_INVALID_ATTRIBUTE,
 		delcorev1.ErrorReason_ERROR_REASON_EVENT_IDENTITY_CONFLICT,
-		delcorev1.ErrorReason_ERROR_REASON_REPORTING_WINDOW_CLOSED:
+		delcorev1.ErrorReason_ERROR_REASON_REPORTING_WINDOW_CLOSED,
+		delcorev1.ErrorReason_ERROR_REASON_CARDINALITY_EXCEEDED:
 		return true
 	default:
 		return false
@@ -156,10 +160,9 @@ type CycleResult struct {
 	TenantDeleted int64
 }
 
-// Cycle runs one delivery cycle: it deletes expired rows, claims up to 100
-// due pending rows oldest first, drops rows of tenants Delcore reports as
-// DELETED and sends the others with IngestEvent. It then refreshes the
-// gauges.
+// Cycle deletes expired rows and processes up to 20 bounded claims of 100 due
+// pending rows, oldest first. It drops rows of tenants Delcore reports as
+// DELETED and sends the others with IngestEvent, then refreshes the gauges.
 func (w *OutboxWorker) Cycle(ctx context.Context) (CycleResult, error) {
 	var res CycleResult
 	defer w.updateGauges(ctx)
@@ -168,39 +171,47 @@ func (w *OutboxWorker) Cycle(ctx context.Context) (CycleResult, error) {
 	if err != nil {
 		return res, err
 	}
-	claimCtx, cancel := context.WithTimeout(ctx, w.timeout)
-	rows, err := w.db.ClaimOutbox(claimCtx, w.now(), OutboxBatchSize, outboxLease)
-	cancel()
-	if err != nil {
-		w.metrics.outboxFailures.WithLabelValues(categoryStoreError).Inc()
-		return res, err
-	}
-	if len(rows) == 0 {
-		return res, nil
-	}
-	deleted := w.deletedTenants(ctx, rows)
-	if len(deleted) > 0 {
-		list := make([]string, 0, len(deleted))
-		for t := range deleted {
-			list = append(list, t)
-		}
-		n, err := store.DeleteOutboxForTenants(ctx, w.db.Pool, list)
-		if err != nil {
-			return res, err
-		}
-		res.TenantDeleted = n
-		w.metrics.outboxFailures.WithLabelValues(categoryTenantDeleted).Add(float64(n))
-		w.log.Info("dropped usage outbox rows of deleted tenants", "rows", n, "tenants", len(list))
-	}
-	for _, row := range rows {
+	for batch := 0; batch < outboxMaxBatchesPerCycle; batch++ {
 		if ctx.Err() != nil {
-			// Unsent rows become due again when their lease ends.
 			return res, nil
 		}
-		if deleted[row.TenantID] {
-			continue
+		claimCtx, cancel := context.WithTimeout(ctx, w.timeout)
+		rows, err := w.db.ClaimOutbox(claimCtx, w.now(), OutboxBatchSize, outboxLease)
+		cancel()
+		if err != nil {
+			w.metrics.outboxFailures.WithLabelValues(categoryStoreError).Inc()
+			return res, err
 		}
-		w.deliver(ctx, row, &res)
+		if len(rows) == 0 {
+			break
+		}
+		deleted := w.deletedTenants(ctx, rows)
+		if len(deleted) > 0 {
+			list := make([]string, 0, len(deleted))
+			for t := range deleted {
+				list = append(list, t)
+			}
+			n, err := store.DeleteOutboxForTenants(ctx, w.db.Pool, list)
+			if err != nil {
+				return res, err
+			}
+			res.TenantDeleted += n
+			w.metrics.outboxFailures.WithLabelValues(categoryTenantDeleted).Add(float64(n))
+			w.log.Info("dropped usage outbox rows of deleted tenants", "rows", n, "tenants", len(list))
+		}
+		for _, row := range rows {
+			if ctx.Err() != nil {
+				// Unsent rows become due again when their lease ends.
+				return res, nil
+			}
+			if deleted[row.TenantID] {
+				continue
+			}
+			w.deliver(ctx, row, &res)
+		}
+		if len(rows) < OutboxBatchSize {
+			break
+		}
 	}
 	return res, nil
 }

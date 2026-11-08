@@ -69,6 +69,8 @@ Model calls fail closed after the authorization cache expires and management ret
 
 Pending events retry until delivered and expire 30 days after creation; expired events are deleted without estimating. Restore Delcore `IngestEvent` delivery first. Event keys are idempotent, so delivery after recovery bills each checkpoint once. A poisoned event received a non-retryable Delcore reason: inspect the reason category, correct the Delcore catalog or registration, and deploy a fix. Do not edit, replay by hand or delete outbox rows to clear the alert.
 
+For `cardinality_exceeded`, first confirm that Delcore has capacity for the same event content in the original billing period. Set `MAX_METER_GROUPS` above the maximum number of resources one tenant touches in a period, or otherwise free admission capacity as the [Delcore cardinality contract](../../../docs/servers-delcore-api-contract.md#cardinality-rejection) describes. Once Delcore is ready, run `mcpa-api requeue-outbox --reason cardinality_exceeded` with the normal database configuration. The command restores unexpired matching rows in batches of 1000 and logs the restored count. Confirm the poisoned gauge falls and pending events deliver. Rows with other poison reasons stay parked.
+
 ### Metering checkpoint failures
 
 A failed checkpoint leaves measured bytes uncommitted; a crash before the next successful checkpoint loses them from billing. Check database health and transaction errors in the logs. Restore the database before the next deployment restart.

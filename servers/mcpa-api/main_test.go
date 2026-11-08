@@ -12,11 +12,14 @@ import (
 
 func TestRunRejectsBadArguments(t *testing.T) {
 	cases := map[string][]string{
-		"no command":       nil,
-		"unknown command":  {"bogus"},
-		"extra argument":   {"migrate", "extra"},
-		"unknown flag":     {"serve", "--bogus"},
-		"flag before name": {"--dev-env"},
+		"no command":             nil,
+		"unknown command":        {"bogus"},
+		"extra argument":         {"migrate", "extra"},
+		"unknown flag":           {"serve", "--bogus"},
+		"flag before name":       {"--dev-env"},
+		"missing requeue reason": {"requeue-outbox"},
+		"unknown requeue reason": {"requeue-outbox", "--reason", "other"},
+		"reason on migrate":      {"migrate", "--reason", "cardinality_exceeded"},
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {

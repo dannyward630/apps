@@ -8,6 +8,7 @@
 //	mcpa-api migrate             apply the embedded SQL migrations
 //	mcpa-api check-schema        exit non-zero when the schema differs
 //	mcpa-api rotate-master-key   rewrap stored data keys under the active key
+//	mcpa-api requeue-outbox --reason cardinality_exceeded
 //
 // --dev-env loads .env from the working directory when present; process
 // variables, including empty ones, win. Every subcommand accepts it so local
@@ -25,6 +26,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/delinoio/apps/servers/mcpa-api/internal/app"
 	"github.com/delinoio/apps/servers/mcpa-api/internal/config"
@@ -45,6 +47,7 @@ const (
 	CommandMigrate         Command = "migrate"
 	CommandCheckSchema     Command = "check-schema"
 	CommandRotateMasterKey Command = "rotate-master-key"
+	CommandRequeueOutbox   Command = "requeue-outbox"
 )
 
 // devEnvFile is opened by exact path in the working directory and never
@@ -62,6 +65,7 @@ commands:
   migrate             apply the embedded SQL migrations
   check-schema        exit non-zero when the database schema differs
   rotate-master-key   rewrap every stored data key under the active master key
+  requeue-outbox       restore poisoned rows matching --reason cardinality_exceeded
 `
 
 func main() {
@@ -77,11 +81,21 @@ func run(args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("mcpa-api "+args[0], flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	devEnv := fs.Bool("dev-env", false, "load .env from the working directory; process variables win")
+	reason := fs.String("reason", "", "poison category to requeue (cardinality_exceeded)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
 	}
 	if fs.NArg() > 0 {
 		fmt.Fprintf(stderr, "mcpa-api %s: unexpected argument %q\n", cmd, fs.Arg(0))
+		return 2
+	}
+	if cmd == CommandRequeueOutbox {
+		if *reason != string(store.OutboxPoisonCardinalityExceeded) {
+			fmt.Fprintln(stderr, "mcpa-api requeue-outbox: --reason must be cardinality_exceeded")
+			return 2
+		}
+	} else if *reason != "" {
+		fmt.Fprintln(stderr, "mcpa-api: --reason is only valid for requeue-outbox")
 		return 2
 	}
 
@@ -118,6 +132,8 @@ func run(args []string, stderr io.Writer) int {
 		err = checkSchema(ctx, lookup, log)
 	case CommandRotateMasterKey:
 		err = rotateMasterKey(ctx, lookup, log)
+	case CommandRequeueOutbox:
+		err = requeueOutbox(ctx, lookup, log, store.OutboxPoisonReason(*reason))
 	default:
 		fmt.Fprintf(stderr, "mcpa-api: unknown command %q\n\n%s", cmd, usage)
 		return 2
@@ -135,6 +151,38 @@ func run(args []string, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func requeueOutbox(ctx context.Context, lookup config.Lookup, log *slog.Logger, reason store.OutboxPoisonReason) error {
+	cfg, err := config.LoadDatabase(lookup)
+	if err != nil {
+		return err
+	}
+	db, err := store.Open(ctx, string(cfg.URL), cfg.DependencyTimeout, store.ModeMaintenance)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.CheckSchema(ctx); err != nil {
+		return err
+	}
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, err := store.RequeuePoisonedOutbox(ctx, db, reason, time.Now())
+		if err != nil {
+			return err
+		}
+		total += n
+		if n < store.OutboxRequeueBatchSize {
+			break
+		}
+	}
+	log.Info("usage outbox rows requeued", "reason", reason, "rows", total)
+	fmt.Fprintln(os.Stdout, total)
+	return nil
 }
 
 // installOTELFallback bridges development values to the OTLP exporter and
