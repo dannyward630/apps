@@ -5,6 +5,32 @@ import { readFileSync } from "node:fs";
 import yaml from "js-yaml";
 const read = (name) =>
   yaml.load(readFileSync(new URL(name, import.meta.url), "utf8"));
+test("API example URLs use only local or invalid hosts", () => {
+  const example = readFileSync(
+    new URL("../.env.example", import.meta.url),
+    "utf8",
+  );
+  const entries = new Map(
+    example
+      .split(/\r?\n/u)
+      .map((line) => line.match(/^([A-Z][A-Z0-9_]*)=(.*)$/u))
+      .filter(Boolean)
+      .map(([, name, value]) => [name, value]),
+  );
+  assert.equal(entries.get("WEB_ORIGIN"), "https://anydash.localhost");
+  for (const [name, value] of entries) {
+    if (!/(?:_URL|_ORIGIN|_RESOURCE)$/u.test(name) || !value) continue;
+    const host = new URL(value).hostname;
+    assert.ok(
+      host === "127.0.0.1" ||
+        host === "[::1]" ||
+        host === "localhost" ||
+        host.endsWith(".localhost") ||
+        host.endsWith(".invalid"),
+      `${name} must use a local or invalid host: ${host}`,
+    );
+  }
+});
 test("email routing sends each alert immediately, hourly and on recovery", () => {
   const config = read("alertmanager.example.yml");
   assert.deepEqual(config.route.group_by, ["..."]);
