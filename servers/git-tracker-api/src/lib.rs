@@ -450,18 +450,8 @@ impl Server {
         self.authority.manager(h, space).await?;
         let actor = self.authority.identify(h).await?;
         let token = string(q, "githubAccessToken");
-        let user = self.github.user(token).await.map_err(|fault| {
-            self.record_failure(&fault);
-            Fault::denied()
-        })?;
-        let mut r = self
-            .github
-            .connect(string(q, "fullName"), token)
-            .await
-            .map_err(|fault| {
-                self.record_failure(&fault);
-                Fault::denied()
-            })?;
+        let user = self.github.user(token).await?;
+        let mut r = self.github.connect(string(q, "fullName"), token).await?;
         r.space_id = space.into();
         let mut tx = self.db.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")

@@ -13,6 +13,23 @@ pub const MEMBERSHIP_DEADLINE: Duration = Duration::from_secs(120);
 /// Page size for the GraphQL pull request commit connection (the GitHub maximum).
 const COMMIT_PAGE: usize = 100;
 const COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){databaseId pullRequest(number:$number){id number state baseRefName headRefOid commits(first:100,after:$after){totalCount nodes{commit{oid}} pageInfo{hasNextPage endCursor}}}}}";
+
+#[derive(Clone, Copy)]
+enum Discovery {
+    User,
+    Repository,
+}
+
+fn discovery_fault(status: reqwest::StatusCode, endpoint: Discovery) -> Fault {
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Fault::denied(),
+        reqwest::StatusCode::NOT_FOUND if matches!(endpoint, Discovery::Repository) => {
+            Fault::missing()
+        }
+        _ => Fault::unavailable(),
+    }
+}
+
 pub struct GitHub {
     pub http: reqwest::Client,
     pub base: String,
@@ -58,7 +75,12 @@ impl GitHub {
         token: &str,
         body: Option<Value>,
     ) -> Result<Value> {
-        self.call_inner(method, path, token, body)
+        self.call_inner(method, path, token, body, None)
+            .await
+            .map_err(github_failure)
+    }
+    async fn call_discovery(&self, path: &str, token: &str, endpoint: Discovery) -> Result<Value> {
+        self.call_inner("GET", path, token, None, Some(endpoint))
             .await
             .map_err(github_failure)
     }
@@ -68,6 +90,7 @@ impl GitHub {
         path: &str,
         token: &str,
         body: Option<Value>,
+        discovery: Option<Discovery>,
     ) -> Result<Value> {
         let mut request = self
             .http
@@ -83,7 +106,9 @@ impl GitHub {
         }
         let response = request.send().await?;
         if !response.status().is_success() {
-            return Err(Fault::unavailable());
+            return Err(discovery.map_or_else(Fault::unavailable, |endpoint| {
+                discovery_fault(response.status(), endpoint)
+            }));
         }
         if response.status() == reqwest::StatusCode::NO_CONTENT {
             return Ok(json!({}));
@@ -115,7 +140,7 @@ impl GitHub {
         Ok(token.into())
     }
     pub async fn user(&self, token: &str) -> Result<String> {
-        let v = self.call("GET", "/user", token, None).await?;
+        let v = self.call_discovery("/user", token, Discovery::User).await?;
         let id = integer(&v, "id");
         if id == 0 {
             return Err(Fault::denied());
@@ -129,7 +154,9 @@ impl GitHub {
             return Err(Fault::invalid("owner/repository required"));
         }
         let p = format!("/repos/{}/{}", escape(parts[0]), escape(parts[1]));
-        let v = self.call("GET", &p, token, None).await?;
+        let v = self
+            .call_discovery(&p, token, Discovery::Repository)
+            .await?;
         if v["permissions"]["admin"] != true {
             return Err(Fault::denied());
         }

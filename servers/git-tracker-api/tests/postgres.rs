@@ -603,6 +603,10 @@ async fn permissions_atomic_upload_oidc_visibility_and_cleanup(
 struct GitHubMock {
     private: std::sync::atomic::AtomicBool,
     fail_metadata: std::sync::atomic::AtomicBool,
+    user_status: std::sync::atomic::AtomicU16,
+    repository_status: std::sync::atomic::AtomicU16,
+    repository_admin: std::sync::atomic::AtomicBool,
+    repository_delay_ms: std::sync::atomic::AtomicU64,
     gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     resolve_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
@@ -621,6 +625,10 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with_github_timeout(Duration::from_secs(20)).await
+}
+
+async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
     use std::sync::atomic::Ordering;
     let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
@@ -658,6 +666,10 @@ async fn fixture() -> Fixture {
     let github = Arc::new(GitHubMock {
         private: false.into(),
         fail_metadata: false.into(),
+        user_status: 200.into(),
+        repository_status: 200.into(),
+        repository_admin: true.into(),
+        repository_delay_ms: 0.into(),
         gate: std::sync::Mutex::new(None),
         resolve_gate: std::sync::Mutex::new(None),
     });
@@ -695,6 +707,23 @@ async fn fixture() -> Fixture {
                     release.notified().await;
                 }
             }
+            if p == "/repos/owner/repo" {
+                let delay = github.repository_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+            }
+            let status = match p.as_str() {
+                "/user" => github.user_status.load(Ordering::SeqCst),
+                "/repos/owner/repo" => github.repository_status.load(Ordering::SeqCst),
+                _ => 200,
+            };
+            if status != 200 {
+                return (
+                    StatusCode::from_u16(status).unwrap(),
+                    Json(json!({"message":"provider-body-must-stay-private"})),
+                );
+            }
             let private = github.private.load(Ordering::SeqCst);
             let out = match p.as_str() {
                 "/token" => json!({"access_token":"service","expires_in":3600}),
@@ -710,7 +739,7 @@ async fn fixture() -> Fixture {
                 // Discovery deliberately reports the repository as public so a stale snapshot
                 // would be visible if the connection persisted it.
                 "/repos/owner/repo" => {
-                    json!({"id":42,"full_name":"owner/repo","private":false,"permissions":{"admin":true}})
+                    json!({"id":42,"full_name":"owner/repo","private":false,"permissions":{"admin":github.repository_admin.load(Ordering::SeqCst)}})
                 }
                 "/repositories/42" => json!({"id":42,"full_name":"owner/repo","private":private}),
                 "/repos/owner/repo/installation" => json!({"id":1}),
@@ -736,6 +765,10 @@ async fn fixture() -> Fixture {
         .timeout(Duration::from_secs(20))
         .build()
         .unwrap();
+    let github_http = reqwest::Client::builder()
+        .timeout(github_timeout)
+        .build()
+        .unwrap();
     let private_key = RsaPrivateKey::from_pkcs8_pem(std::str::from_utf8(KEY).unwrap()).unwrap();
     let jwks: JwkSet = serde_json::from_value(json!({"keys":[{"kty":"RSA","kid":"fixture","alg":"RS256","use":"sig","n":URL_SAFE_NO_PAD.encode(private_key.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(private_key.e().to_bytes_be())}]})).unwrap();
     let server = Arc::new(Server {
@@ -749,7 +782,7 @@ async fn fixture() -> Fixture {
             "fixture".into(),
         ),
         github: GitHub::new(
-            http.clone(),
+            github_http,
             base.clone(),
             "1".into(),
             EncodingKey::from_rsa_pem(KEY).unwrap(),
@@ -800,10 +833,13 @@ impl Fixture {
         (r.status(), r.json().await.unwrap())
     }
     async fn connect(&self) -> (StatusCode, Value) {
+        self.connect_with("owner/repo", "fixture").await
+    }
+    async fn connect_with(&self, full_name: &str, access_token: &str) -> (StatusCode, Value) {
         self.call(
             "ConnectRepository",
             "Bearer manager",
-            json!({"spaceId":self.space,"fullName":"owner/repo","githubAccessToken":"fixture"}),
+            json!({"spaceId":self.space,"fullName":full_name,"githubAccessToken":access_token}),
         )
         .await
     }
@@ -1232,6 +1268,87 @@ async fn postgres_space_id_validation_precedes_delcore_requests() {
     assert!(fixture.delcore_requests.load(Ordering::SeqCst) > 0);
     let (status, connected) = fixture.connect().await;
     assert_eq!(status, StatusCode::OK, "{connected}");
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_repository_discovery_preserves_failure_classes() {
+    use std::sync::atomic::Ordering;
+    let f = fixture_with_github_timeout(Duration::from_millis(100)).await;
+    let token = "synthetic-user-token-must-stay-private";
+    let failures = f
+        .server
+        .metrics
+        .events
+        .with_label_values(&["github", "failure"]);
+
+    let (_, invalid) = f.connect_with("foo", token).await;
+    assert_eq!(invalid["code"], "invalid_argument", "{invalid}");
+
+    for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+        f.github
+            .user_status
+            .store(status.as_u16(), Ordering::SeqCst);
+        let (_, denied) = f.connect_with("owner/repo", token).await;
+        assert_eq!(denied["code"], "permission_denied", "{denied}");
+        assert!(!denied.to_string().contains(token));
+        assert!(
+            !denied
+                .to_string()
+                .contains("provider-body-must-stay-private")
+        );
+    }
+    f.github.user_status.store(200, Ordering::SeqCst);
+
+    for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+        f.github
+            .repository_status
+            .store(status.as_u16(), Ordering::SeqCst);
+        let (_, denied) = f.connect_with("owner/repo", token).await;
+        assert_eq!(denied["code"], "permission_denied", "{denied}");
+    }
+    f.github.repository_status.store(404, Ordering::SeqCst);
+    let (_, missing) = f.connect_with("owner/repo", token).await;
+    assert_eq!(missing["code"], "not_found", "{missing}");
+
+    f.github.repository_status.store(503, Ordering::SeqCst);
+    let before = failures.get();
+    let (_, unavailable) = f.connect_with("owner/repo", token).await;
+    assert_eq!(unavailable["code"], "unavailable", "{unavailable}");
+    assert_eq!(failures.get(), before + 1);
+    assert!(!unavailable.to_string().contains(token));
+    assert!(
+        !unavailable
+            .to_string()
+            .contains("provider-body-must-stay-private")
+    );
+    f.github.repository_status.store(200, Ordering::SeqCst);
+
+    f.github.repository_delay_ms.store(250, Ordering::SeqCst);
+    let before = failures.get();
+    let (_, timeout) = f.connect_with("owner/repo", token).await;
+    assert_eq!(timeout["code"], "unavailable", "{timeout}");
+    assert_eq!(failures.get(), before + 1);
+    f.github.repository_delay_ms.store(0, Ordering::SeqCst);
+
+    f.github.repository_admin.store(false, Ordering::SeqCst);
+    let (_, denied) = f.connect_with("owner/repo", token).await;
+    assert_eq!(denied["code"], "permission_denied", "{denied}");
+    assert_eq!(f.row().await, None);
+    assert_eq!(f.audit_count().await, 0);
+    f.github.repository_admin.store(true, Ordering::SeqCst);
+
+    let (status, connected) = f.connect_with("owner/repo", token).await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let row = f.row().await;
+    assert!(row.is_some());
+    assert_eq!(f.audit_count().await, 1);
+
+    f.github.fail_metadata.store(true, Ordering::SeqCst);
+    let (_, denied) = f.connect_with("owner/repo", token).await;
+    assert_eq!(denied["code"], "permission_denied", "{denied}");
+    assert_eq!(f.row().await, row);
+    assert_eq!(f.audit_count().await, 1);
 }
 
 fn webhook_event() -> (String, Vec<u8>) {
