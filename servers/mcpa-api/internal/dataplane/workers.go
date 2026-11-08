@@ -4,6 +4,8 @@ package dataplane
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -45,18 +47,31 @@ func (dp *DataPlane) RunRetention(ctx context.Context) error {
 // they end, expired request keys, expired console state and resource
 // tombstones that no retained record refers to anymore.
 func (dp *DataPlane) RetentionCycle(ctx context.Context) error {
+	return dp.retentionCycle(ctx, retentionRules, store.DeleteExpiredConsoleState)
+}
+
+func (dp *DataPlane) retentionCycle(ctx context.Context, rules []retentionRule, deleteConsole func(context.Context, store.DB) error) error {
 	now := dp.now()
-	for _, rule := range retentionRules {
+	var failures []error
+	for _, rule := range rules {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(failures, err)...)
+		}
 		var total int64
 		for {
 			stepCtx, cancel := context.WithTimeout(ctx, dp.cfg.DependencyTimeout)
 			n, err := rule.prune(stepCtx, dp.db.Pool, now, retentionBatch)
 			cancel()
+			if ctx.Err() != nil {
+				return errors.Join(append(failures, ctx.Err())...)
+			}
 			if err != nil {
-				return err
+				failures = append(failures, fmt.Errorf("%s: %w", rule.kind, err))
+				dp.log.Error("retention rule failed", "kind", rule.kind, "rows", total, "alert", true, "error", err)
+				break
 			}
 			total += n
-			if n < retentionBatch || ctx.Err() != nil {
+			if n < retentionBatch {
 				break
 			}
 		}
@@ -64,9 +79,18 @@ func (dp *DataPlane) RetentionCycle(ctx context.Context) error {
 			dp.log.Info("retention pruned records", "kind", rule.kind, "rows", total)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(append(failures, err)...)
+	}
 	stepCtx, cancel := context.WithTimeout(ctx, dp.cfg.DependencyTimeout)
 	defer cancel()
-	return store.DeleteExpiredConsoleState(stepCtx, dp.db.Pool)
+	if err := deleteConsole(stepCtx, dp.db.Pool); err != nil {
+		if ctx.Err() != nil {
+			return errors.Join(append(failures, ctx.Err())...)
+		}
+		failures = append(failures, fmt.Errorf("console_state: %w", err))
+	}
+	return errors.Join(failures...)
 }
 
 // RunLifecycle checks tenant lifecycles every LifecycleInterval until ctx

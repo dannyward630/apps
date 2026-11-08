@@ -1198,6 +1198,34 @@ func TestIntegrationRetentionPruning(t *testing.T) {
 	}
 }
 
+func TestIntegrationRetentionContinuesAfterPruneFailure(t *testing.T) {
+	e := newEnv(t)
+	failure := errors.New("call record prune failed")
+	rules := append([]retentionRule(nil), retentionRules...)
+	rules[0].prune = func(context.Context, store.DB, time.Time, int) (int64, error) {
+		return 0, failure
+	}
+	if _, err := e.db.Pool.Exec(e.ctx, `INSERT INTO audit_events (id, tenant_id, action, actor_kind, occur_time)
+		VALUES ($1, $2, 1, 1, now() - interval '14 months')`, store.NewID(), e.tenant); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Pool.Exec(e.ctx, `INSERT INTO console_login_flows
+		(state_hash, browser_hash, code_verifier, nonce, return_to, expire_time)
+		VALUES ('\x01', '\x02', 'verifier', 'nonce', '/', now() - interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
+	err := e.dp.retentionCycle(e.ctx, rules, store.DeleteExpiredConsoleState)
+	if !errors.Is(err, failure) || !strings.Contains(err.Error(), "call_records:") {
+		t.Fatalf("named call-record failure: %v", err)
+	}
+	if got := e.scalar(`SELECT count(*) FROM audit_events WHERE tenant_id = $1`, e.tenant); got != 0 {
+		t.Fatalf("expired audit events after failed call-record rule: %d", got)
+	}
+	if got := e.scalar(`SELECT count(*) FROM console_login_flows`); got != 0 {
+		t.Fatalf("expired console login flows after failed call-record rule: %d", got)
+	}
+}
+
 func TestIntegrationProviderOAuth(t *testing.T) {
 	e := newEnv(t)
 	id := e.resource("oauth")
