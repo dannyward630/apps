@@ -931,14 +931,15 @@ pub async fn check_source(
                 "select devices or all devices",
             ));
         }
-        let owned: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM devices WHERE id=ANY($1) AND user_id=$2 AND deleted_at IS NULL",
+        let owned: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM devices WHERE id=ANY($1) AND user_id=$2 AND deleted_at IS NULL \
+             ORDER BY id FOR SHARE",
         )
         .bind(&devices)
         .bind(owner)
-        .fetch_one(db)
+        .fetch_all(db)
         .await?;
-        if owned != devices.len() as i64 {
+        if owned.len() != devices.len() {
             return Err(ApiError::not_found("source.device_ids"));
         }
     } else {
@@ -954,11 +955,14 @@ pub async fn check_source(
                 "select 1 to 50 connections",
             ));
         }
-        let providers: Vec<i16> = sqlx::query_scalar("SELECT provider FROM connections WHERE id=ANY($1) AND user_id=$2 AND deleted_at IS NULL")
-            .bind(&connections)
-            .bind(owner)
-            .fetch_all(db)
-            .await?;
+        let providers: Vec<i16> = sqlx::query_scalar(
+            "SELECT provider FROM connections WHERE id=ANY($1) AND user_id=$2 \
+             AND deleted_at IS NULL ORDER BY id FOR SHARE",
+        )
+        .bind(&connections)
+        .bind(owner)
+        .fetch_all(db)
+        .await?;
         if providers.len() != connections.len() {
             return Err(ApiError::not_found("source.connection_ids"));
         }
@@ -1037,12 +1041,17 @@ pub async fn add_widget(s: &Server, call: &Call, q: AddWidgetRequest) -> Result<
     let caller = format!("user:{}", user.user_id);
     let print = fingerprint(&q);
     let mut tx = s.db.begin().await?;
-    // Lock the dashboard before the replay lookup: a retry that overlaps the original request
-    // waits for its commit and then returns the original result instead of VERSION_CONFLICT.
-    let locked = lock_version(&mut tx, id, None).await?;
+    // Serialize duplicate request IDs without holding the dashboard ahead of source rows. Source
+    // deletion locks its parent row before the dashboard, so additions must follow that order.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))")
+        .bind(format!("anydash-request:AddWidget:{caller}:{request_id}"))
+        .execute(&mut *tx)
+        .await?;
     if let Some(existing) =
         replay(&mut tx, &caller, "AddWidget", request_id, &print, call.now).await?
     {
+        // Preserve the original replay behavior: do not return a stale dashboard snapshot.
+        lock_version(&mut tx, id, None).await?;
         let dashboard = dashboard_message(&mut tx, id, user.user_id).await?;
         tx.commit().await?;
         return Ok(AddWidgetResponse {
@@ -1051,8 +1060,8 @@ pub async fn add_widget(s: &Server, call: &Call, q: AddWidgetRequest) -> Result<
             ..Default::default()
         });
     }
-    if locked.version as u64 != q.expected_version {
-        return Err(ApiError::version_conflict(locked.version as u64));
+    if row.version as u64 != q.expected_version {
+        return Err(ApiError::version_conflict(row.version as u64));
     }
     let source = check_source(
         &mut tx,
@@ -1061,6 +1070,7 @@ pub async fn add_widget(s: &Server, call: &Call, q: AddWidgetRequest) -> Result<
         &q.source.as_option().cloned().unwrap_or_default(),
     )
     .await?;
+    lock_version(&mut tx, id, Some(q.expected_version)).await?;
     let used: i64 = sqlx::query_scalar("SELECT count(*) FROM widgets WHERE dashboard_id=$1")
         .bind(id)
         .fetch_one(&mut *tx)
@@ -1333,7 +1343,9 @@ pub async fn set_widget_sharing_scope(
     if !space.edit() {
         return Err(ApiError::denied());
     }
-    lock_version(&mut tx, id, Some(q.expected_version)).await?;
+    if row.version as u64 != q.expected_version {
+        return Err(ApiError::version_conflict(row.version as u64));
+    }
     let kind: WidgetType = enum_of(
         sqlx::query_scalar::<_, i16>("SELECT type FROM widgets WHERE id=$1")
             .bind(widget)
@@ -1347,6 +1359,13 @@ pub async fn set_widget_sharing_scope(
         &q.source.as_option().cloned().unwrap_or_default(),
     )
     .await?;
+    lock_version(&mut tx, id, Some(q.expected_version)).await?;
+    // Source detachment locks the widget before deleting its source rows. Keep this same order
+    // while replacing a widget's sources so concurrent deletion cannot deadlock here.
+    sqlx::query("SELECT id FROM widgets WHERE id=$1 FOR UPDATE")
+        .bind(widget)
+        .fetch_one(&mut *tx)
+        .await?;
     write_sources(&mut tx, widget, &source).await?;
     let state = if space.personal {
         SharingState::Private

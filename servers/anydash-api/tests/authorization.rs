@@ -2,10 +2,20 @@
 //! Tenant isolation, the team role matrix and data-owner sharing.
 mod support;
 use serde_json::{Value, json};
+use std::{sync::Arc, time::Duration};
 use support::{Fixture, id};
 
 fn layout(presentation: &str) -> Value {
     json!({"x":0,"y":0,"width":4,"height":2,"presentation":presentation})
+}
+
+struct AddWidgetRace {
+    widget_type: &'static str,
+    widget_layout: Value,
+    query: Value,
+    source: Value,
+    deletion_query: &'static str,
+    source_query: &'static str,
 }
 
 async fn version(f: &Fixture, caller: &support::Caller, dashboard: &str) -> String {
@@ -18,6 +28,637 @@ async fn version(f: &Fixture, caller: &support::Caller, dashboard: &str) -> Stri
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+async fn wait_for_lock_waits(f: &Fixture, fragments: &[&str]) {
+    for _ in 0..100 {
+        let mut all_waiting = true;
+        for fragment in fragments {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() \
+                 AND wait_event_type='Lock' AND position($1 in query)>0",
+            )
+            .bind(fragment)
+            .fetch_one(&f.db)
+            .await
+            .unwrap();
+            all_waiting &= count > 0;
+        }
+        if all_waiting {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let activity: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT left(query,200),wait_event_type FROM pg_stat_activity WHERE datname=current_database()",
+    )
+    .fetch_all(&f.db)
+    .await
+    .unwrap();
+    panic!("expected PostgreSQL lock waits for {fragments:?}: {activity:?}");
+}
+
+async fn wait_for_any_lock_wait(f: &Fixture, fragments: &[&str]) {
+    for _ in 0..100 {
+        for fragment in fragments {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() \
+                 AND wait_event_type='Lock' AND position($1 in query)>0",
+            )
+            .bind(fragment)
+            .fetch_one(&f.db)
+            .await
+            .unwrap();
+            if count > 0 {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let activity: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT left(query,200),wait_event_type FROM pg_stat_activity WHERE datname=current_database()",
+    )
+    .fetch_all(&f.db)
+    .await
+    .unwrap();
+    panic!("expected one PostgreSQL lock wait from {fragments:?}: {activity:?}");
+}
+
+async fn install_account_delete_barrier(f: &Fixture, table: &str) {
+    f.exec(
+        "CREATE OR REPLACE FUNCTION repair951_account_delete_barrier() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(901951); RETURN NEW; END $$",
+    )
+    .await;
+    f.exec(&format!(
+        "CREATE TRIGGER repair951_account_delete_barrier BEFORE UPDATE ON {table} \
+         FOR EACH ROW WHEN (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL) \
+         EXECUTE FUNCTION repair951_account_delete_barrier()"
+    ))
+    .await;
+}
+
+async fn race_add_widget_with_account_deletion(
+    f: &Arc<Fixture>,
+    person: &support::Person,
+    dashboard: &str,
+    race: AddWidgetRace,
+) {
+    let hold = f.lock_row("SELECT pg_advisory_xact_lock(901951)").await;
+    let deletion = {
+        let f = Arc::clone(f);
+        let person = person.clone();
+        tokio::spawn(async move {
+            f.call(
+                &f.user(&person),
+                "AccountService/DeleteAccountData",
+                json!({"confirm":true}),
+            )
+            .await
+        })
+    };
+    wait_for_lock_waits(f, &[race.deletion_query]).await;
+    let addition = {
+        let f = Arc::clone(f);
+        let person = person.clone();
+        let dashboard = dashboard.to_owned();
+        tokio::spawn(async move {
+            f.call(
+                &f.user(&person),
+                "DashboardService/AddWidget",
+                json!({
+                    "dashboardId": dashboard,
+                    "expectedVersion": "1",
+                    "requestId": id(),
+                    "type": race.widget_type,
+                    "layout": race.widget_layout,
+                    "query": race.query,
+                    "source": race.source
+                }),
+            )
+            .await
+        })
+    };
+    wait_for_lock_waits(f, &[race.source_query]).await;
+    hold.commit().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), deletion)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), addition)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(result.code, "not_found");
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM widgets WHERE dashboard_id='{dashboard}'"
+        ))
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn account_deletion_and_add_widget_lock_connection_before_dashboard() {
+    let f = Arc::new(Fixture::setup().await);
+    let person = f.person("account-delete-connection-lock-owner");
+    f.connect(&person).await;
+    let (_, access, _) = f
+        .enroll(&person, "account-delete-connection-device", "")
+        .await;
+    let connection = f
+        .ok(
+            &f.device(&access),
+            "ConnectionService/CreateConnection",
+            json!({"requestId":id(),"provider":"PROVIDER_CODEX"}),
+        )
+        .await["connection"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let caller = f.user(&person);
+    let dashboard = f
+        .ok(
+            &caller,
+            "DashboardService/CreateDashboard",
+            json!({"requestId":id(),"spaceId":person.personal,"name":"Account deletion connection race"}),
+        )
+        .await["dashboard"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    install_account_delete_barrier(&f, "connections").await;
+    race_add_widget_with_account_deletion(
+        &f,
+        &person,
+        &dashboard,
+        AddWidgetRace {
+            widget_type: "WIDGET_TYPE_SUBSCRIPTION_LIMITS",
+            widget_layout: layout("WIDGET_PRESENTATION_GAUGE"),
+            query: json!({}),
+            source: json!({"connectionIds":[connection]}),
+            deletion_query: "UPDATE connections SET deleted_at=COALESCE",
+            source_query: "SELECT provider FROM connections WHERE id=ANY",
+        },
+    )
+    .await;
+    Arc::try_unwrap(f).ok().unwrap().cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn account_deletion_and_add_widget_lock_device_before_dashboard() {
+    let f = Arc::new(Fixture::setup().await);
+    let person = f.person("account-delete-device-lock-owner");
+    f.connect(&person).await;
+    let (device, _, _) = f.enroll(&person, "account-delete-device", "").await;
+    let caller = f.user(&person);
+    let dashboard = f
+        .ok(
+            &caller,
+            "DashboardService/CreateDashboard",
+            json!({"requestId":id(),"spaceId":person.personal,"name":"Account deletion device race"}),
+        )
+        .await["dashboard"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    install_account_delete_barrier(&f, "devices").await;
+    race_add_widget_with_account_deletion(
+        &f,
+        &person,
+        &dashboard,
+        AddWidgetRace {
+            widget_type: "WIDGET_TYPE_LOCAL_USAGE_SERIES",
+            widget_layout: layout("WIDGET_PRESENTATION_BAR_CHART"),
+            query: json!({"period":"QUERY_PERIOD_LAST_7_DAYS","granularity":"TIME_GRANULARITY_DAY"}),
+            source: json!({"deviceIds":[device]}),
+            deletion_query: "UPDATE devices SET deleted_at=$2 WHERE user_id=$1",
+            source_query: "SELECT id FROM devices WHERE id=ANY",
+        },
+    )
+    .await;
+    Arc::try_unwrap(f).ok().unwrap().cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn source_replacement_and_source_detachment_share_widget_first_lock_order() {
+    let f = Arc::new(Fixture::setup().await);
+    let person = f.person("source-replacement-lock-owner");
+    f.connect(&person).await;
+    let (_, access, _) = f
+        .enroll(&person, "source-replacement-lock-device", "")
+        .await;
+    let caller = f.user(&person);
+    let first = f
+        .ok(
+            &f.device(&access),
+            "ConnectionService/CreateConnection",
+            json!({"requestId":id(),"provider":"PROVIDER_CODEX"}),
+        )
+        .await["connection"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second = f
+        .ok(
+            &f.device(&access),
+            "ConnectionService/CreateConnection",
+            json!({"requestId":id(),"provider":"PROVIDER_CODEX"}),
+        )
+        .await["connection"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let dashboard = f
+        .ok(
+            &caller,
+            "DashboardService/CreateDashboard",
+            json!({"requestId":id(),"spaceId":person.personal,"name":"Source replacement"}),
+        )
+        .await["dashboard"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let widget = f.ok(&caller, "DashboardService/AddWidget",
+        json!({"dashboardId":dashboard,"expectedVersion":"1","requestId":id(),"type":"WIDGET_TYPE_SUBSCRIPTION_LIMITS","layout":layout("WIDGET_PRESENTATION_GAUGE"),"query":{},"source":{"connectionIds":[first]}})).await["widgetId"].as_str().unwrap().to_owned();
+
+    // Queue source deletion on the widget while source replacement is poised to change the
+    // widget_sources row. With a consistent widget-before-source order, both transactions finish.
+    let hold = f
+        .lock_row(&format!(
+            "SELECT id FROM widgets WHERE id='{widget}' FOR UPDATE"
+        ))
+        .await;
+    let deletion = {
+        let f = Arc::clone(&f);
+        let person = person.clone();
+        let first = first.clone();
+        tokio::spawn(async move {
+            f.call(
+                &f.user(&person),
+                "ConnectionService/DeleteConnection",
+                json!({"connectionId":first}),
+            )
+            .await
+        })
+    };
+    wait_for_lock_waits(
+        &f,
+        &["SELECT w.id FROM widgets w JOIN widget_sources s ON s.widget_id=w.id"],
+    )
+    .await;
+    let sharing = {
+        let f = Arc::clone(&f);
+        let person = person.clone();
+        let dashboard = dashboard.clone();
+        let widget = widget.clone();
+        let second = second.clone();
+        tokio::spawn(async move {
+            f.call(
+                &f.user(&person),
+                "DashboardService/SetWidgetSharingScope",
+                json!({"dashboardId":dashboard,"expectedVersion":"2","widgetId":widget,"source":{"connectionIds":[second]}}),
+            )
+            .await
+        })
+    };
+    wait_for_any_lock_wait(
+        &f,
+        &[
+            "SELECT id FROM widgets WHERE id=$1 FOR UPDATE",
+            "UPDATE widgets SET all_devices=$2 WHERE id=$1",
+            "INSERT INTO widget_sources(widget_id,source_kind,source_id)",
+        ],
+    )
+    .await;
+    hold.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), deletion)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), sharing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM widgets WHERE id='{widget}' AND sharing_state=1"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM widget_sources WHERE widget_id='{widget}' AND source_id='{second}'"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM widget_sources WHERE widget_id='{widget}' AND source_id='{first}'"
+        ))
+        .await,
+        0
+    );
+    Arc::try_unwrap(f).ok().unwrap().cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn source_detachment_and_widget_removal_share_widget_first_lock_order() {
+    let f = Arc::new(Fixture::setup().await);
+    let person = f.person("source-lock-owner");
+    f.connect(&person).await;
+    let (_, access, _) = f.enroll(&person, "source-lock-device", "").await;
+    let caller = f.user(&person);
+    let connection = f
+        .ok(
+            &f.device(&access),
+            "ConnectionService/CreateConnection",
+            json!({"requestId":id(),"provider":"PROVIDER_CODEX"}),
+        )
+        .await["connection"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let dashboard = f
+        .ok(
+            &caller,
+            "DashboardService/CreateDashboard",
+            json!({"requestId":id(),"spaceId":person.personal,"name":"Lock order"}),
+        )
+        .await["dashboard"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let widget = f.ok(&caller, "DashboardService/AddWidget",
+        json!({"dashboardId":dashboard,"expectedVersion":"1","requestId":id(),"type":"WIDGET_TYPE_SUBSCRIPTION_LIMITS","layout":layout("WIDGET_PRESENTATION_GAUGE"),"query":{},"source":{"connectionIds":[connection]}})).await["widgetId"].as_str().unwrap().to_owned();
+
+    let hold = f
+        .lock_row(&format!(
+            "SELECT 1 FROM widget_sources WHERE widget_id='{widget}' FOR UPDATE"
+        ))
+        .await;
+    let deletion = {
+        let f = Arc::clone(&f);
+        let person = person.clone();
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            f.call(
+                &f.user(&person),
+                "ConnectionService/DeleteConnection",
+                json!({"connectionId":connection}),
+            )
+            .await
+        })
+    };
+    wait_for_lock_waits(&f, &["DELETE FROM widget_sources WHERE source_kind"]).await;
+    let removal = {
+        let f = Arc::clone(&f);
+        let person = person.clone();
+        let dashboard = dashboard.clone();
+        let widget = widget.clone();
+        tokio::spawn(async move {
+            f.call(
+                &f.user(&person),
+                "DashboardService/RemoveWidget",
+                json!({"dashboardId":dashboard,"expectedVersion":"2","widgetId":widget}),
+            )
+            .await
+        })
+    };
+    wait_for_lock_waits(
+        &f,
+        &[
+            "DELETE FROM widget_sources WHERE source_kind",
+            "DELETE FROM widgets WHERE id",
+        ],
+    )
+    .await;
+    hold.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), deletion)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), removal)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        f.count(&format!("SELECT count(*) FROM widgets WHERE id='{widget}'"))
+            .await,
+        0
+    );
+
+    let device = f
+        .count("SELECT count(*) FROM devices WHERE deleted_at IS NULL")
+        .await;
+    assert_eq!(device, 1);
+    let device: String =
+        sqlx::query_scalar("SELECT id::text FROM devices WHERE deleted_at IS NULL")
+            .fetch_one(&f.db)
+            .await
+            .unwrap();
+    let second_widget = f.ok(&caller, "DashboardService/AddWidget",
+        json!({"dashboardId":dashboard,"expectedVersion":"3","requestId":id(),"type":"WIDGET_TYPE_LOCAL_USAGE_SERIES","layout":layout("WIDGET_PRESENTATION_BAR_CHART"),"query":{"period":"QUERY_PERIOD_LAST_7_DAYS","granularity":"TIME_GRANULARITY_DAY"},"source":{"deviceIds":[device]}})).await["widgetId"].as_str().unwrap().to_owned();
+    f.ok(
+        &caller,
+        "DashboardService/DeleteDashboard",
+        json!({"dashboardId":dashboard}),
+    )
+    .await;
+    let hold = f
+        .lock_row(&format!(
+            "SELECT 1 FROM widget_sources WHERE widget_id='{second_widget}' FOR UPDATE"
+        ))
+        .await;
+    let deletion = {
+        let f = Arc::clone(&f);
+        let person = person.clone();
+        let device = device.clone();
+        tokio::spawn(async move {
+            f.call(
+                &f.user(&person),
+                "DeviceService/DeleteDevice",
+                json!({"deviceId":device}),
+            )
+            .await
+        })
+    };
+    wait_for_lock_waits(&f, &["DELETE FROM widget_sources WHERE source_kind"]).await;
+    let purge = {
+        let f = Arc::clone(&f);
+        let dashboard = uuid::Uuid::parse_str(&dashboard).unwrap();
+        tokio::spawn(async move {
+            let mut tx = f.db.begin().await.unwrap();
+            anydash_api::worker::purge(
+                &mut tx,
+                anydash_api::rpc::DeletionKind::Dashboard as i16,
+                Some(dashboard),
+                None,
+                None,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        })
+    };
+    wait_for_lock_waits(
+        &f,
+        &[
+            "DELETE FROM widget_sources WHERE source_kind",
+            "DELETE FROM dashboards WHERE id",
+        ],
+    )
+    .await;
+    hold.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), deletion)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), purge)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM widgets WHERE id='{second_widget}'"
+        ))
+        .await,
+        0
+    );
+    Arc::try_unwrap(f).ok().unwrap().cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn source_validation_waits_for_device_deletion_and_rejects_it() {
+    let f = Arc::new(Fixture::setup().await);
+    let person = f.person("source-validation-owner");
+    f.connect(&person).await;
+    let (device, _, _) = f.enroll(&person, "source-validation-device", "").await;
+    let caller = f.user(&person);
+    let dashboard = f
+        .ok(
+            &caller,
+            "DashboardService/CreateDashboard",
+            json!({"requestId":id(),"spaceId":person.personal,"name":"Source validation"}),
+        )
+        .await["dashboard"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut hold = f.db.begin().await.unwrap();
+    sqlx::query("UPDATE devices SET deleted_at=now() WHERE id=$1")
+        .bind(uuid::Uuid::parse_str(&device).unwrap())
+        .execute(&mut *hold)
+        .await
+        .unwrap();
+    let mut addition = {
+        let f = Arc::clone(&f);
+        let person = person.clone();
+        let dashboard = dashboard.clone();
+        let device = device.clone();
+        tokio::spawn(async move {
+            f.call(&f.user(&person), "DashboardService/AddWidget",
+            json!({"dashboardId":dashboard,"expectedVersion":"1","requestId":id(),"type":"WIDGET_TYPE_LOCAL_USAGE_SERIES","layout":layout("WIDGET_PRESENTATION_BAR_CHART"),"query":{"period":"QUERY_PERIOD_LAST_7_DAYS","granularity":"TIME_GRANULARITY_DAY"},"source":{"deviceIds":[device]}})).await
+        })
+    };
+    tokio::select! {
+        () = wait_for_lock_waits(&f, &["SELECT id FROM devices WHERE id=ANY"]) => {},
+        result = &mut addition => panic!("AddWidget returned before source lock: {result:?}"),
+    }
+    hold.commit().await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), addition)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(result.code, "not_found");
+    assert_eq!(f.count("SELECT count(*) FROM widgets").await, 0);
+
+    let (_, access, _) = f.enroll(&person, "sharing-validation-device", "").await;
+    let first = f
+        .ok(
+            &f.device(&access),
+            "ConnectionService/CreateConnection",
+            json!({"requestId":id(),"provider":"PROVIDER_CODEX"}),
+        )
+        .await["connection"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second = f
+        .ok(
+            &f.device(&access),
+            "ConnectionService/CreateConnection",
+            json!({"requestId":id(),"provider":"PROVIDER_CODEX"}),
+        )
+        .await["connection"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let widget = f.ok(&caller, "DashboardService/AddWidget",
+        json!({"dashboardId":dashboard,"expectedVersion":"1","requestId":id(),"type":"WIDGET_TYPE_SUBSCRIPTION_LIMITS","layout":layout("WIDGET_PRESENTATION_GAUGE"),"query":{},"source":{"connectionIds":[first]}})).await["widgetId"].as_str().unwrap().to_owned();
+    let mut hold = f.db.begin().await.unwrap();
+    sqlx::query("UPDATE connections SET deleted_at=now() WHERE id=$1")
+        .bind(uuid::Uuid::parse_str(&second).unwrap())
+        .execute(&mut *hold)
+        .await
+        .unwrap();
+    let mut sharing = {
+        let f = Arc::clone(&f);
+        let person = person.clone();
+        let dashboard = dashboard.clone();
+        let widget = widget.clone();
+        let second = second.clone();
+        tokio::spawn(async move {
+            f.call(&f.user(&person), "DashboardService/SetWidgetSharingScope",
+            json!({"dashboardId":dashboard,"expectedVersion":"2","widgetId":widget,"source":{"connectionIds":[second]}})).await
+        })
+    };
+    tokio::select! {
+        () = wait_for_lock_waits(&f, &["SELECT provider FROM connections WHERE id=ANY"]) => {},
+        result = &mut sharing => panic!("SetWidgetSharingScope returned before source lock: {result:?}"),
+    }
+    hold.commit().await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), sharing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(result.code, "not_found");
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM widget_sources WHERE widget_id='{widget}' AND source_id='{first}'"
+        ))
+        .await,
+        1
+    );
+    f.ok(
+        &caller,
+        "ConnectionService/DeleteConnection",
+        json!({"connectionId":first}),
+    )
+    .await;
+    assert_eq!(f.count(&format!("SELECT count(*) FROM widgets WHERE id='{widget}' AND sharing_state=3 AND sharing_end_reason=3")).await, 1);
+    Arc::try_unwrap(f).ok().unwrap().cleanup().await;
 }
 
 #[tokio::test]

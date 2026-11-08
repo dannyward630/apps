@@ -323,6 +323,7 @@ pub async fn purge(
             ("dashboards", None)
         };
         if let Some(source) = source {
+            crate::rpc::lock_source_widgets(db, source, target).await?;
             sqlx::query("DELETE FROM widget_sources WHERE source_kind=$1 AND source_id=$2")
                 .bind(source)
                 .bind(target)

@@ -255,6 +255,7 @@ pub async fn detach_source(
     kind: i16,
     source: Uuid,
 ) -> Result<()> {
+    lock_source_widgets(db, kind, source).await?;
     let widgets: Vec<Uuid> = sqlx::query_scalar(
         "DELETE FROM widget_sources WHERE source_kind=$1 AND source_id=$2 RETURNING widget_id",
     )
@@ -294,6 +295,20 @@ pub async fn detach_source(
             .await?;
         }
     }
+    Ok(())
+}
+
+/// Lock widgets before their source rows, matching widget removal and dashboard deletion.
+/// The caller holds the source parent row when this is used during logical deletion.
+pub async fn lock_source_widgets(db: &mut PgConnection, kind: i16, source: Uuid) -> Result<()> {
+    let _: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT w.id FROM widgets w JOIN widget_sources s ON s.widget_id=w.id \
+         WHERE s.source_kind=$1 AND s.source_id=$2 ORDER BY w.id FOR UPDATE OF w",
+    )
+    .bind(kind)
+    .bind(source)
+    .fetch_all(db)
+    .await?;
     Ok(())
 }
 
