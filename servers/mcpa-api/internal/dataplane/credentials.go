@@ -280,39 +280,48 @@ func (s *CredentialSync) notify(ctx context.Context, db store.DB, resourceID uui
 // while it was not listening are unknown; calls then reload from
 // PostgreSQL.
 func (s *CredentialSync) Listen(ctx context.Context) error {
+	return s.listenWith(ctx, s.listenOnce, time.After)
+}
+
+func (s *CredentialSync) listenWith(ctx context.Context, listen func(context.Context) (bool, error), after func(time.Duration) <-chan time.Time) error {
 	backoff := time.Second
 	for ctx.Err() == nil {
-		err := s.listenOnce(ctx)
+		connected, err := listen(ctx)
 		if ctx.Err() != nil {
 			return nil
+		}
+		if connected {
+			backoff = time.Second
 		}
 		s.log.Warn("credential change listener disconnected", "error", err, "retry_in", backoff.String())
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(backoff):
+		case <-after(backoff):
 		}
-		backoff = min(backoff*2, time.Minute)
+		if !connected {
+			backoff = min(backoff*2, time.Minute)
+		}
 	}
 	return nil
 }
 
-func (s *CredentialSync) listenOnce(ctx context.Context) error {
+func (s *CredentialSync) listenOnce(ctx context.Context) (bool, error) {
 	conn, err := s.db.Pool.Acquire(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// The connection carries LISTEN state; never return it to the pool.
 	raw := conn.Hijack()
 	defer func() { _ = raw.Close(context.Background()) }()
 	if _, err := raw.Exec(ctx, "LISTEN "+pgx.Identifier{credentialChannel}.Sanitize()); err != nil {
-		return err
+		return false, err
 	}
 	s.invalidateAll()
 	for {
 		n, err := raw.WaitForNotification(ctx)
 		if err != nil {
-			return err
+			return true, err
 		}
 		instance, resourceID, ok := strings.Cut(n.Payload, ":")
 		if !ok || instance == s.instance {
