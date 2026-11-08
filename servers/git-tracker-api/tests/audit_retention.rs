@@ -125,6 +125,69 @@ fn at(rfc3339: &str) -> DateTime<Utc> {
 
 #[tokio::test]
 #[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_out_of_range_retention_skips_audit_delete_without_persistence_failure() {
+    let f = fixture(chrono::Duration::hours(100_000_000)).await;
+    let row = f.insert_audit(at("2000-01-01T00:00:00Z")).await;
+    let failures = f
+        .server
+        .metrics
+        .events
+        .with_label_values(&["persistence", "failure"]);
+    let before = failures.get();
+    f.server
+        .maintain_at(at("2026-10-22T00:00:00Z"))
+        .await
+        .unwrap();
+    assert!(f.present(row).await);
+    assert_eq!(failures.get(), before);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_minimum_cutoff_executes_delete_but_earlier_cutoff_skips_it() {
+    let now = at("2026-10-22T00:00:00Z");
+    let minimum =
+        DateTime::<Utc>::from_timestamp_micros(-211_813_488_000_000_000 + 946_684_800_000_000)
+            .unwrap();
+    let mut f = fixture(now - minimum).await;
+    let row = f.insert_audit(at("2000-01-01T00:00:00Z")).await;
+    sqlx::raw_sql(
+        "CREATE TABLE audit_delete_probe (calls bigint NOT NULL);
+         INSERT INTO audit_delete_probe VALUES (0);
+         CREATE FUNCTION audit_delete_probe_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             UPDATE audit_delete_probe SET calls = calls + 1;
+             RETURN NULL;
+         END $$;
+         CREATE TRIGGER audit_delete_probe AFTER DELETE ON git_tracker_audit
+         FOR EACH STATEMENT EXECUTE FUNCTION audit_delete_probe_fn();",
+    )
+    .execute(&f.db)
+    .await
+    .unwrap();
+
+    f.server.maintain_at(now).await.unwrap();
+    let calls: i64 = sqlx::query_scalar("SELECT calls FROM audit_delete_probe")
+        .fetch_one(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(calls, 1);
+    assert!(f.present(row).await);
+
+    f.server.audit_retention += chrono::Duration::microseconds(1);
+    f.server.maintain_at(now).await.unwrap();
+    let calls: i64 = sqlx::query_scalar("SELECT calls FROM audit_delete_probe")
+        .fetch_one(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(calls, 1);
+    assert!(f.present(row).await);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
 async fn unrepresentable_retention_keeps_audit_rows_across_cycles() {
     let retention = chrono::Duration::from_std(Duration::from_secs(9_999_999_999 * 3600)).unwrap();
     let f = fixture(retention).await;

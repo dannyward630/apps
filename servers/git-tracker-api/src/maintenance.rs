@@ -5,12 +5,18 @@ use hmac::{Hmac, Mac};
 use serde_json::Value;
 use server_common::{Fault, Result, integer, now, string, uuid};
 use sha2::Sha256;
+// PostgreSQL timestamps use microseconds since 2000-01-01, while chrono uses the Unix epoch.
+const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
+const PG_MIN_TIMESTAMP_MICROS: i64 = -211_813_488_000_000_000;
 /// Returns the instant before which audit rows have expired, or `None` when `retention` reaches
-/// back past the earliest representable timestamp. In that case no application-created audit row
-/// can be older than the cutoff, so there is nothing to expire. Never substitute a sentinel or a
-/// clamped value: the cutoff must stay the exact `now - retention` or be absent.
+/// back past PostgreSQL's earliest `timestamptz` or chrono subtraction overflows. In either case
+/// no stored audit row can be older than the cutoff. The cutoff stays exact or is absent.
 pub fn audit_cutoff(now: DateTime<Utc>, retention: chrono::Duration) -> Option<DateTime<Utc>> {
-    now.checked_sub_signed(retention)
+    let cutoff = now.checked_sub_signed(retention)?;
+    let postgres_micros = cutoff
+        .timestamp_micros()
+        .checked_sub(PG_EPOCH_UNIX_MICROS)?;
+    (postgres_micros >= PG_MIN_TIMESTAMP_MICROS).then_some(cutoff)
 }
 impl Server {
     pub async fn maintain(&self) -> Result<()> {
@@ -109,7 +115,7 @@ impl Server {
             }
             None => tracing::debug!(
                 retention_seconds = self.audit_retention.num_seconds(),
-                "audit expiration skipped: retention predates every representable timestamp"
+                "audit expiration skipped: retention predates PostgreSQL timestamptz range"
             ),
         }
         Ok(())
@@ -209,12 +215,19 @@ mod tests {
     }
 
     #[test]
-    fn cutoff_is_absent_only_below_the_minimum_timestamp() {
+    fn cutoff_uses_postgres_minimum_and_keeps_chrono_overflow_skip() {
         let now = at("2026-10-22T00:00:00Z");
-        let exact = now - DateTime::<Utc>::MIN_UTC;
-        assert_eq!(audit_cutoff(now, exact), Some(DateTime::<Utc>::MIN_UTC));
+        let minimum =
+            DateTime::<Utc>::from_timestamp_micros(PG_MIN_TIMESTAMP_MICROS + PG_EPOCH_UNIX_MICROS)
+                .unwrap();
+        let exact = now - minimum;
+        assert_eq!(audit_cutoff(now, exact), Some(minimum));
         assert_eq!(
             audit_cutoff(now, exact + chrono::Duration::microseconds(1)),
+            None
+        );
+        assert_eq!(
+            audit_cutoff(now, chrono::Duration::hours(100_000_000)),
             None
         );
         let huge = chrono::Duration::from_std(Duration::from_secs(35_999_999_996_400)).unwrap();
