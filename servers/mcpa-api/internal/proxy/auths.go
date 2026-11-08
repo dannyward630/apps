@@ -28,6 +28,7 @@ const (
 	sdkProviderCodex        = "codex"
 	sdkProviderKimi         = "kimi"
 	sdkProviderOpenAICompat = "openai-compatibility"
+	codexAPIKeyBaseURL      = "https://api.openai.com/v1"
 )
 
 // Auth attribute keys owned by mcpa. The SDK copies attributes with each
@@ -175,6 +176,9 @@ func buildAuth(cred Credential, now time.Time) (*builtAuth, error) {
 			auth.Provider = sdkProviderClaude
 		case mcpav1.Provider_PROVIDER_CODEX:
 			auth.Provider = sdkProviderCodex
+			if baseURL == "" {
+				baseURL = codexAPIKeyBaseURL
+			}
 		case mcpav1.Provider_PROVIDER_KIMI:
 			auth.Provider = sdkProviderKimi
 		case mcpav1.Provider_PROVIDER_OPENAI_COMPATIBLE:
