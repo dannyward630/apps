@@ -122,7 +122,44 @@ fetch() {
   if command -v curl >/dev/null 2>&1; then
     curl --proto "$curl_proto" --proto-redir "$curl_proto" -fsSL --retry 3 -o "$2" "$1"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$2" "$1"
+    if [ "$curl_proto" = '=https' ]; then
+      wget --https-only --max-redirect=0 --help >/dev/null 2>&1 ||
+        fail "wget does not support --https-only or --max-redirect=0; install curl or GNU Wget"
+      # GNU Wget 1.x can follow HTTP redirects despite --https-only. Keep
+      # redirects disabled in wget until supported versions enforce the flag.
+      url=$1
+      redirects=0
+      while :; do
+        case "$url" in
+          https://*) ;;
+          *) fail "wget refused a non-HTTPS download URL" ;;
+        esac
+        if wget --https-only --max-redirect=0 -q -S -O "$2" "$url" 2>"$work/wget-response"; then
+          return 0
+        fi
+        grep -Eq '^[[:space:]]*HTTP/[0-9.]+ 30(1|2|3|7|8)([[:space:]]|$)' "$work/wget-response" || return 1
+        location=$(awk 'tolower($1) == "location:" { gsub(/\r/, "", $2); print $2; exit }' "$work/wget-response")
+        [ -n "$location" ] || return 1
+        redirects=$((redirects + 1))
+        [ "$redirects" -le 10 ] || fail "wget exceeded 10 HTTPS redirects"
+        case "$location" in
+          https://*) url=$location ;;
+          //*) url="https:$location" ;;
+          /*)
+            host=${url#https://}
+            host=${host%%/*}
+            url="https://$host$location"
+            ;;
+          *://*) fail "wget refused a non-HTTPS redirect" ;;
+          *)
+            url_path=${url%%\?*}
+            url="${url_path%/*}/$location"
+            ;;
+        esac
+      done
+    else
+      wget -q -O "$2" "$1"
+    fi
   else
     fail "curl or wget is required"
   fi

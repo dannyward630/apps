@@ -11,10 +11,11 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { delimiter, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { executableName, platforms } from "../bin/verify.mjs";
@@ -83,6 +84,34 @@ function fakeCommands(
       ? "echo 'musl libc (x86_64)' >&2; exit 1"
       : "echo 'ldd (GNU libc) 2.36'",
   );
+  return bin;
+}
+
+function wgetOnlyCommands(root) {
+  const bin = resolve(root, "wget-only-bin");
+  mkdirSync(bin);
+  for (const name of ["sh", "dash", "uname", "grep", "awk", "mktemp", "rm"]) {
+    const command = process.env.PATH.split(delimiter)
+      .map((directory) => resolve(directory, name))
+      .find(existsSync);
+    if (command) symlinkSync(command, resolve(bin, name));
+  }
+  writeFileSync(
+    resolve(bin, "wget"),
+    `#!/bin/sh
+if [ "$1" = --https-only ] && [ "$2" = --max-redirect=0 ] && [ "$3" = --help ]; then
+  [ "$WGET_SUPPORTS_HTTPS_ONLY" = 1 ]
+  exit $?
+fi
+printf '%s\\n' "$@" >"$WGET_ARGS_FILE"
+if [ -n "$WGET_REDIRECT_LOCATION" ]; then
+  printf '  HTTP/1.1 302 Found\\n  Location: %s\\n' "$WGET_REDIRECT_LOCATION" >&2
+  exit 8
+fi
+exit 1
+`,
+  );
+  chmodSync(resolve(bin, "wget"), 0o755);
   return bin;
 }
 
@@ -162,6 +191,57 @@ for (const interpreter of shells) {
       ...f.server.env,
       ...extra,
     });
+
+  test(
+    `${interpreter}: install.sh restricts wget unless a mirror is configured`,
+    { skip: process.platform === "win32" },
+    async (t) => {
+      const root = mkdtempSync(resolve(tmpdir(), "anydash-wget-"));
+      t.after(() => rmSync(root, { recursive: true, force: true }));
+      const bin = wgetOnlyCommands(root);
+      const argsFile = resolve(root, "wget-args");
+      const env = {
+        PATH: bin,
+        HOME: root,
+        WGET_ARGS_FILE: argsFile,
+        WGET_SUPPORTS_HTTPS_ONLY: "1",
+      };
+      const args = [sh, "--version", "1.2.3"];
+      const restricted = await run(interpreter, args, env);
+      assert.equal(restricted.status, 1);
+      assert.match(restricted.stderr, /cannot download SHA256SUMS/);
+      assert.match(
+        readFileSync(argsFile, "utf8"),
+        /^--https-only\n--max-redirect=0\n-q\n-S\n-O\n/,
+      );
+
+      const mirrored = await run(interpreter, args, {
+        ...env,
+        ANYDASH_DOWNLOAD_URL: "http://localhost/releases/download",
+      });
+      assert.equal(mirrored.status, 1);
+      assert.match(mirrored.stderr, /cannot download SHA256SUMS/);
+      assert.match(readFileSync(argsFile, "utf8"), /^-q\n-O\n/);
+
+      const redirect = await run(interpreter, args, {
+        ...env,
+        WGET_REDIRECT_LOCATION: "http://localhost/insecure",
+      });
+      assert.equal(redirect.status, 1);
+      assert.match(redirect.stderr, /wget refused a non-HTTPS redirect/);
+      assert.match(redirect.stderr, /nothing was installed/);
+
+      rmSync(argsFile);
+      const unsupported = await run(interpreter, args, {
+        ...env,
+        WGET_SUPPORTS_HTTPS_ONLY: "0",
+      });
+      assert.equal(unsupported.status, 1);
+      assert.match(unsupported.stderr, /wget does not support --https-only/);
+      assert.match(unsupported.stderr, /nothing was installed/);
+      assert.ok(!existsSync(argsFile));
+    },
+  );
 
   test(
     `${interpreter}: install.sh selects the newest AnyDash release and installs a verified executable`,
