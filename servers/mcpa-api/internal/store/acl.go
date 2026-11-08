@@ -30,6 +30,25 @@ func ListACL(ctx context.Context, db DB, resourceID uuid.UUID) ([]ACLEntry, erro
 	if err != nil {
 		return nil, err
 	}
+	return collectACL(rows)
+}
+
+// ListACLForPrincipals reads only the direct user entry and entries for the
+// user's current groups. Authorization paths must not load the full ACL.
+func ListACLForPrincipals(ctx context.Context, db DB, resourceID uuid.UUID, userID string, groupIDs []string) ([]ACLEntry, error) {
+	rows, err := db.Query(ctx, `SELECT resource_id, principal_kind, principal_id, role, created_by_user_id, create_time
+		FROM resource_acl WHERE resource_id = $1 AND
+		((principal_kind = $2 AND principal_id = $3) OR (principal_kind = $4 AND principal_id = ANY($5::text[])))
+		ORDER BY principal_kind, principal_id`, resourceID,
+		int16(mcpav1.PrincipalKind_PRINCIPAL_KIND_USER), userID,
+		int16(mcpav1.PrincipalKind_PRINCIPAL_KIND_GROUP), groupIDs)
+	if err != nil {
+		return nil, err
+	}
+	return collectACL(rows)
+}
+
+func collectACL(rows pgx.Rows) ([]ACLEntry, error) {
 	defer rows.Close()
 	var out []ACLEntry
 	for rows.Next() {

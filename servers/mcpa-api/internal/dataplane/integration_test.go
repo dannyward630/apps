@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -946,6 +947,39 @@ func metricValue(t *testing.T, e *itEnv, name, label, value string) float64 {
 		}
 	}
 	return 0
+}
+
+func TestIntegrationCallKeyAuthenticationWithLargeACL(t *testing.T) {
+	e := newEnv(t)
+	resourceID := e.resource("large-acl")
+	secret, _ := e.callKey("owner", resourceID)
+	_, err := e.db.Pool.Exec(e.ctx, `INSERT INTO resource_acl
+		(resource_id, principal_kind, principal_id, role, created_by_user_id)
+		SELECT $1, $2, 'legacy-' || n::text, $3, $4 FROM generate_series(1, 99999) AS n`,
+		resourceID, int16(mcpav1.PrincipalKind_PRINCIPAL_KIND_USER),
+		int16(mcpav1.ResourceRole_RESOURCE_ROLE_INVOKE), e.users["owner"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Pool.Exec(e.ctx, `ANALYZE resource_acl`); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.call(e.srv.URL, resourceID, secret, "/v1/chat/completions", chatBody(false), nil); got.status != http.StatusOK {
+		t.Fatalf("model call with 100000 ACL entries: %d %s", got.status, got.body)
+	}
+	authenticator := NewKeyAuthenticator(e.db, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Now)
+	result := testing.Benchmark(func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := authenticator.AuthenticateCallKey(e.ctx, resourceID, secret); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	t.Logf("100000-row call-key authentication: %d ns/op, %d B/op", result.NsPerOp(), result.AllocedBytesPerOp())
+	if got := result.AllocedBytesPerOp(); got >= 1<<20 {
+		t.Fatalf("call-key authentication allocated %d bytes per call, want under 1 MiB", got)
+	}
 }
 
 func TestIntegrationKeyInvalidation(t *testing.T) {

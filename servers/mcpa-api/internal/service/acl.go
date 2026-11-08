@@ -46,6 +46,8 @@ func (s *Service) ListAclEntries(ctx context.Context, req *connect.Request[mcpav
 	return connect.NewResponse(out), nil
 }
 
+const maxACLEntriesPerResource = 1000
+
 // PutAclEntry grants or changes a role. The last MANAGE holder cannot be
 // downgraded.
 func (s *Service) PutAclEntry(ctx context.Context, req *connect.Request[mcpav1.PutAclEntryRequest]) (*connect.Response[mcpav1.PutAclEntryResponse], error) {
@@ -72,6 +74,16 @@ func (s *Service) PutAclEntry(ctx context.Context, req *connect.Request[mcpav1.P
 		}
 		if m.GetRole() != roleManage && !authz.HasOtherManager(entries, m.GetPrincipalKind(), m.GetPrincipalId()) {
 			return apperr.FailedPrecondition("the resource needs at least one other MANAGE entry")
+		}
+		exists := false
+		for _, existing := range entries {
+			if existing.PrincipalKind == m.GetPrincipalKind() && existing.PrincipalID == m.GetPrincipalId() {
+				exists = true
+				break
+			}
+		}
+		if !exists && len(entries) >= maxACLEntriesPerResource {
+			return apperr.FailedPrecondition("the resource can have at most 1000 ACL entries")
 		}
 		entry, err = store.PutACL(ctx, tx, store.ACLEntry{
 			ResourceID: r.ID, PrincipalKind: m.GetPrincipalKind(), PrincipalID: m.GetPrincipalId(), Role: m.GetRole(), CreatedByUserID: p.UserID,

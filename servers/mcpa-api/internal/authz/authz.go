@@ -411,7 +411,7 @@ func effectiveRole(ctx context.Context, db store.DB, tenantID string, resourceID
 	if err != nil {
 		return 0, err
 	}
-	entries, err := store.ListACL(ctx, db, resourceID)
+	entries, err := store.ListACLForPrincipals(ctx, db, resourceID, userID, groups)
 	if err != nil {
 		return 0, err
 	}

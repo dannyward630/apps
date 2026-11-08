@@ -65,36 +65,36 @@ Each enum's full value names use its prefix, for example `ERROR_REASON_MFA_REQUI
 
 All RPCs are unary.
 
-| RPC                        | Request fields                                                            | Response fields                                                   |
-| -------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `GetViewer`                | none                                                                      | `viewer`                                                          |
-| `ListTenantGroups`         | `tenant_id`                                                               | `groups`                                                          |
-| `CreateResource`           | `request_key` (UUID v7), `tenant_id`, `name`, `description`               | `resource`                                                        |
-| `GetResource`              | `resource_id`                                                             | `resource`                                                        |
-| `ListResources`            | `tenant_id`, `page`                                                       | `resources` (only those with a caller role), `next_after_id`      |
-| `UpdateResource`           | `resource_id`, `name`, `description`                                      | `resource`                                                        |
-| `DeleteResource`           | `resource_id`, `confirm_name` (must equal the name)                       | none                                                              |
-| `UpdateRouting`            | `resource_id`, `routing`                                                  | `resource`                                                        |
-| `ListAclEntries`           | `resource_id`                                                             | `entries`                                                         |
-| `PutAclEntry`              | `resource_id`, `principal_kind`, `principal_id`, `role`                   | `entry`                                                           |
-| `RemoveAclEntry`           | `resource_id`, `principal_kind`, `principal_id`                           | none                                                              |
-| `ListCredentials`          | `resource_id`                                                             | `credentials`                                                     |
-| `RegisterApiKeyCredential` | `resource_id`, `provider`, `name`, `api_key`, `base_url`, `models`        | `credential`                                                      |
-| `RemoveCredential`         | `resource_id`, `credential_id`                                            | none                                                              |
-| `StartProviderOAuth`       | `resource_id`, `provider`, `name`                                         | `flow`                                                            |
-| `CompleteProviderOAuth`    | `resource_id`, `flow_id`, `callback_url` (the full provider redirect URL) | `flow`                                                            |
-| `GetProviderOAuthFlow`     | `resource_id`, `flow_id`                                                  | `flow`                                                            |
-| `IssueCallKey`             | `request_key` (UUID v7), `resource_id`, `name`, optional `expire_time`    | `call_key`, `secret` (only on the first execution)                |
-| `ListCallKeys`             | `resource_id`, `page`                                                     | `call_keys` (all for managers, own for invokers), `next_after_id` |
-| `RevokeCallKey`            | `resource_id`, `call_key_id`                                              | `call_key`                                                        |
-| `GetResourceBudget`        | `resource_id`                                                             | `budget`                                                          |
-| `SetResourceBudget`        | `resource_id`, `limit_usd` (empty removes the limit)                      | `budget`                                                          |
-| `GetTenantBudget`          | `tenant_id`                                                               | `budget`                                                          |
-| `SetTenantBudget`          | `tenant_id`, `limit_usd`                                                  | `budget`                                                          |
-| `GetUsage`                 | `tenant_id`, `filter`, `page`                                             | `summary`, `rows`, `next_after_id`                                |
-| `ListCallRecords`          | `tenant_id`, `filter`, `page`                                             | `records`, `next_after_id`                                        |
-| `ListAuditEvents`          | `resource_id`, `page`                                                     | `events`, `next_after_id`                                         |
-| `ListTenantAuditEvents`    | `tenant_id`, `page`                                                       | `events` (tenant-level events only), `next_after_id`              |
+| RPC                        | Request fields                                                                                       | Response fields                                                       |
+| -------------------------- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `GetViewer`                | none                                                                                                 | `viewer`                                                              |
+| `ListTenantGroups`         | `tenant_id`                                                                                          | `groups`                                                              |
+| `CreateResource`           | `request_key` (UUID v7), `tenant_id`, `name`, `description`                                          | `resource`                                                            |
+| `GetResource`              | `resource_id`                                                                                        | `resource`                                                            |
+| `ListResources`            | `tenant_id`, `page`                                                                                  | `resources` (only those with a caller role), `next_after_id`          |
+| `UpdateResource`           | `resource_id`, `name`, `description`                                                                 | `resource`                                                            |
+| `DeleteResource`           | `resource_id`, `confirm_name` (must equal the name)                                                  | none                                                                  |
+| `UpdateRouting`            | `resource_id`, `routing`                                                                             | `resource`                                                            |
+| `ListAclEntries`           | `resource_id`                                                                                        | `entries`                                                             |
+| `PutAclEntry`              | `resource_id`, `principal_kind`, `principal_id`, `role`; at most 1,000 distinct entries per resource | `entry`; `FAILED_PRECONDITION` when a new principal exceeds the limit |
+| `RemoveAclEntry`           | `resource_id`, `principal_kind`, `principal_id`                                                      | none                                                                  |
+| `ListCredentials`          | `resource_id`                                                                                        | `credentials`                                                         |
+| `RegisterApiKeyCredential` | `resource_id`, `provider`, `name`, `api_key`, `base_url`, `models`                                   | `credential`                                                          |
+| `RemoveCredential`         | `resource_id`, `credential_id`                                                                       | none                                                                  |
+| `StartProviderOAuth`       | `resource_id`, `provider`, `name`                                                                    | `flow`                                                                |
+| `CompleteProviderOAuth`    | `resource_id`, `flow_id`, `callback_url` (the full provider redirect URL)                            | `flow`                                                                |
+| `GetProviderOAuthFlow`     | `resource_id`, `flow_id`                                                                             | `flow`                                                                |
+| `IssueCallKey`             | `request_key` (UUID v7), `resource_id`, `name`, optional `expire_time`                               | `call_key`, `secret` (only on the first execution)                    |
+| `ListCallKeys`             | `resource_id`, `page`                                                                                | `call_keys` (all for managers, own for invokers), `next_after_id`     |
+| `RevokeCallKey`            | `resource_id`, `call_key_id`                                                                         | `call_key`                                                            |
+| `GetResourceBudget`        | `resource_id`                                                                                        | `budget`                                                              |
+| `SetResourceBudget`        | `resource_id`, `limit_usd` (empty removes the limit)                                                 | `budget`                                                              |
+| `GetTenantBudget`          | `tenant_id`                                                                                          | `budget`                                                              |
+| `SetTenantBudget`          | `tenant_id`, `limit_usd`                                                                             | `budget`                                                              |
+| `GetUsage`                 | `tenant_id`, `filter`, `page`                                                                        | `summary`, `rows`, `next_after_id`                                    |
+| `ListCallRecords`          | `tenant_id`, `filter`, `page`                                                                        | `records`, `next_after_id`                                            |
+| `ListAuditEvents`          | `resource_id`, `page`                                                                                | `events`, `next_after_id`                                             |
+| `ListTenantAuditEvents`    | `tenant_id`, `page`                                                                                  | `events` (tenant-level events only), `next_after_id`                  |
 
 Every response also carries `metadata`. The server contract owns the authorization requirement, validation bounds and error reasons of each RPC.
 

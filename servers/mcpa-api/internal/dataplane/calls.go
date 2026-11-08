@@ -89,7 +89,7 @@ func (k *KeyAuthenticator) AuthenticateCallKey(ctx context.Context, resourceID, 
 	if err != nil {
 		return proxy.CallPrincipal{}, err
 	}
-	entries, err := store.ListACL(ctx, k.db.Pool, rid)
+	entries, err := store.ListACLForPrincipals(ctx, k.db.Pool, rid, key.IssuerUserID, groups)
 	if err != nil {
 		return proxy.CallPrincipal{}, err
 	}
