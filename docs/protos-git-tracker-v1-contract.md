@@ -145,7 +145,7 @@ Repository connection IDs are UUID v7 values. `github_repository_id` retains Git
 
 PR execution measurements remain inspectable, but do not supply upstream branch graph points or automatic baselines. This prevents fork measurements from replacing baseline-branch data or configuration for a shared commit SHA.
 
-Comparison responses preserve the original baseline value and `baseline_unit`; deltas use the target unit. Clients must display both units when they differ.
+Comparison responses preserve the original baseline value and `baseline_unit` whenever a baseline row and column exist, including incompatible-unit comparisons. Incompatible comparisons leave delta and percentage empty. Deltas for compatible comparisons use the target unit. Clients must display both units when they differ.
 
 ## Rust bindings
 

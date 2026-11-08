@@ -106,6 +106,8 @@ pub fn compare(target: &Column, base: Option<&Column>, value: &str, baseline: &s
         ..Default::default()
     };
     let Some(base) = base else { return out };
+    out.baseline_value = baseline.into();
+    out.baseline_unit = base.unit.clone();
     let (Some(a), Some(b)) = (unit(&target.unit), unit(&base.unit)) else {
         return out;
     };
@@ -118,8 +120,6 @@ pub fn compare(target: &Column, base: Option<&Column>, value: &str, baseline: &s
     };
     let old = old * b.1 / a.1;
     let delta = value - &old;
-    out.baseline_value = baseline.into();
-    out.baseline_unit = base.unit.clone();
     out.delta = text(&delta);
     let pct = if old.is_zero() {
         None

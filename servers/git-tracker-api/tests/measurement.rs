@@ -86,6 +86,68 @@ fn exact_decimals_thresholds_units_and_bounds() {
     );
 }
 #[test]
+fn incompatible_comparison_keeps_original_baseline_fields() {
+    let mut s = State::default();
+    let at = Utc::now();
+    let base = context("base", "a");
+    s.upload(
+        &base,
+        &dataset(),
+        &[row("one", "1024")],
+        at,
+        vec![],
+        String::new(),
+    )
+    .unwrap();
+    s.complete(&base, at).unwrap();
+
+    let mut target_dataset = dataset();
+    target_dataset.columns[0].unit = "ms".into();
+    let target = context("target", "b");
+    s.upload(
+        &target,
+        &target_dataset,
+        &[row("one", "2")],
+        at + Duration::seconds(1),
+        vec!["a".into()],
+        String::new(),
+    )
+    .unwrap();
+
+    let comparison = &s.comparisons(&s.records["target"], None)[0];
+    assert_eq!(comparison.status, COMPARISON_STATUS_INCOMPATIBLE);
+    assert_eq!(comparison.baseline_value, "1024");
+    assert_eq!(comparison.baseline_unit, "B");
+    assert_eq!(comparison.baseline_execution_id, "base");
+    assert_eq!(comparison.delta, "");
+    assert_eq!(comparison.percentage, "");
+    let json = serde_json::to_value(comparison).unwrap();
+    assert_eq!(json["baselineValue"], "1024");
+    assert_eq!(json["baselineUnit"], "B");
+
+    let compatible = decimal::compare(&column("KiB"), Some(&column("B")), "1", "1024");
+    assert_eq!(compatible.status, COMPARISON_STATUS_UNCHANGED);
+    assert_eq!(compatible.baseline_value, "1024");
+    assert_eq!(compatible.baseline_unit, "B");
+    assert_eq!(compatible.delta, "0");
+
+    let new = decimal::compare(&column("ms"), None, "2", "");
+    assert_eq!(new.status, COMPARISON_STATUS_NEW);
+    assert_eq!(new.baseline_value, "");
+    assert_eq!(new.baseline_unit, "");
+
+    let unavailable = &s.comparisons(&s.records["target"], Some(None))[0];
+    assert_eq!(unavailable.status, COMPARISON_STATUS_UNAVAILABLE);
+    assert_eq!(unavailable.baseline_value, "");
+    assert_eq!(unavailable.baseline_unit, "");
+
+    s.records.remove("base");
+    let deleted = &s.comparisons(&s.records["target"], None)[0];
+    assert_eq!(deleted.status, COMPARISON_STATUS_BASELINE_DELETED);
+    assert_eq!(deleted.baseline_value, "");
+    assert_eq!(deleted.baseline_unit, "");
+}
+#[test]
 fn atomic_upload_retry_lifecycle_and_registration_order() {
     let mut s = State::default();
     let at = Utc::now();
