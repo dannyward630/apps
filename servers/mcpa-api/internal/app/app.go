@@ -35,6 +35,9 @@ const ShutdownTimeout = 30 * time.Second
 type Worker struct {
 	Name string
 	Run  func(ctx context.Context) error
+	// KeepRunningDuringDrain is for workers that must observe changes until
+	// admitted HTTP requests finish; they stop immediately after the drain.
+	KeepRunningDuringDrain bool
 }
 
 // App holds the wired components. Later layers read them to build their
@@ -52,8 +55,9 @@ type App struct {
 	Service       *service.Service
 	Web           *web.Handler
 
-	mounts  []server.Mount
-	workers []Worker
+	mounts        []server.Mount
+	workers       []Worker
+	shutdownHooks []func(context.Context) error
 }
 
 // New connects to PostgreSQL, refuses a schema that differs from the
@@ -152,6 +156,12 @@ func (a *App) Mount(m ...server.Mount) { a.mounts = append(a.mounts, m...) }
 // AddWorker adds a background worker. Call it before Run.
 func (a *App) AddWorker(w ...Worker) { a.workers = append(a.workers, w...) }
 
+// AddShutdownHook registers cleanup that must wait for HTTP requests to drain.
+// Call it before Run.
+func (a *App) AddShutdownHook(hook func(context.Context) error) {
+	a.shutdownHooks = append(a.shutdownHooks, hook)
+}
+
 // Handler builds the root HTTP handler from the components and mounts.
 func (a *App) Handler() http.Handler {
 	return server.New(server.Config{
@@ -189,6 +199,8 @@ func (a *App) Serve(ctx context.Context, ln net.Listener) error {
 func (a *App) serve(ctx context.Context, ln net.Listener, handler http.Handler) error {
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	drainWorkerCtx, cancelDrainWorkers := context.WithCancelCause(context.WithoutCancel(ctx))
+	defer cancelDrainWorkers(nil)
 	// Requests get their own lifetime: ending ctx starts the graceful drain,
 	// and in-flight requests keep their context until Shutdown completes or
 	// its deadline expires.
@@ -207,15 +219,22 @@ func (a *App) serve(ctx context.Context, ln net.Listener, handler http.Handler) 
 
 	var wg sync.WaitGroup
 	for _, w := range a.workers {
+		worker := w
+		workerCtx := runCtx
+		if worker.KeepRunningDuringDrain {
+			workerCtx = drainWorkerCtx
+		}
 		wg.Go(func() {
-			a.Log.Info("worker started", "worker", w.Name)
-			err := w.Run(runCtx)
+			a.Log.Info("worker started", "worker", worker.Name)
+			err := worker.Run(workerCtx)
 			if err != nil && !errors.Is(err, context.Canceled) {
-				a.Log.Error("worker failed", "worker", w.Name, "error", err)
-				cancel(fmt.Errorf("worker %s: %w", w.Name, err))
+				a.Log.Error("worker failed", "worker", worker.Name, "error", err)
+				cause := fmt.Errorf("worker %s: %w", worker.Name, err)
+				cancel(cause)
+				cancelDrainWorkers(cause)
 				return
 			}
-			a.Log.Info("worker stopped", "worker", w.Name)
+			a.Log.Info("worker stopped", "worker", worker.Name)
 		})
 	}
 
@@ -232,10 +251,24 @@ func (a *App) serve(ctx context.Context, ln net.Listener, handler http.Handler) 
 	a.Log.Info("mcpa-api shutting down")
 	shutdownCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), ShutdownTimeout)
 	defer stop()
-	shutdownErr := srv.Shutdown(shutdownCtx)
+	cause := context.Cause(runCtx)
+	failed := cause != nil && !errors.Is(cause, context.Canceled) && ctx.Err() == nil
+	var shutdownErr error
+	if failed {
+		shutdownErr = srv.Close()
+	} else {
+		shutdownErr = srv.Shutdown(shutdownCtx)
+	}
 	// Cancel requests that outlived the drain deadline.
 	cancelRequests()
 	cancel(nil)
+	cancelDrainWorkers(nil)
+	var hookErr error
+	for _, hook := range a.shutdownHooks {
+		if err := hook(shutdownCtx); err != nil {
+			hookErr = errors.Join(hookErr, err)
+		}
+	}
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
@@ -245,11 +278,14 @@ func (a *App) serve(ctx context.Context, ln net.Listener, handler http.Handler) 
 		a.Log.Warn("workers did not stop within the shutdown timeout")
 	}
 
-	if cause := context.Cause(runCtx); cause != nil && !errors.Is(cause, context.Canceled) && ctx.Err() == nil {
+	if failed {
 		return cause
 	}
 	if shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
 		return fmt.Errorf("http shutdown: %w", shutdownErr)
+	}
+	if hookErr != nil {
+		return fmt.Errorf("shutdown hook: %w", hookErr)
 	}
 	return nil
 }

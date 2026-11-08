@@ -246,6 +246,16 @@ func New(opts Options) (*Engine, error) {
 // writes and stops accepting upstream relay connections. In-flight calls are
 // not interrupted.
 func (e *Engine) Close() error {
+	return e.CloseContext(context.Background())
+}
+
+// CloseContext stops the engine and flushes queued credential writes until ctx
+// is done. Callers use this during graceful shutdown to keep cleanup within
+// the process shutdown deadline.
+func (e *Engine) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
@@ -268,7 +278,7 @@ func (e *Engine) Close() error {
 	if e.janitorDone != nil {
 		<-e.janitorDone
 	}
-	e.persister.close()
+	e.persister.close(ctx)
 	if err := e.relay.Close(); err != nil {
 		e.logger.Warn("closing the upstream relay failed", slog.String("error", err.Error()))
 	}

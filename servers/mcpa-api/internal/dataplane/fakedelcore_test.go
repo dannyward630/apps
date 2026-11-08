@@ -44,10 +44,12 @@ type fakeDelcore struct {
 	requests  []string
 	// attempts counts IngestEvent calls per event key, including failures
 	// and replays.
-	attempts  map[string]int
-	period    delcore.Period
-	finalized map[string]bool
-	calls     map[string]int
+	attempts         map[string]int
+	period           delcore.Period
+	finalized        map[string]bool
+	calls            map[string]int
+	authorizeEntered chan<- struct{}
+	authorizeRelease <-chan struct{}
 }
 
 func newFakeDelcore(t testing.TB) *fakeDelcore {
@@ -121,7 +123,17 @@ func (f *fakeDelcore) Authorize(_ context.Context, req *connect.Request[delcorev
 	m := req.Msg
 	f.mu.Lock()
 	reasons := f.denied[m.GetTenantId()+"/"+m.GetUserId()+"/"+m.GetCapability()]
+	entered, release := f.authorizeEntered, f.authorizeRelease
 	f.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
 	return connect.NewResponse(&delcorev1.AuthorizeResponse{Allowed: len(reasons) == 0, Reasons: reasons}), nil
 }
 

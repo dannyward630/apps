@@ -88,11 +88,14 @@ type asyncPersister struct {
 	logger    *slog.Logger
 	timeout   time.Duration
 
-	mu      sync.Mutex
-	pending map[persistKey][]byte
-	wake    chan struct{}
-	stop    chan struct{}
-	done    chan struct{}
+	mu        sync.Mutex
+	pending   map[persistKey][]byte
+	wake      chan struct{}
+	stop      chan struct{}
+	done      chan struct{}
+	runCtx    context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
 }
 
 type persistKey struct {
@@ -101,6 +104,7 @@ type persistKey struct {
 }
 
 func newAsyncPersister(persister TokenPersister, logger *slog.Logger, timeout time.Duration) *asyncPersister {
+	runCtx, cancel := context.WithCancel(context.Background())
 	p := &asyncPersister{
 		persister: persister,
 		logger:    logger,
@@ -109,6 +113,8 @@ func newAsyncPersister(persister TokenPersister, logger *slog.Logger, timeout ti
 		wake:      make(chan struct{}, 1),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
+		runCtx:    runCtx,
+		cancel:    cancel,
 	}
 	go p.run()
 	return p
@@ -144,12 +150,11 @@ func (p *asyncPersister) run() {
 	for {
 		select {
 		case <-p.stop:
-			p.flush()
 			return
 		case <-p.wake:
 		case <-retry.C:
 		}
-		if failed := p.flush(); failed {
+		if failed := p.flush(p.runCtx); failed {
 			retry.Reset(5 * time.Second)
 		}
 	}
@@ -157,14 +162,14 @@ func (p *asyncPersister) run() {
 
 // flush writes every queued payload and requeues failures. It reports
 // whether any write failed.
-func (p *asyncPersister) flush() bool {
+func (p *asyncPersister) flush(parent context.Context) bool {
 	p.mu.Lock()
 	batch := p.pending
 	p.pending = map[persistKey][]byte{}
 	p.mu.Unlock()
 	failed := false
 	for key, payload := range batch {
-		ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+		ctx, cancel := context.WithTimeout(parent, p.timeout)
 		err := p.persister.PersistCredentialSecret(ctx, key.resourceID, key.credentialID, payload)
 		cancel()
 		if err == nil {
@@ -184,14 +189,23 @@ func (p *asyncPersister) flush() bool {
 	return failed
 }
 
-func (p *asyncPersister) close() {
+func (p *asyncPersister) close(ctxs ...context.Context) {
 	if p == nil {
 		return
 	}
-	select {
-	case <-p.stop:
-	default:
-		close(p.stop)
+	var ctx context.Context
+	if len(ctxs) > 0 {
+		ctx = ctxs[0]
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	p.closeOnce.Do(func() {
+		p.cancel()
+		close(p.stop)
+	})
 	<-p.done
+	if p.flush(ctx) {
+		p.logger.Warn("credential persistence flush did not finish before shutdown", "error", ctx.Err())
+	}
 }

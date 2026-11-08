@@ -67,6 +67,8 @@ func TestServeStopsOnContextAndDrainsWorkers(t *testing.T) {
 func TestServeReturnsWorkerFailure(t *testing.T) {
 	a := quietApp()
 	boom := errors.New("boom")
+	closed := make(chan struct{})
+	a.AddShutdownHook(func(context.Context) error { close(closed); return nil })
 	a.AddWorker(
 		Worker{Name: "failing", Run: func(context.Context) error { return boom }},
 		Worker{Name: "loop", Run: func(ctx context.Context) error { <-ctx.Done(); return nil }},
@@ -80,6 +82,11 @@ func TestServeReturnsWorkerFailure(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("a failing worker did not stop serve")
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("shutdown hook did not run after worker failure")
 	}
 }
 
@@ -104,6 +111,8 @@ func TestServeKeepsRequestContextsDuringDrain(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	ctxErr := make(chan error, 1)
+	hookRan := make(chan struct{})
+	a.AddShutdownHook(func(context.Context) error { close(hookRan); return nil })
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
 		select {
@@ -139,6 +148,11 @@ func TestServeKeepsRequestContextsDuringDrain(t *testing.T) {
 		t.Fatalf("the request context ended with the serve context: %v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
+	select {
+	case <-hookRan:
+		t.Fatal("shutdown hook ran before the request drained")
+	default:
+	}
 	close(release)
 	if err := <-ctxErr; err != nil {
 		t.Fatalf("the request context ended during the drain: %v", err)
@@ -153,5 +167,163 @@ func TestServeKeepsRequestContextsDuringDrain(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("serve did not return after the drain")
+	}
+	select {
+	case <-hookRan:
+	default:
+		t.Fatal("shutdown hook did not run after the request drained")
+	}
+}
+
+func TestServeWorkerFailureStopsActiveRequest(t *testing.T) {
+	a := quietApp()
+	started := make(chan struct{})
+	fail := make(chan struct{})
+	boom := errors.New("worker failed")
+	a.AddWorker(Worker{Name: "failing", Run: func(context.Context) error {
+		<-fail
+		return boom
+	}})
+	a.AddShutdownHook(func(context.Context) error { return nil })
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	})
+	ln := listen(t)
+	done := make(chan error, 1)
+	go func() { done <- a.serve(context.Background(), ln, handler) }()
+	requestDone := make(chan struct{})
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/")
+		if err == nil {
+			resp.Body.Close()
+		}
+		close(requestDone)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not start")
+	}
+	close(fail)
+	select {
+	case err := <-done:
+		if !errors.Is(err, boom) {
+			t.Fatalf("serve returned %v, want worker failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker failure waited for the active request")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active request did not stop after worker failure")
+	}
+}
+
+func TestServeShutdownHookReceivesDeadlineContext(t *testing.T) {
+	a := quietApp()
+	called := make(chan context.Context, 1)
+	a.AddShutdownHook(func(ctx context.Context) error {
+		called <- ctx
+		return nil
+	})
+
+	ln := listen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.serve(ctx, ln, http.NotFoundHandler()) }()
+	cancel()
+
+	select {
+	case got := <-called:
+		if _, ok := got.Deadline(); !ok {
+			t.Fatal("shutdown hook context has no deadline")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown hook was not called")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after the shutdown hook")
+	}
+}
+
+func TestServeKeepsDrainWorkerUntilRequestsFinish(t *testing.T) {
+	a := quietApp()
+	workerStarted := make(chan struct{})
+	workerStopped := make(chan struct{})
+	a.AddWorker(Worker{
+		Name:                   "drain-worker",
+		KeepRunningDuringDrain: true,
+		Run: func(ctx context.Context) error {
+			close(workerStarted)
+			<-ctx.Done()
+			close(workerStopped)
+			return ctx.Err()
+		},
+	})
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-releaseRequest
+		w.WriteHeader(http.StatusNoContent)
+	})
+	ln := listen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.serve(ctx, ln, handler) }()
+	select {
+	case <-workerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain worker did not start")
+	}
+	response := make(chan *http.Response, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/")
+		if err != nil {
+			t.Errorf("request failed: %v", err)
+			return
+		}
+		resp.Body.Close()
+		response <- resp
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not start")
+	}
+	cancel()
+	select {
+	case <-workerStopped:
+		t.Fatal("drain worker stopped before the request finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseRequest)
+	select {
+	case resp := <-response:
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("response status = %d", resp.StatusCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not finish")
+	}
+	select {
+	case <-workerStopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain worker did not stop after the request finished")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return")
 	}
 }

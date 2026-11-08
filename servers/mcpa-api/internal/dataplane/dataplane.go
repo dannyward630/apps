@@ -158,7 +158,12 @@ func New(cfg Config) (*DataPlane, error) {
 }
 
 // Close stops the engine's background refresh and flushes token writes.
-func (dp *DataPlane) Close() error { return dp.Engine.Close() }
+func (dp *DataPlane) Close() error { return dp.CloseContext(context.Background()) }
+
+// CloseContext stops the engine and bounds its queued credential flush by ctx.
+func (dp *DataPlane) CloseContext(ctx context.Context) error {
+	return dp.Engine.CloseContext(ctx)
+}
 
 // every runs fn immediately and then every interval until ctx ends. Errors
 // are logged and never stop the loop.

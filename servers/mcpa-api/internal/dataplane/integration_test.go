@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -57,6 +58,82 @@ func formatCases() []formatCase {
 		{"claude-stream", "/v1/messages", `{"model":"compat-model","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"` + promptCanary + `"}]}`, claude},
 		{"gemini", "/v1beta/models/compat-model:generateContent", gemini, nil},
 		{"gemini-stream", "/v1beta/models/compat-model:streamGenerateContent?alt=sse", gemini, nil},
+	}
+}
+
+func TestIntegrationModelCallFinishesDuringGracefulDrain(t *testing.T) {
+	e := newEnv(t)
+	id := e.resource("drain")
+	key, _ := e.callKey("owner", id)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	e.dc.set(func(f *fakeDelcore) {
+		f.authorizeEntered = entered
+		f.authorizeRelease = release
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- e.app.Serve(ctx, ln) }()
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/r/"+id+"/v1/chat/completions", strings.NewReader(chatBody(false)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	type response struct {
+		status int
+		body   []byte
+		err    error
+	}
+	result := make(chan response, 1)
+	go func() {
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			result <- response{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		result <- response{status: resp.StatusCode, body: body, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("model call did not reach Delcore authorization")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("serve returned before the model call drained: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case got := <-result:
+		if got.err != nil || got.status != http.StatusOK || !strings.Contains(string(got.body), outputCanary) {
+			t.Fatalf("model call during drain: status %d, body %s, error %v", got.status, got.body, got.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("model call did not finish during the drain")
+	}
+	if hits := e.up.hits.Load(); hits != 1 {
+		t.Fatalf("provider calls = %d, want 1", hits)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve returned %v after the drain", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after the model call")
 	}
 }
 

@@ -25,6 +25,8 @@ The server uses Go. This deviates from the repository Rust default for new serve
 - One process embeds the SDK. There is no CPA server or process per resource and no action to create, start or stop a dedicated CPA server.
 - PostgreSQL is the only authoritative store. Connect-Go and Protobuf use the root pinned versions.
 
+On graceful shutdown, the server stops accepting HTTP requests and lets admitted requests finish for up to 30 seconds. The data-plane engine stays available during this drain. After the drain ends or reaches its deadline, the server cancels remaining requests, closes the engine, stops background credential refresh and flushes queued token writes. A worker or listener failure stops the HTTP server immediately and then closes the engine.
+
 The binary is `mcpa-api`, built from `./servers/mcpa-api`. It has these subcommands:
 
 | Subcommand                   | Behavior                                                                                                                                                      |

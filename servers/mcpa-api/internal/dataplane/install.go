@@ -3,7 +3,6 @@
 package dataplane
 
 import (
-	"context"
 	"net/http"
 	"time"
 
@@ -31,8 +30,8 @@ type InstallOptions struct {
 
 // Install builds the data plane for a, mounts the engine at /r/, installs
 // the service hooks and registers the workers: outbox delivery, retention,
-// tenant lifecycle, the cross-replica credential listener and engine
-// shutdown.
+// tenant lifecycle and the cross-replica credential listener. Engine cleanup
+// runs after HTTP requests drain.
 func Install(a *app.App, opts InstallOptions) (*DataPlane, error) {
 	geminiClient := opts.OAuth.GeminiCLIClient
 	if geminiClient == (provideroauth.GoogleOAuthClient{}) {
@@ -71,11 +70,8 @@ func Install(a *app.App, opts InstallOptions) (*DataPlane, error) {
 		app.Worker{Name: "usage_outbox", Run: dp.Outbox.Run},
 		app.Worker{Name: "retention", Run: dp.RunRetention},
 		app.Worker{Name: "tenant_lifecycle", Run: dp.RunLifecycle},
-		app.Worker{Name: "credential_sync", Run: dp.Sync.Listen},
-		app.Worker{Name: "data_plane_engine", Run: func(ctx context.Context) error {
-			<-ctx.Done()
-			return dp.Close()
-		}},
+		app.Worker{Name: "credential_sync", Run: dp.Sync.Listen, KeepRunningDuringDrain: true},
 	)
+	a.AddShutdownHook(dp.CloseContext)
 	return dp, nil
 }
