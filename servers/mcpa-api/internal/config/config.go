@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -210,6 +211,11 @@ func (p *parser) origin(name string) string {
 		p.fail("%s %v", name, err)
 		return ""
 	}
+	u, _ := url.Parse(o)
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		p.fail("%s must use https unless it targets a loopback host", name)
+		return ""
+	}
 	return o
 }
 
@@ -236,7 +242,7 @@ func (p *parser) absoluteURL(name string, required bool) string {
 	return raw
 }
 
-// NormalizeOrigin returns the canonical scheme://host[:port] form of an origin.
+// NormalizeOrigin returns the browser-serialized scheme://host[:port] origin.
 func NormalizeOrigin(raw string) (string, error) {
 	u, err := url.Parse(strings.TrimSuffix(raw, "/"))
 	if err != nil || u.Host == "" || u.User != nil {
@@ -248,10 +254,17 @@ func NormalizeOrigin(raw string) (string, error) {
 	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 		return "", errors.New("must not contain a path, query or fragment")
 	}
-	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
-		return "", errors.New("must use https unless it targets a loopback host")
+	for _, r := range u.Hostname() {
+		if r > 127 {
+			return "", errors.New("must use an ASCII (punycode) host")
+		}
 	}
-	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), nil
+	host := strings.ToLower(u.Host)
+	if port, err := strconv.Atoi(u.Port()); err == nil &&
+		((u.Scheme == "https" && port == 443) || (u.Scheme == "http" && port == 80)) {
+		host = strings.TrimSuffix(host, ":"+u.Port())
+	}
+	return strings.ToLower(u.Scheme) + "://" + host, nil
 }
 
 func isLoopbackHost(host string) bool {
@@ -458,7 +471,7 @@ func (p *parser) returnURLs(webOrigin string) []string {
 			continue
 		}
 		origin, err := NormalizeOrigin(u.Scheme + "://" + u.Host)
-		if err != nil || (webOrigin != "" && origin != webOrigin) {
+		if err != nil || (u.Scheme == "http" && !isLoopbackHost(u.Hostname())) || (webOrigin != "" && origin != webOrigin) {
 			p.fail("MCPA_WEB_RETURN_URLS entries must use the WEB_ORIGIN origin")
 		}
 	}

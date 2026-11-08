@@ -30,16 +30,20 @@ import (
 const webOrigin = "https://mcpa.example"
 
 func newHandler(t *testing.T, ready server.Readiness, mounts ...server.Mount) http.Handler {
+	return newHandlerForOrigin(t, webOrigin, ready, mounts...)
+}
+
+func newHandlerForOrigin(t *testing.T, origin string, ready server.Readiness, mounts ...server.Mount) http.Handler {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	authn := auth.NewAuthenticator(auth.AuthenticatorConfig{WebOrigin: webOrigin})
+	authn := auth.NewAuthenticator(auth.AuthenticatorConfig{WebOrigin: origin})
 	return server.New(server.Config{
 		Service:       mcpav1connect.UnimplementedMcpaServiceHandler{},
 		Authenticator: authn,
 		Web:           web.New(web.Config{Authenticator: authn, Log: log}),
 		Metrics:       obs.NewMetrics(),
 		Log:           log,
-		WebOrigin:     webOrigin,
+		WebOrigin:     origin,
 		MetricsToken:  "metrics-token",
 		Ready:         ready,
 		Mounts:        mounts,
@@ -169,6 +173,20 @@ func TestBrowserPolicy(t *testing.T) {
 	rec = do(h, http.MethodGet, "/auth/login?return_to=https://evil.example/", map[string]string{"Origin": "https://evil.example"})
 	if rec.Code == http.StatusForbidden {
 		t.Fatalf("navigation was rejected by the origin policy: %s", rec.Body.String())
+	}
+}
+
+func TestBrowserPolicyAcceptsCanonicalDefaultPort(t *testing.T) {
+	origin, err := config.NormalizeOrigin("https://x.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHandlerForOrigin(t, origin, nil)
+	rec := do(h, http.MethodOptions, getViewer, map[string]string{
+		"Origin": "https://x.example", "Access-Control-Request-Method": "POST",
+	})
+	if rec.Code != http.StatusNoContent || rec.Header().Get("Access-Control-Allow-Origin") != "https://x.example" {
+		t.Fatalf("preflight: status %d headers %v", rec.Code, rec.Header())
 	}
 }
 
