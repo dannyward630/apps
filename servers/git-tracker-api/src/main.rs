@@ -10,7 +10,7 @@ use axum::{
 use git_tracker_api::{Server, auth::Actions, github::GitHub};
 use server_common::{
     authority::Authority,
-    config::{duration, required},
+    config::{duration, required, valid_origin},
     http::Policy,
     telemetry,
 };
@@ -40,20 +40,17 @@ async fn run() -> anyhow::Result<()> {
         matches!(command.as_str(), "serve" | "migrate"),
         "unknown command"
     );
-    let db = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&required("DATABASE_URL")?)
-        .await
-        .map_err(|_| anyhow::anyhow!("database unavailable"))?;
     if command == "migrate" {
+        let db = database().await?;
         sqlx::raw_sql(include_str!("../migrations/00001_git_tracker.sql"))
             .execute(&db)
             .await?;
         return Ok(());
     }
+    let origin = web_origin()?;
+    let db = database().await?;
     required("AUDIT_RETENTION")?;
     let retention = duration("AUDIT_RETENTION", Duration::from_secs(1))?;
-    let origin = required("WEB_ORIGIN")?;
     let server = Arc::new(Server {
         db: db.clone(),
         authority: Authority::from_env(Duration::from_secs(30))?,
@@ -183,4 +180,49 @@ async fn run() -> anyhow::Result<()> {
         provider.shutdown()?
     }
     Ok(())
+}
+
+fn web_origin() -> anyhow::Result<String> {
+    let origin = required("WEB_ORIGIN")?;
+    check_web_origin(&origin)?;
+    Ok(origin)
+}
+
+fn check_web_origin(origin: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        valid_origin(origin),
+        "WEB_ORIGIN must be one exact http or https origin"
+    );
+    Ok(())
+}
+
+async fn database() -> anyhow::Result<sqlx::PgPool> {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(20)
+        .connect(&required("DATABASE_URL")?)
+        .await
+        .map_err(|_| anyhow::anyhow!("database unavailable"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_web_origin;
+
+    #[test]
+    fn rejects_non_origin_values() {
+        for value in ["http://x/", "https://x/p", "ftp://x", ""] {
+            assert_eq!(
+                check_web_origin(value).unwrap_err().to_string(),
+                "WEB_ORIGIN must be one exact http or https origin",
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_exact_origins() {
+        for value in ["http://127.0.0.1:46320", "https://git-tracker.delino.io"] {
+            check_web_origin(value).unwrap();
+        }
+    }
 }

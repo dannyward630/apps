@@ -169,6 +169,8 @@ PR execution measurements remain available in execution history and explicit com
 
 Server environment variables have no service-name prefix. Use `DATABASE_URL`, `LISTEN`, `WEB_ORIGIN`, `AUDIT_RETENTION`, `GITHUB_APP_ID`, `GITHUB_KEY_FILE`, `WEBHOOK_SECRET`, `DELCORE_URL`, `DELCORE_RESOURCE`, `LOGTO_TOKEN_URL`, `CLIENT_ID` and `CLIENT_SECRET`. Alert generation reads `ALERT_<name>_THRESHOLD`, `ALERT_<name>_WINDOW` and `ALERT_<name>_FOR`; PostgreSQL integration tests read `TEST_DATABASE_URL`. Configure the new names in each service environment before upgrading; prefixed aliases are not supported. `DELCORE_URL` and `DELCORE_RESOURCE` identify the upstream service and retain that name.
 
+`WEB_ORIGIN` must be one exact `http` or `https` origin, including its scheme and any non-default port, without a path or trailing slash. The server rejects an invalid value during startup before connecting to PostgreSQL. The configured value remains the exact CORS allowlist entry.
+
 ## Local development
 
 `servers/scripts/dev-api.mjs` owns the development launcher shared by the APIs. Its environment handoff follows the [repository workflow](repository-workflow-contract.md#local-development-databases).
