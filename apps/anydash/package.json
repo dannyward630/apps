@@ -41,7 +41,7 @@
     "@lynx-js/testing-environment": "0.4.0",
     "@lynx-js/types": "4.3.0",
     "@lynx-js/web-elements": "0.12.16",
-    "@rstest/core": "0.12.4",
+    "@rstest/core": "0.12.6",
     "@types/node": "24.19.2",
     "@types/react": "19.2.14",
     "axe-core": "4.11.0",
