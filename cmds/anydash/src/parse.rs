@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 pub const UNKNOWN_MODEL: &str = "unknown";
+/// Match the API's model identifier rule before a model becomes a local bucket key.
+#[must_use]
+pub fn normalize_model(model: &str) -> &str {
+    if (1..=200).contains(&model.len()) && model.bytes().all(|b| b.is_ascii_graphic()) {
+        model
+    } else {
+        UNKNOWN_MODEL
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Tokens {
@@ -97,11 +106,7 @@ pub fn codex_line(
                 out.push(Event::Session {
                     id: state.session.clone(),
                     at,
-                    model: if state.model.is_empty() {
-                        UNKNOWN_MODEL.to_owned()
-                    } else {
-                        state.model.clone()
-                    },
+                    model: normalize_model(&state.model).to_owned(),
                 });
             }
         }
@@ -123,13 +128,13 @@ pub fn codex_line(
         }
         Some("turn_context") => {
             if let Some(model) = payload.get("model").and_then(Value::as_str) {
-                let first = state.model.is_empty();
-                model.clone_into(&mut state.model);
+                let first = normalize_model(&state.model) == UNKNOWN_MODEL;
+                normalize_model(model).clone_into(&mut state.model);
                 if first && !state.session.is_empty() && state.started >= cutoff {
                     out.push(Event::Session {
                         id: state.session.clone(),
                         at: state.started,
-                        model: model.to_owned(),
+                        model: state.model.clone(),
                     });
                 }
             }
@@ -163,11 +168,7 @@ pub fn codex_line(
             if at >= cutoff && tokens.total() > 0 {
                 out.push(Event::Tokens {
                     at,
-                    model: if state.model.is_empty() {
-                        UNKNOWN_MODEL.to_owned()
-                    } else {
-                        state.model.clone()
-                    },
+                    model: normalize_model(&state.model).to_owned(),
                     tokens,
                     key: String::new(),
                 });
@@ -207,11 +208,7 @@ pub fn claude_line(line: &str, cutoff: i64, out: &mut Vec<Event>) -> Result<(), 
                 cache_read: count(usage, "cache_read_input_tokens")?,
                 cache_write: count(usage, "cache_creation_input_tokens")?,
             };
-            let model = message
-                .get("model")
-                .and_then(Value::as_str)
-                .filter(|m| !m.is_empty())
-                .unwrap_or(UNKNOWN_MODEL)
+            let model = normalize_model(message.get("model").and_then(Value::as_str).unwrap_or(""))
                 .to_owned();
             let request = v.get("requestId").and_then(Value::as_str).unwrap_or("");
             (model, Some((at, hash(&format!("{id}\0{request}")), t)))

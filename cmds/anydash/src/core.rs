@@ -1113,6 +1113,12 @@ impl Core {
     /// Upload changed buckets in chunks of at most 2,000 buckets and 1 MiB, then the parser
     /// statuses. Rejected uploads stay buffered.
     pub async fn upload(&self, now: i64) -> Result<usize> {
+        // A direct upload can run before the first sync after upgrading an older collector.
+        // Repair its unsendable model keys before building any request.
+        self.store().repair_invalid_model_buckets(
+            time::now_micros(),
+            time::bucket_start(now - time::RETENTION_SECONDS),
+        )?;
         let mut uploaded = 0;
         // A stop request ends a long backlog upload between chunks; the rest stays buffered.
         while !self.stopping() {

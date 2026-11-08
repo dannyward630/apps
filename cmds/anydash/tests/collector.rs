@@ -26,6 +26,7 @@ use anydash::{
 use prost::Message as _;
 use serde_json::json;
 use std::{
+    collections::HashSet,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -1175,6 +1176,152 @@ async fn offline_buffering_update_required_and_chunked_upload() {
     assert!(mock.count("/anydash.v1.CollectorService/UploadUsage") >= 2);
     assert_eq!(updated.status(true).unwrap().pending_bucket_count, 0);
     let _ = Tokens::default();
+}
+#[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "One scenario verifies parsed models, legacy rows, provider polling and direct upload."
+)]
+async fn invalid_models_do_not_block_upload_or_held_provider_poll() {
+    let home = tempfile::tempdir().unwrap();
+    let state = Arc::new(Mutex::new(Api::default()));
+    let (mock, core) = logged_in(home.path(), &state, Owner::Foreground).await;
+    vercel_connection(&core).await.unwrap();
+    let now = time::now();
+    core.heartbeat(now).await.unwrap();
+    assert!(core.status(true).unwrap().connections[0].lease_held);
+
+    let at = now - 300;
+    let bucket = time::bucket_start(at);
+    let claude = home.path().join(".claude/projects/p/models.jsonl");
+    let line = |model: &str, session: &str, id: &str, input: u64| {
+        json!({"type": "assistant", "timestamp": time::rfc3339(at), "sessionId": session,
+            "message": {"id": id, "model": model,
+                "usage": {"input_tokens": input, "output_tokens": 2}}})
+        .to_string()
+    };
+    support::write(
+        &claude,
+        &format!(
+            "{}\n{}\n",
+            line("my model", "new-invalid", "new-invalid", 7),
+            line("m", "valid", "valid", 11)
+        ),
+    );
+    support::write(
+        &home.path().join(".codex/sessions/fixture.jsonl"),
+        &format!(
+            "{}\n{}\n{}\n",
+            json!({"timestamp": time::rfc3339(at), "type": "session_meta", "payload": {"id": "codex-empty", "timestamp": time::rfc3339(at)}}),
+            json!({"timestamp": time::rfc3339(at), "type": "turn_context", "payload": {"model": ""}}),
+            json!({"timestamp": time::rfc3339(at), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 5, "output_tokens": 1}}}}),
+        ),
+    );
+    let db = rusqlite::Connection::open(home.path().join("anydash/data/collector.db")).unwrap();
+    for (index, model) in ["old model", "é"].into_iter().enumerate() {
+        db.execute(
+            "INSERT INTO claude_records(key, path, total, at, model, input, output, cache_read, cache_write)
+             VALUES(?1, '/legacy', 3, ?2, ?3, 3, 0, 0, 0)",
+            rusqlite::params![format!("legacy-{index}"), at, model],
+        ).unwrap();
+        db.execute(
+            "INSERT INTO buckets(tool, model, bucket, sessions, input, output, cache_read, cache_write, version, uploaded_version)
+             VALUES(?1, ?2, ?3, 0, 3, 0, 0, 0, ?4, 0)",
+            rusqlite::params![
+                pb::LocalTool::ClaudeCode as i32,
+                model,
+                bucket,
+                i64::try_from(index + 1).unwrap()
+            ],
+        ).unwrap();
+    }
+    drop(db);
+
+    let base = api(state);
+    mock.set(move |r| {
+        if r.route().ends_with("UploadUsage") {
+            let request: UploadUsageRequest = support::decode(r);
+            let mut keys = HashSet::new();
+            for bucket in &request.buckets {
+                let model = &bucket.model;
+                let key = (
+                    bucket.tool,
+                    model.clone(),
+                    bucket.bucket_start.as_ref().map(|t| t.seconds),
+                );
+                if model.is_empty()
+                    || model.len() > 200
+                    || !model.bytes().all(|b| b.is_ascii_graphic())
+                    || !keys.insert(key)
+                {
+                    return Reply::reason(400, "invalid_argument", ErrorReason::InvalidArgument);
+                }
+            }
+        }
+        base(r)
+    });
+    mock.clear();
+    core.cycle(now).await;
+    assert_eq!(core.status(true).unwrap().pending_bucket_count, 0);
+    assert_eq!(mock.count("/anydash.v1.CollectorService/UploadUsage"), 1);
+    assert!(mock.count("/v10/projects") > 0);
+    let upload: UploadUsageRequest = support::decode(
+        &mock
+            .recorded()
+            .into_iter()
+            .find(|r| r.route().ends_with("UploadUsage"))
+            .unwrap(),
+    );
+    let unknown = upload
+        .buckets
+        .iter()
+        .find(|b| b.tool == pb::LocalTool::ClaudeCode as i32 && b.model == "unknown")
+        .unwrap();
+    assert_eq!(unknown.tokens.as_ref().unwrap().input_tokens, Some(13));
+    assert!(
+        upload
+            .buckets
+            .iter()
+            .any(|b| b.model == "m" && b.tokens.as_ref().unwrap().input_tokens == Some(11))
+    );
+    assert!(
+        upload
+            .buckets
+            .iter()
+            .any(|b| b.tool == pb::LocalTool::Codex as i32 && b.model == "unknown")
+    );
+
+    // Direct upload can run before a sync after upgrading an older collector.
+    let db = rusqlite::Connection::open(home.path().join("anydash/data/collector.db")).unwrap();
+    db.execute(
+        "INSERT INTO claude_records(key, path, total, at, model, input, output, cache_read, cache_write)
+         VALUES('direct-legacy', '/legacy', 4, ?1, 'bad model', 4, 0, 0, 0)",
+        [at],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO buckets(tool, model, bucket, sessions, input, output, cache_read, cache_write, version, uploaded_version)
+         VALUES(?1, 'bad model', ?2, 0, 4, 0, 0, 0, 1, 0)",
+        rusqlite::params![pb::LocalTool::ClaudeCode as i32, bucket],
+    )
+    .unwrap();
+    drop(db);
+    mock.clear();
+    assert_eq!(core.upload(now + 1).await.unwrap(), 1);
+    assert_eq!(core.status(true).unwrap().pending_bucket_count, 0);
+    let upload: UploadUsageRequest = support::decode(
+        &mock
+            .recorded()
+            .into_iter()
+            .find(|r| r.route().ends_with("UploadUsage"))
+            .unwrap(),
+    );
+    assert_eq!(upload.buckets.len(), 1);
+    assert_eq!(upload.buckets[0].model, "unknown");
+    assert_eq!(
+        upload.buckets[0].tokens.as_ref().unwrap().input_tokens,
+        Some(17)
+    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn local_sync_requests_do_not_bypass_upload_rate_limits() {

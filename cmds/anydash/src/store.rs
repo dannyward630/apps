@@ -4,6 +4,7 @@
 use crate::{
     error::{Failure, Result},
     keys::DataKey,
+    parse,
     pb::ErrorReason,
     time,
 };
@@ -358,11 +359,29 @@ impl Store {
         started: i64,
         model: &str,
     ) -> Result<()> {
+        // A session saved by an older collector may have an invalid first model. Treat it
+        // as unknown so a later valid model can still become the first known model.
+        let previous: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT model FROM sessions WHERE tool = ?1 AND session = ?2 AND path = ?3",
+                params![tool, session, path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(previous) = previous
+            && parse::normalize_model(&previous) != previous
+        {
+            self.conn.execute(
+                "UPDATE sessions SET model = ?4 WHERE tool = ?1 AND session = ?2 AND path = ?3",
+                params![tool, session, path, parse::UNKNOWN_MODEL],
+            )?;
+        }
         self.conn.execute(
             "INSERT INTO sessions(tool, session, path, started, model) VALUES(?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(tool, session, path) DO UPDATE SET started = MIN(started, excluded.started),
              model = CASE WHEN model = 'unknown' THEN excluded.model ELSE model END",
-            params![tool, session, path, started, model],
+            params![tool, session, path, started, parse::normalize_model(model)],
         )?;
         Ok(())
     }
@@ -406,7 +425,8 @@ impl Store {
         })?;
         for row in rows {
             let (key, t) = row?;
-            out.entry(key).or_default().tokens.add(&t);
+            let normalized = (key.0, parse::normalize_model(&key.1).to_owned(), key.2);
+            out.entry(normalized).or_default().tokens.add(&t);
         }
         let mut sessions = self.conn.prepare(
             "SELECT tool, model, (started / 900) * 900 AS b, COUNT(*) FROM
@@ -424,17 +444,19 @@ impl Store {
         })?;
         for row in rows {
             let (key, n) = row?;
-            out.entry(key).or_default().sessions += n;
+            let normalized = (key.0, parse::normalize_model(&key.1).to_owned(), key.2);
+            out.entry(normalized).or_default().sessions += n;
         }
         Ok(out)
     }
     /// Write changed aggregates to the bucket table with new versions; buckets whose sources
     /// vanished become zero so the server receives the correction. Returns the changed count.
     pub fn refresh_buckets(&self, now_micros: u64, cutoff: i64) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
         let current = self.aggregate()?;
         let mut stored: BTreeMap<(i32, String, i64), (BucketValue, u64)> = BTreeMap::new();
         {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT tool, model, bucket, sessions, input, output, cache_read, cache_write, version FROM buckets",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -463,9 +485,25 @@ impl Store {
                 stored.insert(k, v);
             }
         }
+        // Invalid model keys could never have been accepted by the API. Their source rows
+        // are aggregated under `unknown`; remove the unsendable bucket keys before writing
+        // the single corrected aggregate and its new version in the same transaction.
+        for key in stored.keys() {
+            if parse::normalize_model(&key.1) != key.1 {
+                tx.execute(
+                    "DELETE FROM buckets WHERE tool = ?1 AND model = ?2 AND bucket = ?3",
+                    params![key.0, key.1, key.2],
+                )?;
+            }
+        }
         let mut changed = 0;
         let mut keys: Vec<_> = current.keys().cloned().collect();
-        keys.extend(stored.keys().cloned());
+        keys.extend(
+            stored
+                .keys()
+                .filter(|key| parse::normalize_model(&key.1) == key.1)
+                .cloned(),
+        );
         keys.sort();
         keys.dedup();
         for key in keys {
@@ -478,7 +516,7 @@ impl Store {
                 continue;
             }
             let version = time::next_version(previous.map_or(0, |(_, v)| *v), now_micros);
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO buckets(tool, model, bucket, sessions, input, output, cache_read, cache_write, version, uploaded_version)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
                  ON CONFLICT(tool, model, bucket) DO UPDATE SET sessions = excluded.sessions, input = excluded.input, output = excluded.output,
@@ -488,7 +526,23 @@ impl Store {
             )?;
             changed += 1;
         }
+        tx.commit()?;
         Ok(changed)
+    }
+    /// Repair legacy unsendable bucket keys before an upload that did not run a local sync.
+    pub fn repair_invalid_model_buckets(&self, now_micros: u64, cutoff: i64) -> Result<usize> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT model FROM buckets")?;
+        let models = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if models
+            .iter()
+            .any(|model| parse::normalize_model(model) != model)
+        {
+            self.refresh_buckets(now_micros, cutoff)
+        } else {
+            Ok(0)
+        }
     }
     /// Buckets whose current version has not been uploaded, oldest first.
     pub fn pending_buckets(&self, limit: usize) -> Result<Vec<BucketRow>> {

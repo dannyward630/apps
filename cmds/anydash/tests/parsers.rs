@@ -58,6 +58,45 @@ fn turn(ts: &str, model: &str) -> String {
         .to_string()
 }
 #[test]
+fn model_identifiers_match_the_upload_boundary() {
+    for model in ["", "my model", "bad\tmodel", "é", &"x".repeat(201)] {
+        assert_eq!(parse::normalize_model(model), UNKNOWN_MODEL);
+    }
+    for model in ["m", "gpt-5.5", "model(v2)", &"x".repeat(200)] {
+        assert_eq!(parse::normalize_model(model), model);
+    }
+}
+#[test]
+fn empty_codex_model_and_legacy_state_emit_only_unknown() {
+    let mut state = CodexState::default();
+    let mut events = vec![];
+    for line in [
+        meta("2026-10-31T10:00:00Z", "empty-model"),
+        turn("2026-10-31T10:00:01Z", ""),
+        codex_token("2026-10-31T10:01:00Z", 3, 0, 2, None),
+    ] {
+        parse::codex_line(&line, &mut state, "file", 0, &mut events).unwrap();
+    }
+    assert!(events.iter().all(|event| match event {
+        Event::Tokens { model, .. } | Event::Session { model, .. } => model == UNKNOWN_MODEL,
+        Event::RateLimits { .. } => true,
+    }));
+    state.model = "my model".into();
+    events.clear();
+    parse::codex_line(
+        &codex_token("2026-10-31T10:02:00Z", 6, 0, 4, None),
+        &mut state,
+        "file",
+        0,
+        &mut events,
+    )
+    .unwrap();
+    assert!(events.iter().all(|event| match event {
+        Event::Tokens { model, .. } | Event::Session { model, .. } => model == UNKNOWN_MODEL,
+        Event::RateLimits { .. } => true,
+    }));
+}
+#[test]
 fn codex_cumulative_deltas_and_cached_input() {
     let mut state = CodexState::default();
     let mut events = vec![];
@@ -442,6 +481,89 @@ fn claude(
         v["requestId"] = r.into();
     }
     v.to_string()
+}
+#[test]
+fn invalid_claude_models_aggregate_under_unknown_without_changing_valid_models() {
+    let home = tempfile::tempdir().unwrap();
+    let entry = |model: &str, session: &str, id: &str, input: u64| {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&claude("2026-10-31T10:00:00Z", session, id, None, input, 2))
+                .unwrap();
+        value["message"]["model"] = model.into();
+        value.to_string()
+    };
+    support::write(
+        &home.path().join(".claude/projects/p/models.jsonl"),
+        &format!(
+            "{}\n{}\n{}\n{}\n",
+            entry("my model", "s1", "m1", 3),
+            entry("é", "s2", "m2", 5),
+            entry(&"x".repeat(201), "s3", "m3", 7),
+            entry("m", "s4", "m4", 11),
+        ),
+    );
+    let (store, report) = sync_dir(home.path(), &[]);
+    assert_eq!(report.changed_buckets, 2);
+    let buckets = store.pending_buckets(10).unwrap();
+    assert_eq!(buckets.len(), 2);
+    let unknown = buckets.iter().find(|b| b.model == UNKNOWN_MODEL).unwrap();
+    assert_eq!(
+        (unknown.value.sessions, unknown.value.tokens.input),
+        (3, 15)
+    );
+    let valid = buckets.iter().find(|b| b.model == "m").unwrap();
+    assert_eq!((valid.value.sessions, valid.value.tokens.input), (1, 11));
+}
+#[test]
+fn legacy_invalid_bucket_keys_merge_into_one_unknown_upload() {
+    let home = tempfile::tempdir().unwrap();
+    let db = home.path().join("anydash/data/collector.db");
+    let store = store(home.path());
+    let bucket = time::bucket_start(now() - 300);
+    for (model, input) in [("my model", 3), ("é", 5), (UNKNOWN_MODEL, 2)] {
+        store
+            .add_contribution(
+                "f",
+                LocalTool::Codex as i32,
+                model,
+                bucket,
+                &Tokens {
+                    input,
+                    ..Tokens::default()
+                },
+            )
+            .unwrap();
+    }
+    let legacy = rusqlite::Connection::open(&db).unwrap();
+    for (model, version, uploaded) in [
+        ("my model", 101, 0),
+        ("é", 102, 0),
+        (UNKNOWN_MODEL, 100, 100),
+    ] {
+        legacy.execute(
+            "INSERT INTO buckets(tool, model, bucket, sessions, input, output, cache_read, cache_write, version, uploaded_version)
+             VALUES(?1, ?2, ?3, 0, 2, 0, 0, 0, ?4, ?5)",
+            rusqlite::params![LocalTool::Codex as i32, model, bucket, version, uploaded],
+        ).unwrap();
+    }
+    legacy.execute(
+        "INSERT INTO sessions(tool, session, path, started, model) VALUES(?1, 'legacy', 'f', ?2, 'my model')",
+        rusqlite::params![LocalTool::Codex as i32, bucket],
+    ).unwrap();
+    drop(legacy);
+
+    assert_eq!(store.repair_invalid_model_buckets(200, 0).unwrap(), 1);
+    let pending = store.pending_buckets(10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].model, UNKNOWN_MODEL);
+    assert_eq!(
+        (pending[0].value.sessions, pending[0].value.tokens.input),
+        (1, 10)
+    );
+    assert_eq!(pending[0].version, 200);
+    store.mark_uploaded(&pending[0]).unwrap();
+    assert_eq!(store.refresh_buckets(300, 0).unwrap(), 0);
+    assert_eq!(store.pending_buckets(10).unwrap().len(), 0);
 }
 #[test]
 fn claude_deduplicates_by_message_and_request_keeping_largest_total() {
