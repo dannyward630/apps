@@ -160,7 +160,7 @@ func ValidateUpstreamURL(raw string) error {
 		return fmt.Errorf("base_url must contain at most %d bytes", MaxBaseURLBytes)
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" {
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || strings.ContainsAny(raw, "?#") {
 		return errors.New("base_url must be an https URL without credentials, query or fragment")
 	}
 	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")

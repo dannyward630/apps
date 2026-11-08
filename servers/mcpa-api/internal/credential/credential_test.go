@@ -60,3 +60,30 @@ func TestValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateUpstreamURLDelimiters(t *testing.T) {
+	const invalidMessage = "base_url must be an https URL without credentials, query or fragment"
+	for _, tc := range []struct {
+		url       string
+		wantValid bool
+	}{
+		{url: "https://x.example/v1", wantValid: true},
+		{url: "https://x.example/v1/", wantValid: true},
+		{url: "https://x.example/v1?"},
+		{url: "https://x.example/v1#"},
+		{url: "https://x.example/v1?#"},
+	} {
+		t.Run(tc.url, func(t *testing.T) {
+			err := ValidateUpstreamURL(tc.url)
+			if tc.wantValid {
+				if err != nil {
+					t.Fatalf("valid base URL rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != invalidMessage {
+				t.Fatalf("error = %v, want %q", err, invalidMessage)
+			}
+		})
+	}
+}
