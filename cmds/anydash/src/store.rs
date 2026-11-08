@@ -9,7 +9,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension as _, params};
 use std::{collections::BTreeMap, path::Path};
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 const SCHEMA: &str = "
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE secrets(name TEXT PRIMARY KEY, key_id TEXT NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL);
@@ -22,6 +22,10 @@ CREATE TABLE buckets(tool INTEGER NOT NULL, model TEXT NOT NULL, bucket INTEGER 
 CREATE TABLE connections(id TEXT PRIMARY KEY, provider INTEGER NOT NULL, display_name TEXT NOT NULL, scope_id TEXT NOT NULL, lease_epoch INTEGER NOT NULL, lease_held INTEGER NOT NULL, failures INTEGER NOT NULL, next_attempt INTEGER NOT NULL, last_status INTEGER NOT NULL, failure_class INTEGER NOT NULL, last_success INTEGER NOT NULL, last_error_correlation TEXT NOT NULL, credential_marker TEXT NOT NULL, auth_stopped INTEGER NOT NULL, last_active_observed INTEGER NOT NULL, last_manual INTEGER NOT NULL, account_fingerprint TEXT NOT NULL);
 CREATE TABLE pending_snapshots(connection_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL, snapshot BLOB NOT NULL);
 CREATE TABLE widget_snapshots(widget_id TEXT PRIMARY KEY, position INTEGER NOT NULL, snapshot BLOB NOT NULL);
+";
+const PATH_INDEXES: &str = "
+CREATE INDEX claude_records_path_idx ON claude_records(path);
+CREATE INDEX sessions_path_idx ON sessions(path);
 ";
 /// Token counts normalized to the protocol meaning: uncached input, output including
 /// reasoning, cache reads and cache writes.
@@ -129,7 +133,12 @@ impl Store {
         match version {
             0 => {
                 conn.execute_batch(&format!(
-                    "BEGIN; {SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+                    "BEGIN; {SCHEMA} {PATH_INDEXES} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+                ))?;
+            }
+            1 => {
+                conn.execute_batch(&format!(
+                    "BEGIN; {PATH_INDEXES} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
                 ))?;
             }
             SCHEMA_VERSION => {}
@@ -534,14 +543,6 @@ impl Store {
         self.conn
             .execute("DELETE FROM sessions WHERE started < ?1", [cutoff])?;
         Ok(())
-    }
-    /// Skipped records per tool across retained files.
-    pub fn skipped(&self, tool: i32) -> Result<u64> {
-        Ok(uint(self.conn.query_row(
-            "SELECT COALESCE(SUM(skipped), 0) FROM files WHERE tool = ?1",
-            [tool],
-            |r| r.get(0),
-        )?))
     }
     // Connections
     pub fn connections(&self) -> Result<Vec<ConnectionRow>> {

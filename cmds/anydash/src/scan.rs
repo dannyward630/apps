@@ -203,17 +203,24 @@ pub fn sync(settings: &Settings, store: &Store, now: i64) -> Result<SyncReport> 
         }
         files.sort();
         files.dedup();
+        let mut skipped = 0u64;
         for file in files {
             match sync_file(store, tool, &file, cutoff, &mut report) {
-                Ok(true) => report.files_read += 1,
-                Ok(false) => {}
+                Ok((read, count)) => {
+                    report.files_read += usize::from(read);
+                    skipped = skipped.saturating_add(count);
+                }
                 Err(e) => {
                     store.rollback();
                     tracing::warn!(event = "session_file_failed", tool = tool_name(tool), correlation_id = %e.correlation_id);
+                    if file.is_file() {
+                        let key = file.to_string_lossy();
+                        skipped = skipped
+                            .saturating_add(store.file(&key)?.map_or(0, |cursor| cursor.skipped));
+                    }
                 }
             }
         }
-        let skipped = store.skipped(tool as i32)?;
         let state = if sources.iter().all(|p| !p.enabled) && !sources.is_empty() {
             ParserState::Disabled
         } else if active.is_empty() {
@@ -247,7 +254,7 @@ fn sync_file(
     path: &Path,
     cutoff: i64,
     report: &mut SyncReport,
-) -> Result<bool> {
+) -> Result<(bool, u64)> {
     let meta = std::fs::metadata(path)?;
     let key = path.to_string_lossy().into_owned();
     let compressed = path
@@ -273,8 +280,9 @@ fn sync_file(
                 ..p.clone()
             })?;
         }
-        return Ok(false);
+        return Ok((false, previous.as_ref().map_or(0, |cursor| cursor.skipped)));
     }
+    let reset_existing = previous.is_some() && reread;
     let mut cursor = match previous {
         Some(p) if !reread => p,
         _ => FileCursor {
@@ -306,7 +314,7 @@ fn sync_file(
     }
     let consumed = bytes.len();
     store.begin()?;
-    if reread {
+    if reset_existing {
         store.reset_file(&key)?;
     }
     let mut events = vec![];
@@ -374,5 +382,5 @@ fn sync_file(
     };
     store.put_file(&cursor)?;
     store.commit()?;
-    Ok(true)
+    Ok((true, cursor.skipped))
 }

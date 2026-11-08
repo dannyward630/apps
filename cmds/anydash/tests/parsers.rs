@@ -5,7 +5,7 @@ use anydash::{
     parse::{self, CodexState, Event, UNKNOWN_MODEL},
     pb::{LocalTool, ParserState, SourcePathOrigin},
     scan,
-    store::{Store, Tokens},
+    store::{FileCursor, Store, Tokens},
     time,
 };
 use serde_json::json;
@@ -450,6 +450,167 @@ fn unreadable_records_produce_partial_aggregation() {
         .map(|v| v.tokens.input + v.tokens.output)
         .sum();
     assert_eq!(total, 6);
+}
+#[test]
+fn skipped_records_follow_files_in_enabled_existing_paths() {
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join(".claude/projects");
+    let bad = projects.join("p/bad.jsonl");
+    let good = projects.join("p/good.jsonl");
+    support::write(&bad, "not json\n");
+    support::write(
+        &good,
+        &format!("{}\n", claude("2026-10-31T10:00:00Z", "s", "m", None, 1, 1)),
+    );
+    let settings = support::settings(home.path(), &[]);
+    let store = store(home.path());
+    let status = |store: &Store| {
+        scan::sync(&settings, store, now())
+            .unwrap()
+            .parsers
+            .into_iter()
+            .find(|p| p.tool == LocalTool::ClaudeCode as i32)
+            .unwrap()
+    };
+    let first = status(&store);
+    assert_eq!(
+        (first.state, first.skipped_record_count),
+        (ParserState::Partial as i32, 1)
+    );
+    std::fs::remove_file(&good).unwrap();
+    let retained_bad = status(&store);
+    assert_eq!(
+        (retained_bad.state, retained_bad.skipped_record_count),
+        (ParserState::Partial as i32, 1)
+    );
+    std::fs::remove_file(&bad).unwrap();
+    let removed = status(&store);
+    assert_eq!(
+        (removed.state, removed.skipped_record_count),
+        (ParserState::Ok as i32, 0)
+    );
+    assert!(store.file(&bad.to_string_lossy()).unwrap().is_some());
+    support::write(&bad, "not json\n");
+    assert_eq!(status(&store).skipped_record_count, 1);
+    scan::set_enabled(
+        &settings,
+        &store,
+        LocalTool::ClaudeCode,
+        &projects.to_string_lossy(),
+        false,
+    )
+    .unwrap();
+    let disabled = status(&store);
+    assert_eq!(disabled.skipped_record_count, 0);
+    assert!(
+        disabled.state == ParserState::Disabled as i32
+            || disabled.state == ParserState::NoSources as i32
+    );
+    assert!(store.file(&bad.to_string_lossy()).unwrap().is_some());
+}
+
+#[test]
+fn v1_store_migrates_rows_and_reset_deletes_search_path_indexes() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("collector.db");
+    let store = Store::open(&path).unwrap();
+    store.put_meta("retained", "yes").unwrap();
+    store
+        .put_file(&FileCursor {
+            path: "retained.jsonl".into(),
+            tool: LocalTool::ClaudeCode as i32,
+            identity: "fixture".into(),
+            skipped: 1,
+            ..FileCursor::default()
+        })
+        .unwrap();
+    store
+        .add_contribution("retained.jsonl", 2, "model", now(), &Tokens::default())
+        .unwrap();
+    store
+        .add_claude_record(
+            "record",
+            "retained.jsonl",
+            now(),
+            "model",
+            &Tokens::default(),
+        )
+        .unwrap();
+    store
+        .add_session(2, "session", "retained.jsonl", now(), "model")
+        .unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "BEGIN; DROP INDEX claude_records_path_idx; DROP INDEX sessions_path_idx; \
+         PRAGMA user_version=1; COMMIT;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let migrated = Store::open(&path).unwrap();
+    assert_eq!(migrated.meta("retained").unwrap(), "yes");
+    assert_eq!(migrated.file("retained.jsonl").unwrap().unwrap().skipped, 1);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    for table in ["contributions", "claude_records", "sessions"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "{table} rows survived migration");
+        let plan: Vec<String> = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN DELETE FROM {table} WHERE path=?1"
+            ))
+            .unwrap()
+            .query_map(["retained.jsonl"], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SEARCH") && step.contains(table)),
+            "{table} path delete must use an index: {plan:?}"
+        );
+    }
+    drop(migrated);
+    conn.pragma_update(None, "user_version", 3).unwrap();
+    drop(conn);
+    assert!(
+        Store::open(&path).is_err(),
+        "future schemas remain unsupported"
+    );
+}
+
+#[test]
+fn first_discovery_does_not_execute_file_reset() {
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join(".claude/projects/p/new.jsonl");
+    support::write(
+        &file,
+        &format!("{}\n", claude("2026-10-31T10:00:00Z", "s", "m", None, 1, 1)),
+    );
+    let store = store(home.path());
+    let path = file.to_string_lossy();
+    assert!(store.file(&path).unwrap().is_none());
+    // This sentinel makes an accidental path reset observable even without a prior cursor.
+    store
+        .add_contribution(&path, 2, "reset-sentinel", now(), &Tokens::default())
+        .unwrap();
+    let settings = support::settings(home.path(), &[]);
+    scan::sync(&settings, &store, now()).unwrap();
+    let conn = rusqlite::Connection::open(home.path().join("anydash/data/collector.db")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM contributions WHERE path=?1 AND model='reset-sentinel'",
+            [&path],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "a newly discovered file must not reset path rows");
 }
 #[test]
 fn utc_buckets_for_offset_and_dst_timestamps() {
