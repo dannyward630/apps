@@ -253,15 +253,24 @@ impl GitHub {
         let mut result = vec![string(&c, "sha").to_owned()];
         needed.remove(&result[0]);
         while !needed.is_empty() {
-            let Some(sha) = c["parents"][0]["sha"].as_str().map(str::to_owned) else {
+            let parents = c["parents"].as_array().ok_or_else(Fault::unavailable)?;
+            let Some(parent) = parents.first() else {
                 break;
             };
+            let sha = parent["sha"]
+                .as_str()
+                .filter(|sha| crate::valid_sha(sha))
+                .ok_or_else(Fault::unavailable)?
+                .to_owned();
             result.push(sha.clone());
             needed.remove(&sha);
             if needed.is_empty() {
                 break;
             }
             c = self.commit(r, &sha, &token).await?;
+            if c["sha"] != sha {
+                return Err(Fault::unavailable());
+            }
         }
         Ok(result)
     }
@@ -285,6 +294,12 @@ impl GitHub {
                 )
                 .await?;
             let rows = rows.as_array().ok_or_else(Fault::unavailable)?;
+            if rows
+                .iter()
+                .any(|row| !row["sha"].as_str().is_some_and(crate::valid_sha))
+            {
+                return Err(Fault::unavailable());
+            }
             if rows.iter().any(|v| v["sha"] == c.commit) {
                 return Ok(true);
             }
@@ -407,7 +422,13 @@ impl GitHub {
         }
     }
     pub async fn resolve(&self, r: &Repository, c: &Context) -> Result<(Vec<String>, String)> {
-        self.resolve_inner(r, c).await.map_err(github_failure)
+        self.resolve_inner(r, c).await.map_err(|fault| {
+            if fault.code == connectrpc::ErrorCode::FailedPrecondition {
+                fault
+            } else {
+                github_failure(fault)
+            }
+        })
     }
     async fn resolve_inner(&self, r: &Repository, c: &Context) -> Result<(Vec<String>, String)> {
         let token = self.installation(&r.installation_id).await?;
@@ -417,8 +438,15 @@ impl GitHub {
         }
         if c.pull_request > 0 {
             let p = self.pull(r, c.pull_request).await?;
-            if p["base"]["ref"] != c.branch {
+            if !p["base"]["ref"].as_str().is_some_and(|v| !v.is_empty())
+                || !p["head"]["sha"].as_str().is_some_and(crate::valid_sha)
+            {
                 return Err(Fault::unavailable());
+            }
+            if p["base"]["ref"] != c.branch {
+                return Err(Fault::precondition(
+                    "pull request base does not match branch",
+                ));
             }
             if p["head"]["sha"] != c.commit {
                 match tokio::time::timeout(
@@ -428,7 +456,11 @@ impl GitHub {
                 .await
                 {
                     Ok(Ok(true)) => {}
-                    Ok(Ok(false)) => return Err(Fault::unavailable()),
+                    Ok(Ok(false)) => {
+                        return Err(Fault::precondition(
+                            "commit is not part of the pull request",
+                        ));
+                    }
                     Ok(Err(fault)) => return Err(fault),
                     Err(_) => {
                         tracing::warn!(
@@ -464,7 +496,9 @@ impl GitHub {
             .branch(r, &c.branch, HashSet::from([c.commit.clone()]))
             .await?;
         if branch.last() != Some(&c.commit) {
-            return Err(Fault::unavailable());
+            return Err(Fault::precondition(
+                "commit is not on the branch first-parent path",
+            ));
         }
         let mut parents = Vec::new();
         while let Some(sha) = commit["parents"][0]["sha"].as_str().map(str::to_owned) {

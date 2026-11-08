@@ -28,6 +28,8 @@ fn sha(i: usize) -> String {
 struct Provider {
     /// Current PR head returned by `GET pulls/1`.
     head: String,
+    base_ref: Value,
+    rest_malformed: bool,
     /// Full ordered PR commit list; REST serves at most `REST_CAP` entries.
     commits: Vec<String>,
     /// Overrides REST rows entirely when set (for example to hide the target).
@@ -49,6 +51,8 @@ type Shared = Arc<Mutex<Provider>>;
 fn provider(commits: Vec<String>, head: &str) -> Shared {
     Arc::new(Mutex::new(Provider {
         head: head.into(),
+        base_ref: json!("main"),
+        rest_malformed: false,
         commits,
         rest_rows: None,
         state: "OPEN",
@@ -115,10 +119,15 @@ async fn handle(State(shared): State<Shared>, request: Request) -> (StatusCode, 
         (StatusCode::OK, out)
     } else if let Some(sha) = path.strip_prefix("/repos/owner/repo/commits/") {
         (StatusCode::OK, json!({"sha":sha,"parents":[]}))
+    } else if path == "/repos/owner/repo/git/ref/heads/main" {
+        (
+            StatusCode::OK,
+            json!({"ref":"refs/heads/main","object":{"type":"commit","sha":sha(9)}}),
+        )
     } else if path == "/repos/owner/repo/pulls/1" {
         (
             StatusCode::OK,
-            json!({"base":{"ref":"main","sha":sha(0)},"head":{"sha":p.head}}),
+            json!({"base":{"ref":p.base_ref,"sha":sha(0)},"head":{"sha":p.head}}),
         )
     } else if path == "/repos/owner/repo/pulls/1/commits" {
         let page: usize = query
@@ -131,13 +140,16 @@ async fn handle(State(shared): State<Shared>, request: Request) -> (StatusCode, 
             .rest_rows
             .clone()
             .unwrap_or_else(|| p.commits.iter().take(REST_CAP).cloned().collect());
-        let rows: Vec<Value> = rows
+        let mut rows: Vec<Value> = rows
             .chunks(100)
             .nth(page - 1)
             .unwrap_or_default()
             .iter()
             .map(|s| json!({"sha":s}))
             .collect();
+        if p.rest_malformed {
+            rows.push(json!({"sha":null}));
+        }
         (StatusCode::OK, Value::Array(rows))
     } else if path.starts_with("/repos/owner/repo/compare/") {
         (
@@ -237,6 +249,7 @@ impl Fixture {
 }
 
 const UNAVAILABLE: &str = "a dependency is unavailable";
+const NOT_MEMBER: &str = "commit is not part of the pull request";
 
 fn chain(n: usize) -> Vec<String> {
     (1..=n).map(sha).collect()
@@ -307,9 +320,64 @@ async fn non_members_are_rejected_after_complete_traversal() {
     let f = fixture(provider(chain(300), &sha(300))).await;
     // Retrievable repository commits (base ancestor, side parent, unrelated, force-pushed-away).
     for excluded in [sha(0), sha(1000), sha(2000), sha(3000)] {
-        assert_eq!(f.resolve(&excluded).await.unwrap_err(), UNAVAILABLE);
+        assert_eq!(f.resolve(&excluded).await.unwrap_err(), NOT_MEMBER);
     }
     assert_eq!(f.graphql_calls().len(), 12);
+}
+
+#[tokio::test]
+async fn proven_rejections_have_application_source() {
+    use connectrpc::ErrorCode;
+    use server_common::error::FaultSource;
+
+    let f = fixture(provider(chain(3), &sha(3))).await;
+    let fault = f
+        .github
+        .resolve(&f.repository, &context(&sha(1000)))
+        .await
+        .unwrap_err();
+    assert_eq!(fault.code, ErrorCode::FailedPrecondition);
+    assert_eq!(fault.source, FaultSource::Application);
+
+    f.shared.lock().unwrap().base_ref = json!("release");
+    let fault = f
+        .github
+        .resolve(&f.repository, &context(&sha(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(fault.code, ErrorCode::FailedPrecondition);
+    assert_eq!(fault.source, FaultSource::Application);
+
+    f.shared.lock().unwrap().base_ref = Value::Null;
+    let fault = f
+        .github
+        .resolve(&f.repository, &context(&sha(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(fault.code, ErrorCode::Unavailable);
+    assert_eq!(fault.source, FaultSource::GitHub);
+
+    let mut push = context(&sha(1000));
+    push.pull_request = 0;
+    let fault = f.github.resolve(&f.repository, &push).await.unwrap_err();
+    assert_eq!(fault.code, ErrorCode::FailedPrecondition);
+    assert_eq!(fault.source, FaultSource::Application);
+}
+
+#[tokio::test]
+async fn malformed_rest_rows_keep_membership_uncertain() {
+    use connectrpc::ErrorCode;
+    use server_common::error::FaultSource;
+    let f = fixture(provider(chain(3), &sha(3))).await;
+    f.shared.lock().unwrap().rest_malformed = true;
+    let fault = f
+        .github
+        .resolve(&f.repository, &context(&sha(1000)))
+        .await
+        .unwrap_err();
+    assert_eq!(fault.code, ErrorCode::Unavailable);
+    assert_eq!(fault.source, FaultSource::GitHub);
+    assert!(f.graphql_calls().is_empty());
 }
 
 #[tokio::test]
@@ -361,7 +429,7 @@ async fn short_nonterminal_and_empty_terminal_pages_are_consistent() {
         (commits[100..].to_vec(), true),
         (vec![], false),
     ]);
-    assert_eq!(f.resolve(&sha(5000)).await.unwrap_err(), UNAVAILABLE);
+    assert_eq!(f.resolve(&sha(5000)).await.unwrap_err(), NOT_MEMBER);
     assert_eq!(f.graphql_calls().len(), 3);
 }
 
@@ -563,7 +631,7 @@ async fn closed_membership_does_not_come_from_repository_existence() {
     // The mock serves every `commits/{sha}` lookup, i.e. the object exists in the repository,
     // but a SHA absent from the PR connection must still be rejected.
     let f = fixture(provider(chain(10), &sha(10))).await;
-    assert_eq!(f.resolve(&sha(77)).await.unwrap_err(), UNAVAILABLE);
+    assert_eq!(f.resolve(&sha(77)).await.unwrap_err(), NOT_MEMBER);
     assert!(f.resolve(&sha(5)).await.is_ok());
 }
 

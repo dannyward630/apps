@@ -607,6 +607,7 @@ struct GitHubMock {
     repository_status: std::sync::atomic::AtomicU16,
     repository_admin: std::sync::atomic::AtomicBool,
     repository_delay_ms: std::sync::atomic::AtomicU64,
+    membership_mode: std::sync::atomic::AtomicU8,
     gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     resolve_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
@@ -630,6 +631,13 @@ async fn fixture() -> Fixture {
 }
 
 async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
+    fixture_with_deadlines(github_timeout, git_tracker_api::github::MEMBERSHIP_DEADLINE).await
+}
+
+async fn fixture_with_deadlines(
+    github_timeout: Duration,
+    membership_deadline: Duration,
+) -> Fixture {
     use std::sync::atomic::Ordering;
     let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
@@ -671,6 +679,7 @@ async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
         repository_status: 200.into(),
         repository_admin: true.into(),
         repository_delay_ms: 0.into(),
+        membership_mode: 0.into(),
         gate: std::sync::Mutex::new(None),
         resolve_gate: std::sync::Mutex::new(None),
     });
@@ -720,6 +729,7 @@ async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
             let status = match p.as_str() {
                 "/user" => github.user_status.load(Ordering::SeqCst),
                 "/repos/owner/repo" => github.repository_status.load(Ordering::SeqCst),
+                "/repos/owner/repo/pulls/1/commits" if github.membership_mode.load(Ordering::SeqCst) == 5 => 502,
                 _ => 200,
             };
             if status != 200 {
@@ -729,6 +739,31 @@ async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
                 );
             }
             let private = github.private.load(Ordering::SeqCst);
+            let membership_mode = github.membership_mode.load(Ordering::SeqCst);
+            if p == "/graphql" && membership_mode == 9 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            if p == "/graphql" && membership_mode == 8 {
+                let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let second = !request["variables"]["after"].is_null();
+                let head = if second { "d".repeat(40) } else { "b".repeat(40) };
+                let nodes = if second { json!([]) } else { json!([{"commit":{"oid":"c".repeat(40)}}]) };
+                let response = json!({
+                    "data": {"repository": {
+                        "databaseId": 42,
+                        "pullRequest": {
+                            "id": "fixture-pr", "number": 1, "state": "OPEN",
+                            "baseRefName": "main", "headRefOid": head,
+                            "commits": {
+                                "totalCount": 1, "nodes": nodes,
+                                "pageInfo": {"hasNextPage": !second, "endCursor": if second { Value::Null } else { json!("c1") }}
+                            }
+                        }
+                    }}
+                });
+                return (StatusCode::OK, Json(response));
+            }
             let out = match p.as_str() {
                 "/token" => json!({"access_token":"service","expires_in":3600}),
                 "/delcore.v1.DelcoreService/GetCurrentUser" if auth == "Bearer manager" => {
@@ -753,13 +788,17 @@ async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
                 "/repos/owner/repo/installation" => json!({"id":1}),
                 "/app/installations/1/access_tokens" => json!({"token":"installation"}),
                 "/repos/owner/repo/pulls/1" => {
-                    json!({"base":{"ref":"main","sha":commit},"head":{"sha":commit}})
+                    json!({"base":{"ref":if membership_mode == 2 {"release"} else {"main"},"sha":commit},"head":{"sha":if membership_mode == 0 {commit.clone()} else {"b".repeat(40)}}})
                 }
+                "/repos/owner/repo/pulls/1/commits" if membership_mode == 6 => json!([{"sha":null}]),
+                "/repos/owner/repo/pulls/1/commits" if membership_mode != 0 => json!([]),
+                "/graphql" if membership_mode == 1 || membership_mode == 7 => json!({"data":{"repository":{"databaseId":42,"pullRequest":{"id":"fixture-pr","number":1,"state":"OPEN","baseRefName":"main","headRefOid":"b".repeat(40),"commits":{"totalCount":if membership_mode == 7 {1} else {0},"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}),
+                "/graphql" if membership_mode == 3 => json!({"errors":[{"message":"fixture provider failure"}]}),
                 "/repos/owner/repo/git/ref/heads/main" => {
                     json!({"ref":"refs/heads/main","object":{"type":"commit","sha":commit}})
                 }
                 p if p.starts_with("/repos/owner/repo/commits/") => {
-                    json!({"sha":commit,"parents":[]})
+                    json!({"sha":if membership_mode == 4 {p.rsplit('/').next().unwrap().to_owned()} else {commit},"parents":[]})
                 }
                 _ => return (StatusCode::UNAUTHORIZED, Json(json!({"code":"unauthenticated"}))),
             };
@@ -789,12 +828,16 @@ async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
             "client".into(),
             "fixture".into(),
         ),
-        github: GitHub::new(
-            github_http,
-            base.clone(),
-            "1".into(),
-            EncodingKey::from_rsa_pem(KEY).unwrap(),
-        ),
+        github: {
+            let mut client = GitHub::new(
+                github_http,
+                base.clone(),
+                "1".into(),
+                EncodingKey::from_rsa_pem(KEY).unwrap(),
+            );
+            client.membership_deadline = membership_deadline;
+            client
+        },
         actions: Actions::new(http.clone(), format!("{base}/jwks"), jwks),
         audit_retention: chrono::Duration::days(90),
         webhook_secret: "fixture-only".into(),
@@ -825,6 +868,58 @@ async fn fixture_with_github_timeout(github_timeout: Duration) -> Fixture {
         commit,
         finalized,
         _tasks: vec![mock_task, task],
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_proven_upload_rejections_are_not_github_failures() {
+    use std::sync::atomic::Ordering;
+    let f = fixture_with_deadlines(Duration::from_secs(20), Duration::from_millis(500)).await;
+    let (status, connected) = f.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let rid = connected["repository"]["id"].as_str().unwrap();
+    let (_, issued) = f.call("IssueToken", "Bearer manager", json!({"repositoryId":rid,"expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()})).await;
+    let auth = format!("Bearer {}", issued["token"].as_str().unwrap());
+    let dataset = json!({"id":"size","name":"Size","columns":[{"id":"bytes","unit":"B","direction":"DIRECTION_LOWER"}]});
+    let before_audit = f.audit_count().await;
+    for (mode, branch, commit, code, github_failures) in [
+        (1, "main", f.commit.clone(), "failed_precondition", 0),
+        (2, "main", f.commit.clone(), "failed_precondition", 0),
+        (4, "main", "b".repeat(40), "failed_precondition", 0),
+        (3, "main", f.commit.clone(), "unavailable", 1),
+        (5, "main", f.commit.clone(), "unavailable", 2),
+        (6, "main", f.commit.clone(), "unavailable", 3),
+        (7, "main", f.commit.clone(), "unavailable", 4),
+        (8, "main", f.commit.clone(), "unavailable", 5),
+        (9, "main", f.commit.clone(), "unavailable", 6),
+    ] {
+        f.github.membership_mode.store(mode, Ordering::SeqCst);
+        let execution_id = format!("rejected-{mode}");
+        let context = json!({"repositoryId":rid,"executionId":execution_id,"commit":commit,"branch":branch,"pullRequest":if mode == 4 {0} else {1}});
+        let (status, body) = f.call("Upload", &auth, json!({"context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"1"}}]})).await;
+        assert!(!status.is_success(), "mode {mode}: {body}");
+        assert_eq!(body["code"], code, "mode {mode}: {body}");
+        assert_eq!(
+            f.server
+                .metrics
+                .events
+                .with_label_values(&["github", "failure"])
+                .get(),
+            github_failures,
+            "mode {mode}"
+        );
+        let saved: bool = sqlx::query_scalar(&format!(
+            "SELECT jsonb_exists(state->'records',$1) FROM {}.git_tracker_repositories WHERE id=$2",
+            f.schema
+        ))
+        .bind(&execution_id)
+        .bind(uuid::Uuid::parse_str(rid).unwrap())
+        .fetch_one(&f.admin)
+        .await
+        .unwrap();
+        assert!(!saved, "mode {mode}");
+        assert_eq!(f.audit_count().await, before_audit, "mode {mode}");
     }
 }
 

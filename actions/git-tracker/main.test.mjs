@@ -290,6 +290,24 @@ test("transient failures retry three times, permanent failures do not", async ()
     }),
   );
   assert.equal(calls, 1);
+  calls = 0;
+  await assert.rejects(
+    rpc("https://example.test", "Upload", {}, "secret", {
+      request: async () => {
+        calls++;
+        return new Response(
+          JSON.stringify({
+            code: "failed_precondition",
+            message: "commit is not in the pull request",
+          }),
+          { status: 412 },
+        );
+      },
+      sleep: async () => {},
+    }),
+    /failed_precondition/u,
+  );
+  assert.equal(calls, 1);
 });
 
 test("RPC origin trailing slashes preserve POST endpoint and body", async () => {
