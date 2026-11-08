@@ -89,6 +89,7 @@ var (
 	harvested        map[string]coreauth.ProviderExecutor
 	harvestedConfig  *config.Config
 	sdkLoggingConfig sync.Once
+	sdkLoggingErr    error
 )
 
 // harvestExecutors obtains the SDK's built-in provider executors.
@@ -122,7 +123,9 @@ func harvestExecutors() (map[string]coreauth.ProviderExecutor, *config.Config, e
 }
 
 func runHarvest() (map[string]coreauth.ProviderExecutor, *config.Config, error) {
-	configureSDKGlobals()
+	if err := configureSDKGlobals(); err != nil {
+		return nil, nil, err
+	}
 	cfg := newSDKConfig()
 	bootstrap := coreauth.NewManager(nil, nil, nil)
 	ctx := coreauth.WithSkipPersist(context.Background())
@@ -195,8 +198,12 @@ func (noopAPIKeyClients) Load(context.Context, *config.Config) (*cliproxy.APIKey
 }
 
 // configureSDKGlobals applies process-wide SDK settings once.
-func configureSDKGlobals() {
+func configureSDKGlobals() error {
 	sdkLoggingConfig.Do(func() {
+		sdkLoggingErr = captureSDKStdout(slog.Default().With(slog.String("component", "cliproxy-sdk")))
+		if sdkLoggingErr != nil {
+			return
+		}
 		gin.SetMode(gin.ReleaseMode)
 		sdkauth.RegisterTokenStore(noFileTokenStore{})
 		coreauth.SetQuotaCooldownDisabled(true)
@@ -206,6 +213,7 @@ func configureSDKGlobals() {
 		logrus.SetOutput(io.Discard)
 		logrus.AddHook(slogBridge{logger: slog.Default().With(slog.String("component", "cliproxy-sdk"))})
 	})
+	return sdkLoggingErr
 }
 
 // slogBridge forwards SDK logrus entries to slog without their fields, which

@@ -99,4 +99,8 @@ func TestLoggerRespectsLevel(t *testing.T) {
 	if log.Enabled(context.Background(), slog.LevelDebug) {
 		t.Fatal("debug must stay disabled")
 	}
+	debug := obs.NewLogger(&buf, config.Logging{Format: config.LogFormatJSON, Level: config.LogLevelDebug})
+	if !debug.Enabled(context.Background(), slog.LevelDebug) {
+		t.Fatal("debug must be enabled when configured")
+	}
 }

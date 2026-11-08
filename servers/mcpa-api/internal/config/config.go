@@ -41,6 +41,14 @@ func (f LogFormat) String() string {
 	}
 }
 
+// LogLevel selects the lowest level emitted by the service logger.
+type LogLevel int
+
+const (
+	LogLevelInfo LogLevel = iota + 1
+	LogLevelDebug
+)
+
 // DefaultListen is the fixed loopback development address.
 const DefaultListen = "127.0.0.1:46329"
 
@@ -59,6 +67,7 @@ type OAuthClient struct {
 // Logging holds the log settings shared by every subcommand.
 type Logging struct {
 	Format  LogFormat
+	Level   LogLevel
 	NoColor bool
 }
 
@@ -277,13 +286,20 @@ func isLoopbackHost(host string) bool {
 }
 
 func (p *parser) logging() Logging {
-	l := Logging{Format: LogFormatText}
+	l := Logging{Format: LogFormatText, Level: LogLevelInfo}
 	switch strings.ToLower(p.optional("LOG_FORMAT")) {
 	case "", "text":
 	case "json":
 		l.Format = LogFormatJSON
 	default:
 		p.fail("LOG_FORMAT must be text or json")
+	}
+	switch strings.ToLower(p.optional("LOG_LEVEL")) {
+	case "", "info":
+	case "debug":
+		l.Level = LogLevelDebug
+	default:
+		p.fail("LOG_LEVEL must be info or debug")
 	}
 	// NO_COLOR follows https://no-color.org: any non-empty value disables color.
 	if v, ok := p.lookup("NO_COLOR"); ok && v != "" {

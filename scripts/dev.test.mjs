@@ -706,6 +706,7 @@ test("Managed CPA development keeps its database and Go build API-local", async 
     "CLIENT_SECRET",
     "DEPENDENCY_TIMEOUT",
     "LOG_FORMAT",
+    "LOG_LEVEL",
     "OTEL_*",
     "NO_COLOR",
   ]) {

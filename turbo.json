@@ -282,6 +282,7 @@
         "CLIENT_SECRET",
         "DEPENDENCY_TIMEOUT",
         "LOG_FORMAT",
+        "LOG_LEVEL",
         "OTEL_*",
         "NO_COLOR",
         "DEV_COMPOSE_DATABASE_URLS",

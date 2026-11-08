@@ -57,7 +57,7 @@ The AnyDash release workflows use only the repository-wide environments. Configu
 
 Managed CPA API settings belong to `servers/mcpa-api` and the `/mcpa-api` Infisical development folder. The API `dev` script wraps its command with `infisical run --env=dev --project-config-dir=../.. --path=/mcpa-api`. It then registers the Portless route `mcpa-api` and runs the shared API launcher. The launcher fixes `LISTEN` to `127.0.0.1:46329`, applies the `mcpa-postgres` Compose database URL after Infisical injection, and executes the Go binary with `serve --dev-env`. The binary reads only the service-local `servers/mcpa-api/.env` and never overrides injected or explicitly empty process variables. Direct service-local development uses its configured database URL.
 
-Only the Managed CPA API task receives the `MCPA_*` settings, its shared identity settings (`DELCORE_URL`, `DELCORE_RESOURCE`, `LOGTO_TOKEN_URL`, `LOGTO_ISSUER`, `CLIENT_ID`, `CLIENT_SECRET`, `WEB_ORIGIN`), `DEPENDENCY_TIMEOUT`, `LOG_FORMAT`, `NO_COLOR` and `OTEL_*`. Secret classes include these values:
+Only the Managed CPA API task receives the `MCPA_*` settings, its shared identity settings (`DELCORE_URL`, `DELCORE_RESOURCE`, `LOGTO_TOKEN_URL`, `LOGTO_ISSUER`, `CLIENT_ID`, `CLIENT_SECRET`, `WEB_ORIGIN`), `DEPENDENCY_TIMEOUT`, `LOG_FORMAT`, `LOG_LEVEL`, `NO_COLOR` and `OTEL_*`. Secret classes include these values:
 
 - `DATABASE_URL`.
 - `CLIENT_SECRET`, the service's own Delcore machine-to-machine identity.

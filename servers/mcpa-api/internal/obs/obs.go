@@ -30,11 +30,15 @@ const ServiceName = "mcpa-api"
 // NO_COLOR is set; JSON logs never use color. Lines written with a *Context
 // method and a request context carry trace_id and surface.
 func NewLogger(w io.Writer, l config.Logging) *slog.Logger {
+	level := slog.LevelInfo
+	if l.Level == config.LogLevelDebug {
+		level = slog.LevelDebug
+	}
 	if l.Format == config.LogFormatJSON {
-		return slog.New(newContextHandler(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo})))
+		return slog.New(newContextHandler(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})))
 	}
 	return slog.New(newContextHandler(tint.NewTextHandler(w, &tint.Options{
-		Level:      slog.LevelInfo,
+		Level:      level,
 		TimeFormat: time.RFC3339,
 		NoColor:    l.NoColor,
 	})))

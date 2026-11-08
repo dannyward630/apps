@@ -33,6 +33,7 @@ import (
 	"github.com/delinoio/apps/servers/mcpa-api/internal/mcp"
 	"github.com/delinoio/apps/servers/mcpa-api/internal/oauth"
 	"github.com/delinoio/apps/servers/mcpa-api/internal/obs"
+	"github.com/delinoio/apps/servers/mcpa-api/internal/proxy"
 	"github.com/delinoio/apps/servers/mcpa-api/internal/store"
 )
 
@@ -104,6 +105,7 @@ func run(args []string, stderr io.Writer) int {
 	var err error
 	switch cmd {
 	case CommandServe:
+		defer proxy.CloseSDKStdout()
 		var restore func()
 		restore, err = installOTELFallback(devEnvValues)
 		if err == nil {
