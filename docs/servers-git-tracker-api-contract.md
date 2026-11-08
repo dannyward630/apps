@@ -28,7 +28,7 @@ External individuals and organizations, CI jobs and service operators.
 - When a public-to-private change is received and applied, make historical measurements private and block anonymous and public-cache access.
 - If GitHub availability or permissions prevent checking the current visibility, retain the last confirmed visibility. This intentionally means that an unobserved public-to-private change can leave anonymous reads available until synchronization succeeds.
 - Repository disconnection or App removal stops uploads and makes retained data private. Authorized space members can still read or delete it.
-- Support GitHub Actions OIDC and repository-scoped API tokens for uploads and completion. Managers issue and revoke tokens; an expiration date is mandatory at issuance.
+- Support GitHub Actions OIDC and repository-scoped API tokens for uploads and completion. Managers issue and revoke tokens; an expiration date is mandatory at issuance. Revoking a token ID that does not belong to the requested repository returns not-found and writes no revocation audit row. Revoking an existing token succeeds and writes one revocation audit row for each call, including repeat calls.
 - Support measurements from fork PRs for the connected upstream repository, without granting authority to change baseline-branch data or configuration. Validate execution identity and repository/PR scope; do not treat a fork's configuration as authority over the upstream baseline.
 - Enforce current service permissions and tenant boundaries on protected operations. Feature availability never substitutes for authorization.
 

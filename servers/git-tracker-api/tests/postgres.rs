@@ -968,6 +968,118 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_revoke_token_requires_repository_token_match() {
+    let fixture = fixture().await;
+    let (status, connected) = fixture.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let repository_id = connected["repository"]["id"].as_str().unwrap();
+    let foreign_repository_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO git_tracker_repositories(id,github_id,space_id,full_name,installation_id,public,connected) VALUES($1,$2,$3,$4,$5,$6,$7)",
+    )
+    .bind(foreign_repository_id)
+    .bind(43_i64)
+    .bind(uuid::Uuid::parse_str(&fixture.space).unwrap())
+    .bind("owner/repo")
+    .bind("1")
+    .bind(true)
+    .bind(true)
+    .execute(&fixture.server.db)
+    .await
+    .unwrap();
+
+    let expires_at = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    let (status, owned) = fixture
+        .call(
+            "IssueToken",
+            "Bearer manager",
+            json!({"repositoryId":repository_id,"expiresAt":expires_at}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{owned}");
+    let (status, foreign) = fixture
+        .call(
+            "IssueToken",
+            "Bearer manager",
+            json!({"repositoryId":foreign_repository_id,"expiresAt":expires_at}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{foreign}");
+    let revocations = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM git_tracker_audit WHERE action='token_revoked'",
+        )
+        .fetch_one(&fixture.server.db)
+        .await
+        .unwrap()
+    };
+    assert_eq!(revocations().await, 0);
+
+    for (token_id, code) in [
+        (foreign["tokenId"].as_str().unwrap().to_owned(), "not_found"),
+        (uuid::Uuid::now_v7().to_string(), "not_found"),
+        ("not-a-uuid".to_owned(), "invalid_argument"),
+    ] {
+        let (status, response) = fixture
+            .call(
+                "RevokeToken",
+                "Bearer manager",
+                json!({"repositoryId":repository_id,"tokenId":token_id}),
+            )
+            .await;
+        assert_ne!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["code"], code, "{response}");
+        assert_eq!(revocations().await, 0);
+    }
+
+    let dataset = json!({"id":"size","name":"Size","columns":[{"id":"bytes","unit":"B","direction":"DIRECTION_LOWER"}]});
+    let upload = |repository_id: &str, execution_id: &str| json!({"context":{"repositoryId":repository_id,"executionId":execution_id,"commit":fixture.commit,"branch":"main"},"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"1"}}]});
+    let foreign_auth = format!("Bearer {}", foreign["token"].as_str().unwrap());
+    let (status, response) = fixture
+        .call(
+            "Upload",
+            &foreign_auth,
+            upload(&foreign_repository_id.to_string(), "foreign-still-valid"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let owned_id = owned["tokenId"].as_str().unwrap();
+    for (call_index, token_id) in [owned_id.to_uppercase(), owned_id.to_owned()]
+        .iter()
+        .enumerate()
+    {
+        let (status, response) = fixture
+            .call(
+                "RevokeToken",
+                "Bearer manager",
+                json!({"repositoryId":repository_id,"tokenId":token_id}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(revocations().await, call_index as i64 + 1);
+    }
+    let revoked: bool = sqlx::query_scalar("SELECT revoked FROM git_tracker_tokens WHERE id=$1")
+        .bind(uuid::Uuid::parse_str(owned_id).unwrap())
+        .fetch_one(&fixture.server.db)
+        .await
+        .unwrap();
+    assert!(revoked);
+    let owned_auth = format!("Bearer {}", owned["token"].as_str().unwrap());
+    let (status, denied) = fixture
+        .call(
+            "Upload",
+            &owned_auth,
+            upload(repository_id, "revoked-upload"),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "{denied}");
+    assert_eq!(denied["code"], "unauthenticated");
+    assert_eq!(revocations().await, 2);
+}
+
 async fn queued_repository_lock(
     f: &Fixture,
     rid: &str,

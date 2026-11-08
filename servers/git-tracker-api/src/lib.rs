@@ -324,7 +324,17 @@ impl Server {
                 out = json!({"tokenId":id,"token":token});
             }
             Op::RevokeToken => {
-                sqlx::query("UPDATE git_tracker_tokens SET revoked=true WHERE id::text=$1 AND repository_id=$2").bind(string(&q,"tokenId")).bind(uuid(rid)?).execute(&mut *tx).await?;
+                let token_id = uuid(string(&q, "tokenId"))?;
+                let updated = sqlx::query(
+                    "UPDATE git_tracker_tokens SET revoked=true WHERE id=$1 AND repository_id=$2",
+                )
+                .bind(token_id)
+                .bind(uuid(rid)?)
+                .execute(&mut *tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(Fault::missing());
+                }
                 audit(&mut tx, &repo.space_id, "token_revoked", trace).await?;
             }
             Op::Disconnect => {
