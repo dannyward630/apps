@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/delinoio/apps/servers/mcpa-api/internal/app"
@@ -84,6 +85,7 @@ func run(args []string, stderr io.Writer) int {
 	}
 
 	lookup := config.Lookup(os.LookupEnv)
+	var devEnvValues map[string]string
 	if *devEnv {
 		values, err := config.LoadDotEnv(devEnvFile)
 		if err != nil {
@@ -91,6 +93,7 @@ func run(args []string, stderr io.Writer) int {
 			return 1
 		}
 		lookup = config.WithFallback(lookup, values)
+		devEnvValues = values
 	}
 	log := obs.NewLogger(stderr, config.LoadLogging(lookup))
 	slog.SetDefault(log)
@@ -101,7 +104,12 @@ func run(args []string, stderr io.Writer) int {
 	var err error
 	switch cmd {
 	case CommandServe:
-		err = serve(ctx, lookup, log)
+		var restore func()
+		restore, err = installOTELFallback(devEnvValues)
+		if err == nil {
+			defer restore()
+			err = serve(ctx, lookup, log)
+		}
 	case CommandMigrate:
 		err = migrate(ctx, lookup, log)
 	case CommandCheckSchema:
@@ -125,6 +133,33 @@ func run(args []string, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// installOTELFallback bridges development values to the OTLP exporter and
+// resource SDK, which read process variables directly. Only absent OTEL_ keys
+// are copied, so process values (including empty ones) keep precedence. Remove
+// this bridge when those SDK constructors accept the service's lookup.
+func installOTELFallback(values map[string]string) (func(), error) {
+	var added []string
+	restore := func() {
+		for _, name := range added {
+			_ = os.Unsetenv(name)
+		}
+	}
+	for name, value := range values {
+		if !strings.HasPrefix(name, "OTEL_") {
+			continue
+		}
+		if _, exists := os.LookupEnv(name); exists {
+			continue
+		}
+		if err := os.Setenv(name, value); err != nil {
+			restore()
+			return nil, fmt.Errorf("set %s from %s: %w", name, devEnvFile, err)
+		}
+		added = append(added, name)
+	}
+	return restore, nil
 }
 
 func serve(ctx context.Context, lookup config.Lookup, log *slog.Logger) error {
