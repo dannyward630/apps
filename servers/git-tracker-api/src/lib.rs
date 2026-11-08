@@ -144,6 +144,20 @@ pub async fn audit(db: &mut PgConnection, space: &str, action: &str, trace: &str
         .await?;
     Ok(())
 }
+fn publication_expired() -> Fault {
+    let mut fault = Fault::unavailable();
+    fault.source = server_common::error::FaultSource::GitHub;
+    fault
+}
+fn publication_database_fault(error: sqlx::Error) -> Fault {
+    let timed_out = matches!(error, sqlx::Error::PoolTimedOut)
+        || matches!(&error, sqlx::Error::Database(db) if db.code().as_deref() == Some("55P03"));
+    if timed_out {
+        publication_expired()
+    } else {
+        error.into()
+    }
+}
 impl Server {
     pub fn record_failure(&self, fault: &Fault) {
         let kind = match fault.source {
@@ -366,7 +380,9 @@ impl Server {
         }
         if op.role() == Role::Edit {
             let c = context.as_ref().unwrap();
-            if let Err(fault) = self.publish_by(cutoff, rid, &c.execution_id).await {
+            if c.pull_request > 0
+                && let Err(fault) = self.publish_by(cutoff, rid, &c.execution_id).await
+            {
                 self.record_failure(&fault);
                 tracing::warn!(
                     correlation_id = trace,
@@ -389,32 +405,36 @@ impl Server {
     /// drops its transaction so the lock is released and no publisher keeps running. Committed
     /// measurement state is never touched here.
     async fn publish_by(&self, cutoff: Option<Instant>, rid: &str, execution: &str) -> Result<()> {
-        let expired = || {
-            let mut fault = Fault::unavailable();
-            fault.source = server_common::error::FaultSource::GitHub;
-            fault
-        };
         let cutoff = cutoff
             .filter(|cutoff| *cutoff > Instant::now())
-            .ok_or_else(expired)?;
+            .ok_or_else(publication_expired)?;
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(cutoff),
             self.publish(cutoff, rid, execution),
         )
         .await
-        .unwrap_or_else(|_| Err(expired()))
+        .unwrap_or_else(|_| Err(publication_expired()))
     }
     async fn publish(&self, cutoff: Instant, rid: &str, execution: &str) -> Result<()> {
         // Re-read under the writer lock so delayed requests cannot replace a newer PR comment.
-        let mut tx = self.db.begin().await?;
+        let mut tx = self.db.begin().await.map_err(publication_database_fault)?;
         // Also bound the server-side lock wait so an abandoned statement cannot keep waiting
         // for the repository row after the local deadline passed. A zero value disables it.
         let remaining = cutoff.saturating_duration_since(Instant::now());
         sqlx::query("SELECT set_config('lock_timeout',$1,true)")
             .bind(format!("{}ms", remaining.as_millis().max(1)))
             .execute(&mut *tx)
-            .await?;
-        let (repo, state) = repository(&mut tx, rid).await?;
+            .await
+            .map_err(publication_database_fault)?;
+        // Keep the SQLx error intact until the optional lock wait is classified. The ordinary
+        // repository helper converts it to a persistence fault before this caller can inspect it.
+        let row = sqlx::query("SELECT * FROM git_tracker_repositories WHERE id=$1 FOR UPDATE")
+            .bind(uuid(rid)?)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(publication_database_fault)?;
+        let repo = repository_row(&row);
+        let state: State = serde_json::from_value(row.get("state"))?;
         if let Some(record) = state.records.get(execution) {
             self.github.comment(&repo, &state, record).await?
         }
@@ -802,6 +822,50 @@ impl GitTrackerService for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use server_common::error::FaultSource;
+    #[derive(Debug)]
+    struct Sqlstate(&'static str);
+    impl std::fmt::Display for Sqlstate {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Sqlstate {}
+    impl sqlx::error::DatabaseError for Sqlstate {
+        fn message(&self) -> &str {
+            self.0
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+    #[test]
+    fn publication_database_timeout_mapping_keeps_other_errors_as_persistence() {
+        assert_eq!(
+            publication_database_fault(sqlx::Error::Database(Box::new(Sqlstate("55P03")))).source,
+            FaultSource::GitHub
+        );
+        assert_eq!(
+            publication_database_fault(sqlx::Error::PoolTimedOut).source,
+            FaultSource::GitHub
+        );
+        assert_eq!(
+            publication_database_fault(sqlx::Error::Database(Box::new(Sqlstate("08006")))).source,
+            FaultSource::Persistence
+        );
+    }
     #[test]
     fn publication_cutoff_uses_action_envelope_without_client_deadline() {
         let ingress = Instant::now();

@@ -604,6 +604,7 @@ struct GitHubMock {
     private: std::sync::atomic::AtomicBool,
     fail_metadata: std::sync::atomic::AtomicBool,
     gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    resolve_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 struct Fixture {
@@ -658,6 +659,7 @@ async fn fixture() -> Fixture {
         private: false.into(),
         fail_metadata: false.into(),
         gate: std::sync::Mutex::new(None),
+        resolve_gate: std::sync::Mutex::new(None),
     });
     let delcore_requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let delcore_mock = delcore_requests.clone();
@@ -686,6 +688,13 @@ async fn fixture() -> Fixture {
                     release.notified().await;
                 }
             }
+            if p.starts_with("/repos/owner/repo/commits/") {
+                let gate = github.resolve_gate.lock().unwrap().take();
+                if let Some((entered, release)) = gate {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            }
             let private = github.private.load(Ordering::SeqCst);
             let out = match p.as_str() {
                 "/token" => json!({"access_token":"service","expires_in":3600}),
@@ -706,6 +715,9 @@ async fn fixture() -> Fixture {
                 "/repositories/42" => json!({"id":42,"full_name":"owner/repo","private":private}),
                 "/repos/owner/repo/installation" => json!({"id":1}),
                 "/app/installations/1/access_tokens" => json!({"token":"installation"}),
+                "/repos/owner/repo/pulls/1" => {
+                    json!({"base":{"ref":"main","sha":commit},"head":{"sha":commit}})
+                }
                 "/repos/owner/repo/git/ref/heads/main" => {
                     json!({"ref":"refs/heads/main","object":{"type":"commit","sha":commit}})
                 }
@@ -752,11 +764,13 @@ async fn fixture() -> Fixture {
         "http://{}/gittracker.v1.GitTrackerService",
         listener.local_addr().unwrap()
     );
-    let router = Router::new().fallback_service(
-        connectrpc::Router::new()
-            .add_service(server.clone())
-            .into_axum_service(),
-    );
+    let router = Router::new()
+        .fallback_service(
+            connectrpc::Router::new()
+                .add_service(server.clone())
+                .into_axum_service(),
+        )
+        .layer(axum::middleware::from_fn(git_tracker_api::capture_ingress));
     let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     Fixture {
         server,
@@ -800,6 +814,14 @@ impl Fixture {
             Arc::new(tokio::sync::Notify::new()),
         );
         *self.github.gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+    fn arm_resolve_gate(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let gate = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self.github.resolve_gate.lock().unwrap() = Some(gate.clone());
         gate
     }
     /// Waits until a statement of this fixture's schema is blocked on a lock.
@@ -899,6 +921,276 @@ impl Fixture {
             1
         );
     }
+}
+
+async fn queued_repository_lock(
+    f: &Fixture,
+    rid: &str,
+) -> (
+    tokio::task::JoinHandle<()>,
+    Arc<tokio::sync::Notify>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let db = f.server.db.clone();
+    let rid = uuid::Uuid::parse_str(rid).unwrap();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let held = release.clone();
+    let (acquired, acquired_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut tx = db.begin().await.unwrap();
+        sqlx::query("SELECT id FROM git_tracker_repositories WHERE id=$1 FOR UPDATE")
+            .bind(rid)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        acquired.send(()).unwrap();
+        held.notified().await;
+        tx.rollback().await.unwrap();
+    });
+    f.wait_for_lock_waiter().await;
+    (task, release, acquired_rx)
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_optional_publication_timeout_accounting_and_push_skip() {
+    let f = fixture().await;
+    let (status, connected) = f.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let rid = connected["repository"]["id"].as_str().unwrap().to_owned();
+    let (_, issued) = f
+        .call(
+            "IssueToken",
+            "Bearer manager",
+            json!({"repositoryId":rid,"expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()}),
+        )
+        .await;
+    let auth = format!("Bearer {}", issued["token"].as_str().unwrap());
+    let github_failures = f
+        .server
+        .metrics
+        .events
+        .with_label_values(&["github", "failure"]);
+    let persistence_failures = f
+        .server
+        .metrics
+        .events
+        .with_label_values(&["persistence", "failure"]);
+    let dataset = json!({"id":"size","name":"Size","columns":[{"id":"bytes","unit":"B","direction":"DIRECTION_LOWER"}]});
+
+    // A queued writer receives the mandatory lock after the upload commits. A push response must
+    // finish while that writer still holds it: publication must not acquire a second lock.
+    for method in ["Upload", "Complete"] {
+        let id = format!("push-{method}");
+        let context =
+            json!({"repositoryId":rid,"executionId":id,"commit":f.commit,"branch":"main"});
+        let request = if method == "Upload" {
+            json!({"context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"1"}}]})
+        } else {
+            json!({"context":context})
+        };
+        let (entered, resume) = f.arm_resolve_gate();
+        let http = f.http.clone();
+        let endpoint = format!("{}/{method}", f.base);
+        let auth = auth.clone();
+        let response = tokio::spawn(async move {
+            let response = http
+                .post(endpoint)
+                .header("Authorization", auth)
+                .header("Connect-Protocol-Version", "1")
+                .header("Connect-Timeout-Ms", "2500")
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            (response.status(), response.json::<Value>().await.unwrap())
+        });
+        entered.notified().await;
+        let (lock, unlock, acquired) = queued_repository_lock(&f, &rid).await;
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), acquired)
+            .await
+            .unwrap()
+            .unwrap();
+        let (status, body) = tokio::time::timeout(Duration::from_millis(300), response)
+            .await
+            .expect("push attempted optional repository lock")
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("warnings").is_none(), "{body}");
+        assert_eq!(github_failures.get(), 0);
+        assert_eq!(persistence_failures.get(), 0);
+        unlock.notify_one();
+        lock.await.unwrap();
+    }
+
+    for method in ["Upload", "Complete"] {
+        let id = format!("push-expired-{method}");
+        let context =
+            json!({"repositoryId":rid,"executionId":id,"commit":f.commit,"branch":"main"});
+        let request = if method == "Upload" {
+            json!({"context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"1"}}]})
+        } else {
+            json!({"context":context})
+        };
+        let response = f
+            .http
+            .post(format!("{}/{method}", f.base))
+            .header("Authorization", &auth)
+            .header("Connect-Protocol-Version", "1")
+            .header("Connect-Timeout-Ms", "1500")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert!(body.get("warnings").is_none(), "{body}");
+        assert_eq!(github_failures.get(), 0);
+        assert_eq!(persistence_failures.get(), 0);
+    }
+
+    let expired_pr = json!({"repositoryId":rid,"executionId":"pr-expired","commit":f.commit,"branch":"main","pullRequest":"1","baselineCommit":f.commit});
+    let response = f
+        .http
+        .post(format!("{}/Upload", f.base))
+        .header("Authorization", &auth)
+        .header("Connect-Protocol-Version", "1")
+        .header("Connect-Timeout-Ms", "1500")
+        .json(&json!({"context":expired_pr,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"1"}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["warnings"][0], "PR comment could not be updated");
+    assert_eq!(github_failures.get(), 1);
+    assert_eq!(persistence_failures.get(), 0);
+
+    // Every run forces the optional PR publisher to wait behind the queued writer. Either the
+    // PostgreSQL lock_timeout or the Tokio cutoff may win; both count only a GitHub failure.
+    for i in 0..50 {
+        let id = format!("pr-lock-{i}");
+        let context = json!({"repositoryId":rid,"executionId":id,"commit":f.commit,"branch":"main","pullRequest":"1","baselineCommit":f.commit});
+        let request = json!({"context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"1"}}]});
+        let (entered, resume) = f.arm_resolve_gate();
+        let http = f.http.clone();
+        let endpoint = format!("{}/Upload", f.base);
+        let auth = auth.clone();
+        let response = tokio::spawn(async move {
+            let response = http
+                .post(endpoint)
+                .header("Authorization", auth)
+                .header("Connect-Protocol-Version", "1")
+                .header("Connect-Timeout-Ms", "3500")
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            (response.status(), response.json::<Value>().await.unwrap())
+        });
+        entered.notified().await;
+        let (lock, unlock, acquired) = queued_repository_lock(&f, &rid).await;
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), acquired)
+            .await
+            .unwrap()
+            .unwrap();
+        f.wait_for_lock_waiter().await;
+        let before = github_failures.get();
+        let (status, body) = response.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "run {i}: {body}");
+        assert_eq!(
+            body["warnings"][0], "PR comment could not be updated",
+            "run {i}: {body}"
+        );
+        assert_eq!(github_failures.get(), before + 1, "run {i}");
+        assert_eq!(persistence_failures.get(), 0, "run {i}");
+        let saved: bool = sqlx::query_scalar(&format!(
+            "SELECT jsonb_exists(state->'records',$1) FROM {}.git_tracker_repositories WHERE id=$2",
+            f.schema
+        ))
+        .bind(&id)
+        .bind(uuid::Uuid::parse_str(&rid).unwrap())
+        .fetch_one(&f.admin)
+        .await
+        .unwrap();
+        assert!(saved, "run {i}");
+        unlock.notify_one();
+        lock.await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_genuine_publication_database_error_keeps_persistence_accounting() {
+    let f = fixture().await;
+    let (status, connected) = f.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let rid = connected["repository"]["id"].as_str().unwrap().to_owned();
+    let (_, issued) = f
+        .call(
+            "IssueToken",
+            "Bearer manager",
+            json!({"repositoryId":rid,"expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()}),
+        )
+        .await;
+    let auth = format!("Bearer {}", issued["token"].as_str().unwrap());
+    let context = json!({"repositoryId":rid,"executionId":"pr-database-failure","commit":f.commit,"branch":"main","pullRequest":"1","baselineCommit":f.commit});
+    let dataset = json!({"id":"size","name":"Size","columns":[{"id":"bytes","unit":"B","direction":"DIRECTION_LOWER"}]});
+    let (entered, resume) = f.arm_resolve_gate();
+    let http = f.http.clone();
+    let endpoint = format!("{}/Upload", f.base);
+    let response = tokio::spawn(async move {
+        let response = http
+            .post(endpoint)
+            .header("Authorization", auth)
+            .header("Connect-Protocol-Version", "1")
+            .json(&json!({"context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"1"}}]}))
+            .send()
+            .await
+            .unwrap();
+        (response.status(), response.json::<Value>().await.unwrap())
+    });
+    entered.notified().await;
+    let db = f.server.db.clone();
+    let rename = tokio::spawn(async move {
+        sqlx::query("ALTER TABLE git_tracker_repositories RENAME TO renamed_repositories")
+            .execute(&db)
+            .await
+            .unwrap();
+    });
+    f.wait_for_lock_waiter().await;
+    resume.notify_one();
+    rename.await.unwrap();
+    let (status, body) = response.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["warnings"][0], "PR comment could not be updated");
+    assert_eq!(
+        f.server
+            .metrics
+            .events
+            .with_label_values(&["persistence", "failure"])
+            .get(),
+        1
+    );
+    assert_eq!(
+        f.server
+            .metrics
+            .events
+            .with_label_values(&["github", "failure"])
+            .get(),
+        0
+    );
+    let saved: bool = sqlx::query_scalar(&format!(
+        "SELECT jsonb_exists(state->'records','pr-database-failure') FROM {}.renamed_repositories WHERE id=$1",
+        f.schema
+    ))
+    .bind(uuid::Uuid::parse_str(&rid).unwrap())
+    .fetch_one(&f.admin)
+    .await
+    .unwrap();
+    assert!(saved);
 }
 
 #[tokio::test]
