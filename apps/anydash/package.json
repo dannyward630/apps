@@ -37,7 +37,7 @@
   "devDependencies": {
     "@lynx-js/lynxtron": "0.0.30",
     "@lynx-js/react-rsbuild-plugin": "0.22.1",
-    "@lynx-js/rspeedy": "0.18.3",
+    "@lynx-js/rspeedy": "0.18.4",
     "@lynx-js/testing-environment": "0.4.0",
     "@lynx-js/types": "4.3.0",
     "@lynx-js/web-elements": "0.12.16",
