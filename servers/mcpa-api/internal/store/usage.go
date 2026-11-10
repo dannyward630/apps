@@ -242,6 +242,8 @@ type UsageFilter struct {
 	End   *time.Time
 }
 
+// int16s narrows enum values after the service has verified that each value
+// is defined. Callers must validate before passing untrusted filter values.
 func int16s[T ~int32](values []T) []int16 {
 	out := make([]int16, 0, len(values))
 	for _, v := range values {

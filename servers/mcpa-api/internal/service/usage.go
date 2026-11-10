@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"sort"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"
@@ -62,6 +63,24 @@ func (s *Service) readableResources(ctx context.Context, p *auth.Principal, tena
 func validateFilter(f *mcpav1.CallFilter) error {
 	if f == nil {
 		return nil
+	}
+	if len(f.GetModels()) > 100 {
+		return apperr.InvalidInput("filter.models must contain at most 100 entries")
+	}
+	for _, model := range f.GetModels() {
+		if len(model) == 0 || len(model) > 200 || !utf8.ValidString(model) || hasControl(model) {
+			return apperr.InvalidInput("filter.models entries must contain 1 to 200 bytes of text without control characters")
+		}
+	}
+	for _, provider := range f.GetProviders() {
+		if _, known := mcpav1.Provider_name[int32(provider)]; !known {
+			return apperr.InvalidInput("filter.providers contains an unknown provider")
+		}
+	}
+	for _, status := range f.GetStatuses() {
+		if _, known := mcpav1.CallStatus_name[int32(status)]; !known {
+			return apperr.InvalidInput("filter.statuses contains an unknown call status")
+		}
 	}
 	for _, id := range f.GetCallKeyIds() {
 		if _, err := parseID(id, "filter.call_key_ids"); err != nil {

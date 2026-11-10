@@ -62,6 +62,92 @@ func formatCases() []formatCase {
 	}
 }
 
+func TestIntegrationUsageFilterValidation(t *testing.T) {
+	e := newEnv(t)
+	resourceID := e.resource("usage-filter-validation")
+	_, callKeyID := e.callKey("owner", resourceID)
+	model := strings.Repeat("m", 200)
+	models := make([]string, 101)
+	for i := range models {
+		models[i] = "m"
+	}
+	for _, row := range []struct {
+		provider mcpav1.Provider
+		status   mcpav1.CallStatus
+	}{
+		{mcpav1.Provider_PROVIDER_GEMINI, mcpav1.CallStatus_CALL_STATUS_SUCCEEDED},
+		{mcpav1.Provider_PROVIDER_GEMINI_CLI, mcpav1.CallStatus_CALL_STATUS_PROVIDER_ERROR},
+	} {
+		_, err := e.db.ApplyCheckpoint(e.ctx, store.Checkpoint{
+			CallID: store.NewID(), TenantID: e.tenant, ResourceID: uuid.MustParse(resourceID), CallKeyID: uuid.MustParse(callKeyID),
+			Provider: row.provider, Model: model, Format: mcpav1.EndpointFormat_ENDPOINT_FORMAT_OPENAI,
+			StartTime: time.Now(), Seq: 1, DeltaRequestBytes: 10, RequestBytes: 10, Final: true, Status: row.status,
+			OutboxID: store.NewID(), RequestKey: store.NewID(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	invalid := []struct {
+		name   string
+		filter *mcpav1.CallFilter
+	}{
+		{"NUL model", &mcpav1.CallFilter{Models: []string{"a\x00b"}}},
+		{"control model", &mcpav1.CallFilter{Models: []string{"a\tb"}}},
+		{"empty model", &mcpav1.CallFilter{Models: []string{""}}},
+		{"long model", &mcpav1.CallFilter{Models: []string{strings.Repeat("m", 201)}}},
+		{"too many models", &mcpav1.CallFilter{Models: models}},
+		{"wrapped provider", &mcpav1.CallFilter{Providers: []mcpav1.Provider{65537}}},
+		{"negative provider", &mcpav1.CallFilter{Providers: []mcpav1.Provider{-65535}}},
+		{"undefined provider", &mcpav1.CallFilter{Providers: []mcpav1.Provider{99}}},
+		{"wrapped status", &mcpav1.CallFilter{Statuses: []mcpav1.CallStatus{65537}}},
+		{"negative status", &mcpav1.CallFilter{Statuses: []mcpav1.CallStatus{-65535}}},
+		{"undefined status", &mcpav1.CallFilter{Statuses: []mcpav1.CallStatus{99}}},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			check := func(err error) {
+				t.Helper()
+				var connectErr *connect.Error
+				if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeInvalidArgument {
+					t.Fatalf("error %v, want invalid_argument", err)
+				}
+				for _, item := range connectErr.Details() {
+					value, detailErr := item.Value()
+					if detail, ok := value.(*mcpav1.ErrorDetail); detailErr == nil && ok && detail.GetReason() == mcpav1.ErrorReason_ERROR_REASON_INVALID_INPUT {
+						return
+					}
+				}
+				t.Fatalf("error %v has no INVALID_INPUT detail", err)
+			}
+			_, err := do(e, "owner", e.rpc.GetUsage, &mcpav1.GetUsageRequest{TenantId: e.tenant, Filter: tc.filter})
+			check(err)
+			_, err = do(e, "owner", e.rpc.ListCallRecords, &mcpav1.ListCallRecordsRequest{TenantId: e.tenant, Filter: tc.filter})
+			check(err)
+		})
+	}
+	valid := &mcpav1.CallFilter{
+		Models:    []string{model, model},
+		Providers: []mcpav1.Provider{mcpav1.Provider_PROVIDER_GEMINI, mcpav1.Provider_PROVIDER_GEMINI},
+		Statuses:  []mcpav1.CallStatus{mcpav1.CallStatus_CALL_STATUS_SUCCEEDED, mcpav1.CallStatus_CALL_STATUS_SUCCEEDED},
+	}
+	usage := mustDo(e, "owner", e.rpc.GetUsage, &mcpav1.GetUsageRequest{TenantId: e.tenant, Filter: valid})
+	if usage.GetSummary().GetTotalBytes() != 10 || len(usage.GetRows()) != 1 {
+		t.Fatalf("valid usage filter returned %+v", usage)
+	}
+	records := mustDo(e, "owner", e.rpc.ListCallRecords, &mcpav1.ListCallRecordsRequest{TenantId: e.tenant, Filter: valid})
+	if len(records.GetRecords()) != 1 || records.GetRecords()[0].GetProvider() != mcpav1.Provider_PROVIDER_GEMINI {
+		t.Fatalf("valid call-record filter returned %+v", records)
+	}
+	zero := &mcpav1.CallFilter{Providers: []mcpav1.Provider{mcpav1.Provider_PROVIDER_UNSPECIFIED}, Statuses: []mcpav1.CallStatus{mcpav1.CallStatus_CALL_STATUS_UNSPECIFIED}}
+	if got := mustDo(e, "owner", e.rpc.GetUsage, &mcpav1.GetUsageRequest{TenantId: e.tenant, Filter: zero}); len(got.GetRows()) != 0 {
+		t.Fatalf("zero-valued filter returned rows: %+v", got)
+	}
+	if got := mustDo(e, "owner", e.rpc.ListCallRecords, &mcpav1.ListCallRecordsRequest{TenantId: e.tenant, Filter: zero}); len(got.GetRecords()) != 0 {
+		t.Fatalf("zero-valued filter returned records: %+v", got)
+	}
+}
+
 func TestIntegrationModelCallFinishesDuringGracefulDrain(t *testing.T) {
 	e := newEnv(t)
 	id := e.resource("drain")
