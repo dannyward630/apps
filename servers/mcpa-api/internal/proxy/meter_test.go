@@ -57,6 +57,121 @@ func TestMeteringTransportCountsHandComputedWireForm(t *testing.T) {
 	}
 }
 
+type errorRoundTripper struct{}
+
+func (errorRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("dial refused")
+}
+
+func TestMeteringTransportDoesNotCountUnwrittenRequestLine(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		base http.RoundTripper
+		url  string
+	}{
+		{"failed round tripper", errorRoundTripper{}, "http://provider.example.test/v1/chat/completions"},
+		{"failed dial", &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("dial refused")
+		}}, "http://provider.example.test/v1/chat/completions"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			call := &callState{id: "c1"}
+			req, err := http.NewRequestWithContext(withCall(context.Background(), call), http.MethodPost, tc.url, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := (&http.Client{Transport: &meteringTransport{base: tc.base}}).Do(req); err == nil {
+				t.Fatal("expected provider transport failure")
+			}
+			if got := call.requestBytes.Load(); got != 0 {
+				t.Fatalf("counted %d bytes without a provider request", got)
+			}
+		})
+	}
+
+	t.Run("cancelled before headers", func(t *testing.T) {
+		call := &callState{id: "c1"}
+		ctx, cancel := context.WithCancel(withCall(context.Background(), call))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://provider.example.test/v1/chat/completions", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		if _, err := (&http.Client{Transport: &meteringTransport{base: http.DefaultTransport}}).Do(req); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled request: %v", err)
+		}
+		if got := call.requestBytes.Load(); got != 0 {
+			t.Fatalf("counted %d bytes without a provider request", got)
+		}
+	})
+
+	t.Run("TLS handshake failure", func(t *testing.T) {
+		up := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Error("request reached provider after rejected TLS handshake")
+		}))
+		defer up.Close()
+		call := &callState{id: "c1"}
+		req, err := http.NewRequestWithContext(withCall(context.Background(), call), http.MethodGet, up.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := (&http.Client{Transport: &meteringTransport{base: &http.Transport{}}}).Do(req); err == nil {
+			t.Fatal("expected TLS verification failure")
+		}
+		if got := call.requestBytes.Load(); got != 0 {
+			t.Fatalf("counted %d bytes without a provider request", got)
+		}
+	})
+}
+
+func TestMeteringTransportCountsWrittenRequestLineOnce(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusBadRequest, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			up := newUpstream(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) })
+			call := &callState{id: "c1"}
+			req, err := http.NewRequestWithContext(withCall(context.Background(), call), http.MethodGet, up.URL()+"/v1/models", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := (&http.Client{Transport: &meteringTransport{base: http.DefaultTransport}}).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != status {
+				t.Fatalf("provider status %d, want %d", resp.StatusCode, status)
+			}
+			if got, want := call.requestBytes.Load(), up.read.Load(); got != want {
+				t.Fatalf("metered %d bytes, provider received %d", got, want)
+			}
+		})
+	}
+}
+
+func TestFailedProviderDialCommitsNoProviderRequestBytes(t *testing.T) {
+	h := newHarness(t, func(o *Options) {
+		o.BaseTransport = &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("dial refused")
+		}}
+	})
+	resourceID := newResourceID()
+	key := h.addKey(resourceID)
+	h.addCredential(compatCredential(resourceID, "http://provider.example.test", "sk", "m1"))
+	res := h.call(http.MethodPost, "/r/"+resourceID+"/v1/chat/completions", key, chatBody, nil)
+	if res.resp.StatusCode == http.StatusOK {
+		t.Fatalf("failed provider dial served the call: %s", res.body)
+	}
+	record := h.sink.waitFinal(t, res.callID)
+	if record.RequestBytes != 0 {
+		t.Fatalf("final record counted %d provider request bytes", record.RequestBytes)
+	}
+	for _, entry := range h.sink.committed(res.callID) {
+		if entry.deltaReq != 0 {
+			t.Fatalf("checkpoint %d emitted %d provider request bytes", entry.record.CheckpointSeq, entry.deltaReq)
+		}
+	}
+}
+
 func TestMeteringTransportIgnoresUnattributedRequests(t *testing.T) {
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {})
 	call := &callState{id: "c1"}

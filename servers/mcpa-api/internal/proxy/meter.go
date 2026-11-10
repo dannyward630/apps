@@ -387,13 +387,12 @@ func (t *meteringTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if call == nil || req.Context().Value(traceMeteredContextKey{}) != nil {
 		return t.base.RoundTrip(req)
 	}
-	call.addRequestBytes(requestLineBytes(req.Method, req.URL.RequestURI()))
 	rewriteKimiDeviceHeaders := kimiDeviceHeaderRewrite(call, req)
 	trace := &httptrace.ClientTrace{
 		WroteHeaderField: func(name string, values []string) {
 			if strings.HasPrefix(name, ":") {
-				// HTTP/2: the request line is already counted; :authority is the
-				// Host header line.
+				// HTTP/2: the request line is counted in WroteHeaders;
+				// :authority is the Host header line.
 				if name == ":authority" {
 					call.addRequestBytes(headerFieldBytes("Host", values))
 				}
@@ -401,7 +400,10 @@ func (t *meteringTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			}
 			call.addRequestBytes(headerFieldBytes(name, values))
 		},
-		WroteHeaders: func() { call.addRequestBytes(int64(len("\r\n"))) },
+		WroteHeaders: func() {
+			call.addRequestBytes(requestLineBytes(req.Method, req.URL.RequestURI()))
+			call.addRequestBytes(int64(len("\r\n")))
+		},
 	}
 	out := req.Clone(httptrace.WithClientTrace(req.Context(), trace))
 	// The headers are rewritten on the clone before the transport writes
@@ -435,6 +437,10 @@ type countingReadCloser struct {
 	call *callState
 }
 
+// net/http does not expose partial request-body write progress. Reads from
+// this body can precede socket writes, so an interrupted shared-transport
+// upload may count bytes that did not reach the provider. WroteRequest reports
+// only completion, which cannot recover the partial byte count.
 func (r *countingReadCloser) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	r.call.addRequestBytes(int64(n))
