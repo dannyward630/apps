@@ -168,6 +168,41 @@ func TestClaudeAPIKeyUpstream(t *testing.T) {
 	}
 }
 
+func TestClaudeRequestURIAndMeteringForBasePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, wantURI string
+	}{
+		{"root", "", "/v1/messages?beta=true"},
+		{"root slash", "/", "//v1/messages?beta=true"},
+		{"path", "/path", "/path/v1/messages?beta=true"},
+		{"path slash", "/path/", "/path//v1/messages?beta=true"},
+		{"escaped path", "/escaped%20path/", "/escaped%20path//v1/messages?beta=true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := claudeUpstream(t, "hello claude")
+			h := newHarness(t)
+			resourceID := newResourceID()
+			key := h.addKey(resourceID)
+			h.addCredential(apiKeyCredential(resourceID, mcpav1.Provider_PROVIDER_CLAUDE, up.URL()+tc.path, "sk-ant-test", "claude-test"))
+			body := `{"model":"claude-test","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+			res := h.call(http.MethodPost, "/r/"+resourceID+"/v1/messages", key, body, map[string]string{"Anthropic-Version": "2023-06-01"})
+			if res.resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d body %s", res.resp.StatusCode, res.body)
+			}
+			record := h.sink.waitFinal(t, res.callID)
+			if got, want := record.RequestBytes, up.read.Load(); got != want {
+				t.Fatalf("metered %d request bytes, upstream received %d", got, want)
+			}
+			up.mu.Lock()
+			paths := append([]string(nil), up.paths...)
+			up.mu.Unlock()
+			if len(paths) != 1 || paths[0] != tc.wantURI {
+				t.Fatalf("provider request URIs %q, want %q", paths, tc.wantURI)
+			}
+		})
+	}
+}
+
 func TestGeminiAPIKeyUpstream(t *testing.T) {
 	h := newHarness(t)
 	up := geminiUpstream(t, "hello gemini")

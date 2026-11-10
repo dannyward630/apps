@@ -528,14 +528,14 @@ func withTraceMetering(ctx context.Context, call *callState, fallbackURI string)
 	return httptrace.WithClientTrace(ctx, trace)
 }
 
-// requestURIFor joins a base URL path with an executor path such as
-// "/v1/messages?beta=true".
+// requestURIFor follows the Claude executor's baseURL + suffix construction
+// so the HTTP/1.1 fallback counts the exact request line written upstream.
 func requestURIFor(baseURL, suffix string) string {
-	parsed, err := url.Parse(strings.TrimRight(baseURL, "/"))
+	parsed, err := url.Parse(strings.TrimSpace(baseURL) + suffix)
 	if err != nil || parsed.Path == "" {
 		return suffix
 	}
-	return strings.TrimRight(parsed.EscapedPath(), "/") + suffix
+	return parsed.RequestURI()
 }
 
 // countingResponseWriter counts customer-bound bytes of a call.

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"sync"
 	"testing"
@@ -213,6 +214,54 @@ func TestTraceMeteringMatchesWireForm(t *testing.T) {
 	}
 }
 
+func TestTraceMeteringHTTP2UsesReportedPath(t *testing.T) {
+	body := `{"model":"claude"}`
+	up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 2 || r.URL.RequestURI() != "/v1/messages?beta=true" {
+			t.Errorf("provider received %s %s", r.Proto, r.URL.RequestURI())
+		}
+		gotBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		} else if string(gotBody) != body {
+			t.Errorf("provider received body %q, want %q", gotBody, body)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	up.EnableHTTP2 = true
+	up.StartTLS()
+	defer up.Close()
+	var previous int64
+	for index, fallback := range []string{"/v1/messages?beta=true", "/different//v1/messages?beta=true"} {
+		call := &callState{id: "c1"}
+		wroteRequest := make(chan error, 1)
+		ctx := httptrace.WithClientTrace(withCall(context.Background(), call), &httptrace.ClientTrace{
+			WroteRequest: func(info httptrace.WroteRequestInfo) {
+				wroteRequest <- info.Err
+			},
+		})
+		// New hooks run before existing hooks, so register metering last to
+		// finish byte accounting before the completion observer signals.
+		ctx = withTraceMetering(ctx, call, fallback)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, up.URL+"/v1/messages?beta=true", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := up.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if err := <-wroteRequest; err != nil {
+			t.Fatalf("write HTTP/2 request: %v", err)
+		}
+		if index > 0 && call.requestBytes.Load() != previous {
+			t.Fatalf("HTTP/2 metering changed with fallback: %d versus %d", call.requestBytes.Load(), previous)
+		}
+		previous = call.requestBytes.Load()
+	}
+}
+
 // rawUpstream accepts one connection, reads the request header block and
 // reports its size, then runs after.
 func rawUpstream(t *testing.T, after func(conn net.Conn, r *bufio.Reader)) (string, <-chan int) {
@@ -364,11 +413,24 @@ func TestCountingResponseWriterHandComputed(t *testing.T) {
 }
 
 func TestRequestURIFor(t *testing.T) {
-	if got := requestURIFor("https://api.anthropic.com", claudeMessagesURI); got != "/v1/messages?beta=true" {
-		t.Fatal(got)
-	}
-	if got := requestURIFor("https://api.kimi.com/coding/", claudeMessagesURI); got != "/coding/v1/messages?beta=true" {
-		t.Fatal(got)
+	for _, tc := range []struct {
+		base string
+		want string
+	}{
+		{"https://gw", "/v1/messages?beta=true"},
+		{"https://gw/", "//v1/messages?beta=true"},
+		{"https://gw/path", "/path/v1/messages?beta=true"},
+		{"https://gw/path/", "/path//v1/messages?beta=true"},
+		{"https://gw/escaped%20path/", "/escaped%20path//v1/messages?beta=true"},
+		{"https://api.anthropic.com", "/v1/messages?beta=true"},
+		{"https://api.kimi.com/coding/", "/coding//v1/messages?beta=true"},
+		{"%", claudeMessagesURI},
+	} {
+		t.Run(tc.base, func(t *testing.T) {
+			if got := requestURIFor(tc.base, claudeMessagesURI); got != tc.want {
+				t.Fatalf("request URI %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
