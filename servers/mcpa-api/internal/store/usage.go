@@ -286,22 +286,37 @@ type CallRecord struct {
 	Final               bool
 }
 
+// Each resource contributes at most one page before the global merge. This
+// keeps PostgreSQL on the resource index for tenants with many idle resources.
+// Deduplicating the IDs prevents repeated caller input from repeating rows.
+const listCallRecordsSQL = `SELECT page.id, page.tenant_id, page.resource_id, page.call_key_id, page.provider, page.model,
+			page.format, page.streaming, page.status,
+			provider_status_class, error_class, request_bytes, response_bytes, latency_ms, start_time, final
+		FROM (SELECT DISTINCT id FROM unnest($2::uuid[]) AS r(id)) AS resources
+		CROSS JOIN LATERAL (
+			SELECT c.id, c.tenant_id, c.resource_id, c.call_key_id, c.provider, c.model, c.format,
+				c.streaming, c.status, c.provider_status_class, c.error_class, c.request_bytes,
+				c.response_bytes, c.latency_ms, c.start_time, c.final
+			FROM call_records AS c
+			WHERE c.tenant_id = $1 AND c.resource_id = resources.id
+				AND (cardinality($3::text[]) = 0 OR c.model = ANY($3))
+				AND (cardinality($4::smallint[]) = 0 OR c.provider = ANY($4))
+				AND (cardinality($5::uuid[]) = 0 OR c.call_key_id = ANY($5))
+				AND (cardinality($6::smallint[]) = 0 OR c.status = ANY($6))
+				AND ($7::timestamptz IS NULL OR c.start_time >= $7)
+				AND ($8::timestamptz IS NULL OR c.start_time < $8)
+				AND ($9 = '00000000-0000-0000-0000-000000000000'::uuid OR c.id < $9)
+			ORDER BY c.id DESC LIMIT $10
+		) AS page
+		ORDER BY page.id DESC LIMIT $10`
+
 // ListCallRecords returns call records newest first. before is the cursor
 // (uuid.Nil for the first page).
 func ListCallRecords(ctx context.Context, db DB, f UsageFilter, before uuid.UUID, limit int) ([]CallRecord, error) {
 	args := append(filterArgs(f), before, limit)
-	rows, err := db.Query(ctx, `SELECT id, tenant_id, resource_id, call_key_id, provider, model, format, streaming, status,
-			provider_status_class, error_class, request_bytes, response_bytes, latency_ms, start_time, final
-		FROM call_records
-		WHERE tenant_id = $1 AND resource_id = ANY($2)
-			AND (cardinality($3::text[]) = 0 OR model = ANY($3))
-			AND (cardinality($4::smallint[]) = 0 OR provider = ANY($4))
-			AND (cardinality($5::uuid[]) = 0 OR call_key_id = ANY($5))
-			AND (cardinality($6::smallint[]) = 0 OR status = ANY($6))
-			AND ($7::timestamptz IS NULL OR start_time >= $7)
-			AND ($8::timestamptz IS NULL OR start_time < $8)
-			AND ($9 = '00000000-0000-0000-0000-000000000000'::uuid OR id < $9)
-		ORDER BY id DESC LIMIT $10`, args...)
+	// The generic prepared plan can choose a bitmap scan and sort for each
+	// resource. Plan with the actual resource list on every request instead.
+	rows, err := db.Query(ctx, listCallRecordsSQL, append([]any{pgx.QueryExecModeDescribeExec}, args...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -380,6 +395,28 @@ func ResolveUsageCursor(ctx context.Context, db DB, f UsageFilter, id uuid.UUID)
 	return cursor, err
 }
 
+// ListUsageRows uses the resource/day index for each authorized resource and
+// merges only the rows needed for one page. SumUsage still uses usageWhere to
+// count all matching buckets.
+const listUsageRowsSQL = `SELECT page.id, page.day, page.resource_id, page.model, page.provider,
+		page.call_key_id, page.status, page.call_count, page.request_bytes, page.response_bytes
+	FROM (SELECT DISTINCT id FROM unnest($2::uuid[]) AS r(id)) AS resources
+	CROSS JOIN LATERAL (
+		SELECT u.id, u.day, u.resource_id, u.model, u.provider, u.call_key_id, u.status,
+			u.call_count, u.request_bytes, u.response_bytes
+		FROM usage_daily AS u
+		WHERE u.tenant_id = $1 AND u.resource_id = resources.id
+			AND (cardinality($3::text[]) = 0 OR u.model = ANY($3))
+			AND (cardinality($4::smallint[]) = 0 OR u.provider = ANY($4))
+			AND (cardinality($5::uuid[]) = 0 OR u.call_key_id = ANY($5))
+			AND (cardinality($6::smallint[]) = 0 OR u.status = ANY($6))
+			AND ($7::timestamptz IS NULL OR u.day >= ($7::timestamptz AT TIME ZONE 'UTC')::date)
+			AND ($8::timestamptz IS NULL OR u.day < (($8::timestamptz - interval '1 microsecond') AT TIME ZONE 'UTC')::date + 1)
+			AND ($9::date IS NULL OR (u.day, u.id) < ($9::date, $10::uuid))
+		ORDER BY u.day DESC, u.id DESC LIMIT $11
+	) AS page
+	ORDER BY page.day DESC, page.id DESC LIMIT $11`
+
 // ListUsageRows returns aggregate buckets, newest day first. The cursor
 // carries the last row's position, independent of that row's continued life.
 func ListUsageRows(ctx context.Context, db DB, f UsageFilter, after *UsageCursor, limit int) ([]UsageRow, error) {
@@ -389,11 +426,7 @@ func ListUsageRows(ctx context.Context, db DB, f UsageFilter, after *UsageCursor
 		day, id = after.Day, after.ID
 	}
 	args := append(filterArgs(f), day, id, limit)
-	rows, err := db.Query(ctx, `SELECT id, day, resource_id, model, provider, call_key_id, status, call_count, request_bytes, response_bytes
-		FROM usage_daily
-		WHERE `+usageWhere+`
-			AND ($9::date IS NULL OR (day, id) < ($9::date, $10::uuid))
-		ORDER BY day DESC, id DESC LIMIT $11`, args...)
+	rows, err := db.Query(ctx, listUsageRowsSQL, append([]any{pgx.QueryExecModeDescribeExec}, args...)...)
 	if err != nil {
 		return nil, err
 	}
