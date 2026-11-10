@@ -631,6 +631,25 @@ pub async fn serve(
     limits: Limits,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
+    serve_accepting(listener, app, limits, shutdown).await
+}
+
+trait Accept {
+    async fn accept(&self) -> io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>;
+}
+
+impl Accept for TcpListener {
+    async fn accept(&self) -> io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+        TcpListener::accept(self).await
+    }
+}
+
+async fn serve_accepting(
+    listener: impl Accept,
+    app: Router,
+    limits: Limits,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
     let (stop, _) = watch::channel(false);
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
@@ -639,7 +658,22 @@ pub async fn serve(
             _ = &mut shutdown => break,
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
             accepted = listener.accept() => {
-                let (socket, peer) = accepted?;
+                let (socket, peer) = match accepted {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        let kind = error.kind();
+                        if matches!(kind, io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset | io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) {
+                            tracing::debug!(category = "accept_retry", ?kind, "accept failed");
+                        } else {
+                            tracing::warn!(category = "accept_failure", ?kind, "accept failed");
+                            tokio::select! {
+                                _ = &mut shutdown => break,
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                            }
+                        }
+                        continue;
+                    }
+                };
                 let app = app.clone();
                 let mut stopped = stop.subscribe();
                 connections.spawn(async move {
@@ -718,6 +752,7 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     fn limits() -> Limits {
         Limits {
@@ -726,6 +761,125 @@ mod tests {
             write: Duration::from_millis(60),
             shutdown: Duration::from_millis(100),
         }
+    }
+
+    struct ScriptedAccept {
+        listener: TcpListener,
+        errors: Mutex<VecDeque<io::ErrorKind>>,
+        attempts: Mutex<Vec<Instant>>,
+        count: watch::Sender<usize>,
+    }
+
+    impl Accept for Arc<ScriptedAccept> {
+        async fn accept(&self) -> io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+            let count = {
+                let mut attempts = self.attempts.lock().unwrap();
+                attempts.push(Instant::now());
+                attempts.len()
+            };
+            self.count.send_replace(count);
+            if let Some(kind) = self.errors.lock().unwrap().pop_front() {
+                Err(io::Error::from(kind))
+            } else {
+                self.listener.accept().await
+            }
+        }
+    }
+
+    async fn scripted_accept(
+        errors: impl IntoIterator<Item = io::ErrorKind>,
+    ) -> (
+        Arc<ScriptedAccept>,
+        watch::Receiver<usize>,
+        std::net::SocketAddr,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (count, observed) = watch::channel(0);
+        (
+            Arc::new(ScriptedAccept {
+                listener,
+                errors: Mutex::new(errors.into_iter().collect()),
+                attempts: Mutex::new(Vec::new()),
+                count,
+            }),
+            observed,
+            address,
+        )
+    }
+
+    async fn fetch(address: std::net::SocketAddr) {
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+        assert!(response.ends_with(b"ok"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_accept_errors_retry_without_delay() {
+        let (listener, mut count, address) = scripted_accept([
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WouldBlock,
+        ])
+        .await;
+        let started = Instant::now();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let app = Router::new().route("/healthz", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(serve_accepting(listener, app, limits(), async {
+            let _ = stopped.await;
+        }));
+        count.wait_for(|attempts| *attempts >= 5).await.unwrap();
+        assert_eq!(Instant::now(), started);
+        fetch(address).await;
+        stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resource_accept_errors_wait_one_second_each_then_serve() {
+        let (listener, mut count, address) =
+            scripted_accept([io::ErrorKind::Other, io::ErrorKind::Other]).await;
+        let observed = listener.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let app = Router::new().route("/healthz", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(serve_accepting(listener, app, limits(), async {
+            let _ = stopped.await;
+        }));
+        count.wait_for(|attempts| *attempts >= 3).await.unwrap();
+        {
+            let attempts = observed.attempts.lock().unwrap();
+            assert_eq!(attempts[1] - attempts[0], Duration::from_secs(1));
+            assert_eq!(attempts[2] - attempts[1], Duration::from_secs(1));
+        }
+        fetch(address).await;
+        stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_accept_backoff_promptly() {
+        let (listener, mut count, _) = scripted_accept([io::ErrorKind::Other]).await;
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_accepting(listener, Router::new(), limits(), async {
+            let _ = stopped.await;
+        }));
+        count.wait_for(|attempts| *attempts >= 1).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let started = std::time::Instant::now();
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(100), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
     #[tokio::test]
     async fn closes_silent_and_partial_headers_before_router() {
