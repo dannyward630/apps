@@ -32,6 +32,11 @@ use std::{
 const ACTION_RESPONSE_ENVELOPE: Duration = Duration::from_secs(30);
 /// Time kept after the optional cutoff to release resources and write the response.
 const RESPONSE_RESERVE: Duration = Duration::from_secs(2);
+const LIST_REPOSITORIES_SQL: &str = "SELECT id, github_id, space_id, full_name, installation_id, public, connected \
+    FROM git_tracker_repositories \
+    WHERE ($1 = '' AND public AND connected) OR space_id::text = $1 \
+    ORDER BY full_name, id \
+    LIMIT CASE WHEN $1 = '' THEN 100 ELSE NULL END";
 /// Computes the absolute cutoff for optional PR comment publication. The cutoff is fixed at
 /// request ingress from the earliest of the declared Connect client deadline and the Action
 /// envelope, minus the response reserve. It is carried through the request and never restarted
@@ -229,8 +234,21 @@ impl Server {
                     .allow(authorization, space, Role::View)
                     .await?
             }
-            let rows=sqlx::query("SELECT * FROM git_tracker_repositories WHERE ($1='' AND public AND connected) OR space_id::text=$1 ORDER BY full_name").bind(space).fetch_all(&self.db).await?;
-            return Ok(json!({"repositories":rows.iter().map(repository_row).collect::<Vec<_>>()}));
+            let rows = sqlx::query(LIST_REPOSITORIES_SQL)
+                .bind(space)
+                .fetch_all(&self.db)
+                .await?;
+            let repositories = rows
+                .iter()
+                .map(|row| {
+                    let mut repository = repository_row(row);
+                    if space.is_empty() {
+                        repository.installation_id.clear();
+                    }
+                    repository
+                })
+                .collect::<Vec<_>>();
+            return Ok(json!({"repositories":repositories}));
         }
         let context: Option<Context> = q
             .get("context")
@@ -822,6 +840,12 @@ impl GitTrackerService for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_listing_selects_identity_columns_only() {
+        assert!(!LIST_REPOSITORIES_SQL.contains('*'));
+        assert!(!LIST_REPOSITORIES_SQL.contains("state"));
+    }
     use server_common::error::FaultSource;
     #[derive(Debug)]
     struct Sqlstate(&'static str);

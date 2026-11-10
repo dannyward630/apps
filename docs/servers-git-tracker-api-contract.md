@@ -25,6 +25,7 @@ External individuals and organizations, CI jobs and service operators.
 - A GitHub repository can be connected to only one Delino space at a time. Initial connection requires both Delino space management authority and GitHub repository administrator authority.
 - Use a GitHub App for selected repository access, repository metadata/visibility synchronization, and PR comment management.
 - Public GitHub repository measurements are anonymously readable. Private repository measurements are available only to authorized space members.
+- Anonymous `ListRepositories` returns at most 100 public connected repositories ordered by `fullName` and connection ID. It omits `installationId` while retaining the existing `spaceId` field. The listing query reads repository identity columns without loading measurement state. An authorized space listing returns all of that space's repositories, including disconnected repositories, with `installationId` and `spaceId`.
 - When a public-to-private change is received and applied, make historical measurements private and block anonymous and public-cache access.
 - If GitHub availability or permissions prevent checking the current visibility, retain the last confirmed visibility. This intentionally means that an unobserved public-to-private change can leave anonymous reads available until synchronization succeeds.
 - Repository disconnection or App removal stops uploads and makes retained data private. Authorized space members can still read or delete it.

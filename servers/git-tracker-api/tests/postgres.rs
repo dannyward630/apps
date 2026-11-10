@@ -1447,6 +1447,122 @@ async fn postgres_genuine_publication_database_error_keeps_persistence_accountin
 
 #[tokio::test]
 #[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_repository_listing_bounds_anonymous_results_and_preserves_space_results() {
+    let fixture = fixture().await;
+    let own_space = uuid::Uuid::parse_str(&fixture.space).unwrap();
+    let other_space = uuid::Uuid::now_v7();
+    let large_state = json!({"payload": "x".repeat(16_384)});
+    let mut public_repositories = Vec::new();
+    let mut own_repositories = Vec::new();
+
+    for index in 0..153 {
+        let id = uuid::Uuid::now_v7();
+        let (space, full_name, public, connected) = match index {
+            150 => (own_space, "owner/disconnected".to_owned(), true, false),
+            151 => (own_space, "owner/private".to_owned(), false, true),
+            152 => (other_space, "owner/repo-000".to_owned(), true, true),
+            _ => (
+                own_space,
+                format!("owner/repo-{:03}", if index == 75 { 74 } else { index }),
+                true,
+                true,
+            ),
+        };
+        sqlx::query(
+            "INSERT INTO git_tracker_repositories \
+             (id, github_id, space_id, full_name, installation_id, public, connected, state) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(id)
+        .bind(10_000_i64 + index)
+        .bind(space)
+        .bind(&full_name)
+        .bind("fixture-installation")
+        .bind(public)
+        .bind(connected)
+        .bind(&large_state)
+        .execute(&fixture.server.db)
+        .await
+        .unwrap();
+        if public && connected {
+            public_repositories.push((full_name.clone(), id.to_string()));
+        }
+        if space == own_space {
+            own_repositories.push((full_name, id.to_string()));
+        }
+    }
+    public_repositories.sort();
+    own_repositories.sort();
+
+    let (status, anonymous) = fixture.call("ListRepositories", "", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{anonymous}");
+    let anonymous_rows = anonymous["repositories"].as_array().unwrap();
+    assert_eq!(anonymous_rows.len(), 100);
+    let anonymous_identity: Vec<_> = anonymous_rows
+        .iter()
+        .map(|row| {
+            assert!(row.get("installationId").is_none(), "{row}");
+            assert_eq!(row["public"], true);
+            assert_eq!(row["connected"], true);
+            (
+                row["fullName"].as_str().unwrap().to_owned(),
+                row["id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(anonymous_identity, public_repositories[..100]);
+
+    let (status, authorized) = fixture
+        .call(
+            "ListRepositories",
+            "Bearer manager",
+            json!({"spaceId":fixture.space}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{authorized}");
+    let authorized_rows = authorized["repositories"].as_array().unwrap();
+    assert_eq!(authorized_rows.len(), 152);
+    let authorized_identity: Vec<_> = authorized_rows
+        .iter()
+        .map(|row| {
+            assert_eq!(row["installationId"], "fixture-installation");
+            assert_eq!(row["spaceId"], fixture.space);
+            (
+                row["fullName"].as_str().unwrap().to_owned(),
+                row["id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(authorized_identity, own_repositories);
+    assert!(authorized_rows.iter().any(|row| {
+        row["fullName"] == "owner/disconnected"
+            && !row
+                .get("connected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    }));
+    assert!(authorized_rows.iter().any(|row| {
+        row["fullName"] == "owner/private"
+            && !row.get("public").and_then(Value::as_bool).unwrap_or(false)
+    }));
+
+    let (status, _) = fixture
+        .call("ListRepositories", "", json!({"spaceId":fixture.space}))
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    let (status, malformed) = fixture
+        .call(
+            "ListRepositories",
+            "Bearer manager",
+            json!({"spaceId":"not-a-space"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{malformed}");
+    assert_eq!(malformed["code"], "invalid_argument");
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
 async fn postgres_space_id_validation_precedes_delcore_requests() {
     use std::sync::atomic::Ordering;
 
