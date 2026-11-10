@@ -5,6 +5,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -264,14 +266,47 @@ func ExpectedVersion() (int, error) {
 
 const migrationsTable = "mcpa_schema_migrations"
 
+const digestMigrationVersion = 5
+
+// These bytes were fixed before legacy databases acquired a digest column.
+// Keep this baseline independent of the embedded files so a changed old file
+// cannot be accepted during the first backfill.
+var legacyMigrationDigests = map[int]string{
+	1: "8cbf670ca0f4d94b0968b9a6bf901e36326a73c917710ca838d2080523bfc53c",
+	2: "0ce1fec9e9599158268ee9248edb75d068b8e8093290099177c6d85734ffceaa",
+	3: "b31e5a647cf1f5ee9432fa72069616888ef4412b0b49f142a8677af9ca1bcd5f",
+	4: "14f3092b749d8882ee954621708ac3a698b414fa7a3265fb080ee9bd149ae867",
+}
+
+func migrationDigest(m Migration) string {
+	sum := sha256.Sum256([]byte(m.SQL))
+	return hex.EncodeToString(sum[:])
+}
+
+func checkLegacyMigrationDigests(ms []Migration) error {
+	for _, m := range ms {
+		if want, ok := legacyMigrationDigests[m.Version]; ok && migrationDigest(m) != want {
+			return &SchemaError{Reason: fmt.Sprintf("migration %04d digest differs from the trusted baseline", m.Version)}
+		}
+	}
+	return nil
+}
+
 // migrateLockKey serializes concurrent `migrate` runs.
 const migrateLockKey int64 = 0x6d637061_6d696772 // "mcpamigr"
 
-// Migrate applies pending migrations, each in its own transaction, under a
-// session advisory lock. It returns the versions it applied.
+// Migrate applies all pending migrations in one transaction under a session
+// advisory lock. It returns the versions committed by that transaction.
 func (s *Store) Migrate(ctx context.Context) ([]int, error) {
 	ms, err := Migrations()
 	if err != nil {
+		return nil, err
+	}
+	return s.migrate(ctx, ms)
+}
+
+func (s *Store) migrate(ctx context.Context, ms []Migration) ([]int, error) {
+	if err := checkLegacyMigrationDigests(ms); err != nil {
 		return nil, err
 	}
 	conn, err := s.Pool.raw.Acquire(ctx)
@@ -286,54 +321,102 @@ func (s *Store) Migrate(ctx context.Context) ([]int, error) {
 		// Use a fresh context so the lock is released even after cancellation.
 		_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrateLockKey)
 	}()
-	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+migrationsTable+` (
-		version integer PRIMARY KEY,
-		name text NOT NULL,
-		applied_at timestamptz NOT NULL DEFAULT now()
-	)`); err != nil {
-		return nil, fmt.Errorf("store: create migrations table: %w", err)
-	}
-	applied, err := appliedMigrations(ctx, conn)
+	var done []int
+	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+migrationsTable+` (
+			version integer PRIMARY KEY,
+			name text NOT NULL,
+			applied_at timestamptz NOT NULL DEFAULT now()
+		)`); err != nil {
+			return migrationStepError("create migrations table", err)
+		}
+		applied, err := appliedMigrations(ctx, tx)
+		if err != nil {
+			return err
+		}
+		_, digestVersionApplied := applied[digestMigrationVersion]
+		if err := compareApplied(ms, applied, false, !digestVersionApplied); err != nil {
+			return err
+		}
+		for _, m := range ms {
+			if _, ok := applied[m.Version]; ok {
+				continue
+			}
+			if _, err := tx.Exec(ctx, m.SQL); err != nil {
+				return migrationStepError(fmt.Sprintf("migration %04d_%s", m.Version, m.Name), err)
+			}
+			if m.Version == digestMigrationVersion {
+				for _, old := range ms {
+					if old.Version >= digestMigrationVersion {
+						break
+					}
+					if _, err := tx.Exec(ctx, `UPDATE `+migrationsTable+` SET digest = $1 WHERE version = $2 AND digest IS NULL`, migrationDigest(old), old.Version); err != nil {
+						return migrationStepError("backfill migration digests", err)
+					}
+				}
+				if _, err := tx.Exec(ctx, `ALTER TABLE `+migrationsTable+` ALTER COLUMN digest SET NOT NULL`); err != nil {
+					return migrationStepError("require migration digests", err)
+				}
+			}
+			if m.Version < digestMigrationVersion {
+				_, err = tx.Exec(ctx, `INSERT INTO `+migrationsTable+` (version, name) VALUES ($1, $2)`, m.Version, m.Name)
+			} else {
+				_, err = tx.Exec(ctx, `INSERT INTO `+migrationsTable+` (version, name, digest) VALUES ($1, $2, $3)`, m.Version, m.Name, migrationDigest(m))
+			}
+			if err != nil {
+				return migrationStepError(fmt.Sprintf("record migration %04d", m.Version), err)
+			}
+			done = append(done, m.Version)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	if err := compareApplied(ms, applied, false); err != nil {
-		return nil, err
-	}
-	var done []int
-	for _, m := range ms {
-		if _, ok := applied[m.Version]; ok {
-			continue
-		}
-		err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, m.SQL); err != nil {
-				return err
-			}
-			_, err := tx.Exec(ctx, `INSERT INTO `+migrationsTable+` (version, name) VALUES ($1, $2)`, m.Version, m.Name)
-			return err
-		})
-		if err != nil {
-			return done, fmt.Errorf("store: migration %04d_%s: %w", m.Version, m.Name, err)
-		}
-		done = append(done, m.Version)
 	}
 	return done, nil
 }
 
-func appliedMigrations(ctx context.Context, db DB) (map[int]string, error) {
-	rows, err := db.Query(ctx, `SELECT version, name FROM `+migrationsTable)
+// migrationStepError excludes database error text, which may quote SQL literals.
+func migrationStepError(step string, err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return fmt.Errorf("store: %s failed (SQLSTATE %s)", step, pgErr.Code)
+	}
+	return fmt.Errorf("store: %s failed", step)
+}
+
+type appliedMigration struct {
+	Name   string
+	Digest string
+}
+
+func appliedMigrations(ctx context.Context, db DB) (map[int]appliedMigration, error) {
+	// Version 4 databases have no digest column. Read both layouts until the
+	// forward migration has backfilled those rows in the same transaction.
+	var hasDigest bool
+	if err := db.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM pg_attribute
+		WHERE attrelid = to_regclass($1) AND attname = 'digest' AND NOT attisdropped
+	)`, migrationsTable).Scan(&hasDigest); err != nil {
+		return nil, err
+	}
+	query := `SELECT version, name, '' FROM ` + migrationsTable
+	if hasDigest {
+		query = `SELECT version, name, COALESCE(digest, '') FROM ` + migrationsTable
+	}
+	rows, err := db.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[int]string{}
+	out := map[int]appliedMigration{}
 	for rows.Next() {
 		var v int
-		var name string
-		if err := rows.Scan(&v, &name); err != nil {
+		var entry appliedMigration
+		if err := rows.Scan(&v, &entry.Name, &entry.Digest); err != nil {
 			return nil, err
 		}
-		out[v] = name
+		out[v] = entry
 	}
 	return out, rows.Err()
 }
@@ -343,18 +426,24 @@ type SchemaError struct{ Reason string }
 
 func (e *SchemaError) Error() string { return "schema mismatch: " + e.Reason }
 
-func compareApplied(ms []Migration, applied map[int]string, requireAll bool) error {
-	known := map[int]string{}
+func compareApplied(ms []Migration, applied map[int]appliedMigration, requireAll, allowLegacy bool) error {
+	known := map[int]Migration{}
 	for _, m := range ms {
-		known[m.Version] = m.Name
+		known[m.Version] = m
 	}
-	for v, name := range applied {
+	for v, entry := range applied {
 		want, ok := known[v]
 		if !ok {
 			return &SchemaError{Reason: fmt.Sprintf("database has migration %04d that this binary does not know; deploy a newer binary", v)}
 		}
-		if want != name {
-			return &SchemaError{Reason: fmt.Sprintf("migration %04d is %q in the database but %q in this binary", v, name, want)}
+		if want.Name != entry.Name {
+			return &SchemaError{Reason: fmt.Sprintf("migration %04d is %q in the database but %q in this binary", v, entry.Name, want.Name)}
+		}
+		if entry.Digest == "" && allowLegacy && v < digestMigrationVersion {
+			continue
+		}
+		if entry.Digest != migrationDigest(want) {
+			return &SchemaError{Reason: fmt.Sprintf("migration %04d digest differs from this binary", v)}
 		}
 	}
 	if requireAll {
@@ -374,6 +463,9 @@ func (s *Store) CheckSchema(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := checkLegacyMigrationDigests(ms); err != nil {
+		return err
+	}
 	var exists bool
 	if err := s.Pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, migrationsTable).Scan(&exists); err != nil {
 		return err
@@ -385,5 +477,5 @@ func (s *Store) CheckSchema(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return compareApplied(ms, applied, true)
+	return compareApplied(ms, applied, true, false)
 }
