@@ -3,6 +3,8 @@
 package store
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -34,11 +36,30 @@ func TestEmbeddedMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(ms) == 0 {
+		t.Fatal("no migrations embedded")
+	}
 	v, err := ExpectedVersion()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 4 || ms[len(ms)-1].Name != "mcp_oauth" {
-		t.Fatalf("expected version %d, last %+v", v, ms[len(ms)-1])
+	if v != len(ms) || v != ms[len(ms)-1].Version {
+		t.Fatalf("expected version %d with %d migrations, last %+v", v, len(ms), ms[len(ms)-1])
+	}
+	knownDigests := map[int]string{
+		1: "8cbf670ca0f4d94b0968b9a6bf901e36326a73c917710ca838d2080523bfc53c",
+		2: "0ce1fec9e9599158268ee9248edb75d068b8e8093290099177c6d85734ffceaa",
+		3: "b31e5a647cf1f5ee9432fa72069616888ef4412b0b49f142a8677af9ca1bcd5f",
+		4: "14f3092b749d8882ee954621708ac3a698b414fa7a3265fb080ee9bd149ae867",
+	}
+	if len(ms) < len(knownDigests) {
+		t.Fatalf("expected at least %d applied migrations, got %d", len(knownDigests), len(ms))
+	}
+	for _, m := range ms {
+		if want, ok := knownDigests[m.Version]; ok {
+			if got := fmt.Sprintf("%x", sha256.Sum256([]byte(m.SQL))); got != want {
+				t.Errorf("migration %04d digest = %s, want %s", m.Version, got, want)
+			}
+		}
 	}
 }

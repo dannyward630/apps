@@ -3,6 +3,7 @@
 package store
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -55,8 +56,19 @@ func TestMigrationsAreContiguous(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(ms) == 0 {
+		t.Fatal("no migrations embedded")
+	}
 	version, err := ExpectedVersion()
-	if err != nil || version != len(ms) || version != 4 || ms[1].Name != "data_plane" || ms[2].Name != "usage_spend" || ms[3].Name != "mcp_oauth" {
+	if err != nil || version != len(ms) || version != ms[len(ms)-1].Version {
 		t.Fatalf("expected version %d with %d migrations: %v", version, len(ms), err)
+	}
+	for i, m := range ms {
+		if m.Version != i+1 {
+			t.Errorf("migration %d has version %d", i+1, m.Version)
+		}
+		if name := fmt.Sprintf("%04d_%s.sql", m.Version, m.Name); !migrationName.MatchString(name) {
+			t.Errorf("migration %d has invalid filename %q", m.Version, name)
+		}
 	}
 }
