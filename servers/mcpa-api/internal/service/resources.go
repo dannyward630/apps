@@ -72,6 +72,9 @@ func (s *Service) CreateResource(ctx context.Context, req *connect.Request[mcpav
 			if errors.Is(err, store.ErrNotFound) {
 				return apperr.NotFound("resource not found")
 			}
+			if err == nil && res.Deleted() {
+				return apperr.NotFound("resource not found")
+			}
 			return err
 		}
 		res, err = store.InsertResource(ctx, tx, store.Resource{

@@ -43,6 +43,14 @@ describe("ErrorDetail.reason mapping", () => {
     expect(description.traceId).toBe("trace-1");
   });
 
+  it("keeps idempotency copy with failed_precondition", () => {
+    const description = describeError(
+      failure(Code.FailedPrecondition, ErrorReason.IDEMPOTENCY_CONFLICT),
+    );
+    expect(description.kind).toBe(ErrorKind.Conflict);
+    expect(description.title).toBe("Request already used");
+  });
+
   it("carries the reauthentication URL for MFA failures", () => {
     const description = describeError(
       failure(Code.PermissionDenied, ErrorReason.MFA_REQUIRED, {

@@ -90,7 +90,7 @@ func TenantInactive(msg string) *Error {
 
 // IdempotencyConflict reports a reused request key with different content.
 func IdempotencyConflict() *Error {
-	return newErr(connect.CodeAlreadyExists, mcpav1.ErrorReason_ERROR_REASON_IDEMPOTENCY_CONFLICT, "request_key was already used with different content")
+	return newErr(connect.CodeFailedPrecondition, mcpav1.ErrorReason_ERROR_REASON_IDEMPOTENCY_CONFLICT, "request_key was already used with different content")
 }
 
 // TenantServiceKeyRejected reports a Delcore tenant service key.

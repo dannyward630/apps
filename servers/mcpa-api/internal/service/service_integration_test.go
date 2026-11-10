@@ -245,6 +245,114 @@ func TestCreateResourceReplayRequiresCurrentRole(t *testing.T) {
 	}
 }
 
+func TestCreateResourceReplayRejectsDeletedResource(t *testing.T) {
+	e := newEnv(t)
+	alice, bob, outsider := newUser(), newUser(), newUser()
+	key := store.NewID().String()
+	res := e.createResource(alice, key)
+	if err := e.putACL(alice, res.GetId(), bob, mcpav1.ResourceRole_RESOURCE_ROLE_MANAGE); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.DeleteResource(e.as(alice), connect.NewRequest(&mcpav1.DeleteResourceRequest{
+		ResourceId: res.GetId(), ConfirmName: res.GetName(),
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	replay := func() {
+		t.Helper()
+		got, err := e.svc.CreateResource(e.as(alice), connect.NewRequest(&mcpav1.CreateResourceRequest{
+			RequestKey: key, TenantId: testTenant, Name: res.GetName(),
+		}))
+		if got != nil || reason(err) != mcpav1.ErrorReason_ERROR_REASON_NOT_FOUND {
+			t.Fatalf("deleted resource replay returned response %v, error %v; want only NOT_FOUND", got, err)
+		}
+	}
+	replay()
+	for _, tc := range []struct {
+		name string
+		user string
+	}{
+		{name: "retained manager", user: bob},
+		{name: "unrelated principal", user: outsider},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := &mcpav1.CreateResourceRequest{
+				RequestKey: key, TenantId: testTenant, Name: "new-" + tc.user,
+			}
+			created, err := e.svc.CreateResource(e.as(tc.user), connect.NewRequest(request))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := created.Msg.GetResource()
+			if got.GetId() == res.GetId() || got.GetCreatedByUserId() != tc.user || got.GetCallerRole() != mcpav1.ResourceRole_RESOURCE_ROLE_MANAGE {
+				t.Fatalf("another principal's first use returned %+v, want a new managed resource", got)
+			}
+			again, err := e.svc.CreateResource(e.as(tc.user), connect.NewRequest(request))
+			if err != nil || again.Msg.GetResource().GetId() != got.GetId() {
+				t.Fatalf("another principal's own replay returned %v, error %v", again, err)
+			}
+		})
+	}
+	if _, err := e.svc.GetResource(e.as(bob), connect.NewRequest(&mcpav1.GetResourceRequest{
+		ResourceId: res.GetId(),
+	})); reason(err) != mcpav1.ErrorReason_ERROR_REASON_NOT_FOUND {
+		t.Fatalf("GetResource on tombstone returned %v, want NOT_FOUND", err)
+	}
+	for _, manager := range []string{alice, bob} {
+		got, err := e.svc.ListAuditEvents(e.as(manager), connect.NewRequest(&mcpav1.ListAuditEventsRequest{
+			ResourceId: res.GetId(),
+		}))
+		if err != nil || len(got.Msg.GetEvents()) == 0 {
+			t.Fatalf("manager %s cannot read tombstone audit events: response %v, error %v", manager, got, err)
+		}
+	}
+	var claims int
+	if err := e.db.Pool.QueryRow(e.ctx, `SELECT count(*) FROM idempotency_records
+		WHERE operation = 'CreateResource' AND principal_id = $1 AND request_key = $2`, alice, uuid.MustParse(key)).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != 1 {
+		t.Fatalf("deleted resource has %d idempotency records, want 1", claims)
+	}
+
+	// Remove only retained audit events so the normal tombstone pruning rule
+	// can delete the row while its independent idempotency record still exists.
+	if _, err := e.db.Pool.Exec(e.ctx, `DELETE FROM audit_events WHERE resource_id = $1`, uuid.MustParse(res.GetId())); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err := store.PruneTombstones(e.ctx, e.db.Pool, time.Now().Add(time.Minute), 10)
+	if err != nil || pruned != 1 {
+		t.Fatalf("prune tombstone: deleted %d, error %v", pruned, err)
+	}
+	replay()
+}
+
+func TestCreateResourceReplayRejectsDeletedResourceAfterRoleLoss(t *testing.T) {
+	e := newEnv(t)
+	alice, bob := newUser(), newUser()
+	key := store.NewID().String()
+	res := e.createResource(alice, key)
+	if err := e.putACL(alice, res.GetId(), bob, mcpav1.ResourceRole_RESOURCE_ROLE_MANAGE); err != nil {
+		t.Fatal(err)
+	}
+	e.removeUserACL(res.GetId(), alice)
+	if e.userRole(res.GetId(), alice) != mcpav1.ResourceRole_RESOURCE_ROLE_UNSPECIFIED {
+		t.Fatal("creator retained a role before deletion")
+	}
+	if _, err := e.svc.DeleteResource(e.as(bob), connect.NewRequest(&mcpav1.DeleteResourceRequest{
+		ResourceId: res.GetId(), ConfirmName: res.GetName(),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.svc.CreateResource(e.as(alice), connect.NewRequest(&mcpav1.CreateResourceRequest{
+		RequestKey: key, TenantId: testTenant, Name: res.GetName(),
+	}))
+	if got != nil || reason(err) != mcpav1.ErrorReason_ERROR_REASON_NOT_FOUND {
+		t.Fatalf("deleted resource replay after role loss returned response %v, error %v; want only NOT_FOUND", got, err)
+	}
+}
+
 func TestListTenantAuditEventsReturnsTenantLevelEvents(t *testing.T) {
 	e := newEnv(t)
 	owner, outsider := newUser(), newUser()

@@ -35,6 +35,7 @@ import (
 	"github.com/delinoio/apps/servers/mcpa-api/internal/store"
 	"github.com/delinoio/apps/servers/mcpa-api/internal/store/storetest"
 	"github.com/delinoio/apps/servers/mcpa-api/internal/web"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
@@ -175,6 +176,56 @@ func call[Req, Resp any](f *mfaFixture, cookie, csrf string, fn func(context.Con
 		return nil, err
 	}
 	return resp.Msg, nil
+}
+
+func TestIdempotencyConflictWireCode(t *testing.T) {
+	f := newMFAFixture(t, true, false)
+	cookie, csrf, _ := f.consoleSession()
+	wantError := func(label string, err error, code connect.Code, reason mcpav1.ErrorReason) {
+		t.Helper()
+		if connect.CodeOf(err) != code || apperr.As(err).Reason != reason {
+			t.Fatalf("%s returned code %s, reason %s (%v); want %s, %s", label,
+				connect.CodeOf(err), apperr.As(err).Reason, err, code, reason)
+		}
+	}
+
+	resourceKey := store.NewID().String()
+	create := &mcpav1.CreateResourceRequest{RequestKey: resourceKey, TenantId: mfaTestTenant, Name: "replay-resource"}
+	first, err := call(f, cookie, csrf, f.client.CreateResource, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := call(f, cookie, csrf, f.client.CreateResource, create)
+	if err != nil || again.GetResource().GetId() != first.GetResource().GetId() {
+		t.Fatalf("same-input resource replay returned %v, error %v", again, err)
+	}
+	_, err = call(f, cookie, csrf, f.client.CreateResource, &mcpav1.CreateResourceRequest{
+		RequestKey: resourceKey, TenantId: mfaTestTenant, Name: "changed-resource",
+	})
+	wantError("CreateResource conflict", err, connect.CodeFailedPrecondition, mcpav1.ErrorReason_ERROR_REASON_IDEMPOTENCY_CONFLICT)
+	_, err = call(f, cookie, csrf, f.client.CreateResource, &mcpav1.CreateResourceRequest{
+		RequestKey: store.NewID().String(), TenantId: mfaTestTenant, Name: create.Name,
+	})
+	wantError("duplicate resource name", err, connect.CodeAlreadyExists, mcpav1.ErrorReason_ERROR_REASON_ALREADY_EXISTS)
+
+	callKey := store.NewID().String()
+	expire := time.Now().Add(time.Hour).Truncate(time.Second)
+	issue := &mcpav1.IssueCallKeyRequest{
+		RequestKey: callKey, ResourceId: first.GetResource().GetId(), Name: "replay-key", ExpireTime: timestamppb.New(expire),
+	}
+	issued, err := call(f, cookie, csrf, f.client.IssueCallKey, issue)
+	if err != nil || issued.GetSecret() == "" {
+		t.Fatalf("initial call-key issuance returned %v, error %v", issued, err)
+	}
+	reissued, err := call(f, cookie, csrf, f.client.IssueCallKey, issue)
+	if err != nil || reissued.GetCallKey().GetId() != issued.GetCallKey().GetId() || reissued.GetSecret() != "" {
+		t.Fatalf("same-input call-key replay returned %v, error %v", reissued, err)
+	}
+	_, err = call(f, cookie, csrf, f.client.IssueCallKey, &mcpav1.IssueCallKeyRequest{
+		RequestKey: callKey, ResourceId: first.GetResource().GetId(), Name: issue.Name,
+		ExpireTime: timestamppb.New(expire.Add(time.Hour)),
+	})
+	wantError("IssueCallKey conflict", err, connect.CodeFailedPrecondition, mcpav1.ErrorReason_ERROR_REASON_IDEMPOTENCY_CONFLICT)
 }
 
 func wantMFARequired(t *testing.T, what string, err error) {
