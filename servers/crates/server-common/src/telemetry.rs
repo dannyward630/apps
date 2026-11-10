@@ -77,6 +77,13 @@ impl Metrics {
             }
             Service::GitTracker => {
                 registry.register(Box::new(events.clone())).unwrap();
+                for labels in [
+                    ["persistence", "failure"],
+                    ["github", "failure"],
+                    ["execution", "interrupted"],
+                ] {
+                    events.with_label_values(&labels);
+                }
             }
         }
         Self {
@@ -156,7 +163,53 @@ fn select_format(value: Option<&str>, default_format: LogFormat) -> anyhow::Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{LogFormat, select_format};
+    use super::{LogFormat, Metrics, Service, select_format};
+
+    fn event_samples(metrics: &Metrics) -> Vec<String> {
+        metrics
+            .encode()
+            .lines()
+            .filter(|line| line.starts_with("git_tracker_events_total{"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn git_tracker_initializes_only_alerted_event_series() {
+        let metrics = Metrics::new(Service::GitTracker);
+        let mut samples = event_samples(&metrics);
+        samples.sort();
+        assert_eq!(
+            samples,
+            [
+                "git_tracker_events_total{category=\"failure\",kind=\"github\"} 0",
+                "git_tracker_events_total{category=\"failure\",kind=\"persistence\"} 0",
+                "git_tracker_events_total{category=\"interrupted\",kind=\"execution\"} 0",
+            ]
+        );
+
+        metrics
+            .events
+            .with_label_values(&["github", "failure"])
+            .inc();
+        let mut samples = event_samples(&metrics);
+        samples.sort();
+        assert_eq!(
+            samples,
+            [
+                "git_tracker_events_total{category=\"failure\",kind=\"github\"} 1",
+                "git_tracker_events_total{category=\"failure\",kind=\"persistence\"} 0",
+                "git_tracker_events_total{category=\"interrupted\",kind=\"execution\"} 0",
+            ]
+        );
+    }
+
+    #[test]
+    fn devbase_metrics_do_not_export_git_tracker_event_series() {
+        let metrics = Metrics::new(Service::DevBase);
+        assert!(event_samples(&metrics).is_empty());
+        assert!(metrics.encode().contains("devbase_cleanup_runs_total 0"));
+    }
 
     #[test]
     fn selects_service_default_and_explicit_override() {
