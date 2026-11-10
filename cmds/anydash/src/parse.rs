@@ -215,9 +215,9 @@ pub fn claude_line(line: &str, cutoff: i64, out: &mut Vec<Event>) -> Result<(), 
         }
         None => (UNKNOWN_MODEL.to_owned(), None),
     };
-    if let (Some(session), Some(at)) = (v.get("sessionId").and_then(Value::as_str), at)
-        && at >= cutoff
-    {
+    // Preserve the true first observation even when its tokens are outside retention.
+    // The store applies the cutoff when counting sessions.
+    if let (Some(session), Some(at)) = (v.get("sessionId").and_then(Value::as_str), at) {
         out.push(Event::Session {
             id: hash(session),
             at,

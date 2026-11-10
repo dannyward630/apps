@@ -392,7 +392,7 @@ impl Store {
     /// A Codex rollout holds one session, so several files with the same session are copies of
     /// it: a rollout moved to `archived_sessions`, or compressed. Only the file with the largest
     /// token total counts; the session comes from the file cursor's parser state.
-    pub fn aggregate(&self) -> Result<BTreeMap<(i32, String, i64), BucketValue>> {
+    pub fn aggregate(&self, cutoff: i64) -> Result<BTreeMap<(i32, String, i64), BucketValue>> {
         let mut out: BTreeMap<(i32, String, i64), BucketValue> = BTreeMap::new();
         let mut tokens = self.conn.prepare(
             "WITH codex_files AS (
@@ -430,9 +430,10 @@ impl Store {
         }
         let mut sessions = self.conn.prepare(
             "SELECT tool, model, (started / 900) * 900 AS b, COUNT(*) FROM
-             (SELECT *, ROW_NUMBER() OVER (PARTITION BY tool, session ORDER BY started, path) AS rn FROM sessions) WHERE rn = 1 GROUP BY tool, model, b",
+             (SELECT *, ROW_NUMBER() OVER (PARTITION BY tool, session ORDER BY started, path) AS rn FROM sessions)
+             WHERE rn = 1 AND started >= ?1 GROUP BY tool, model, b",
         )?;
-        let rows = sessions.query_map([], |r| {
+        let rows = sessions.query_map([cutoff], |r| {
             Ok((
                 (
                     r.get::<_, i32>(0)?,
@@ -453,7 +454,7 @@ impl Store {
     /// vanished become zero so the server receives the correction. Returns the changed count.
     pub fn refresh_buckets(&self, now_micros: u64, cutoff: i64) -> Result<usize> {
         let tx = self.conn.unchecked_transaction()?;
-        let current = self.aggregate()?;
+        let current = self.aggregate(cutoff)?;
         let mut stored: BTreeMap<(i32, String, i64), (BucketValue, u64)> = BTreeMap::new();
         {
             let mut stmt = tx.prepare(
@@ -586,7 +587,8 @@ impl Store {
         )?;
         Ok(())
     }
-    /// Delete buckets, contributions, deduplication keys and session records older than `cutoff`.
+    /// Delete expired buckets, contributions and deduplication keys. Keep Claude session
+    /// identities for files with cursors so a later append cannot create a new session start.
     pub fn prune(&self, cutoff: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM buckets WHERE bucket < ?1", [cutoff])?;
@@ -594,8 +596,11 @@ impl Store {
             .execute("DELETE FROM contributions WHERE bucket < ?1", [cutoff])?;
         self.conn
             .execute("DELETE FROM claude_records WHERE at < ?1", [cutoff])?;
-        self.conn
-            .execute("DELETE FROM sessions WHERE started < ?1", [cutoff])?;
+        self.conn.execute(
+            "DELETE FROM sessions WHERE started < ?1 AND
+             (tool != ?2 OR NOT EXISTS (SELECT 1 FROM files WHERE files.path = sessions.path))",
+            params![cutoff, crate::pb::LocalTool::ClaudeCode as i32],
+        )?;
         Ok(())
     }
     // Connections

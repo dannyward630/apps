@@ -314,7 +314,7 @@ fn codex_files_jsonl_zst_archived_and_session_start_bucket() {
     .unwrap();
     let (store, report) = sync_dir(home.path(), &[]);
     assert_eq!(report.files_read, 2);
-    let buckets = store.aggregate().unwrap();
+    let buckets = store.aggregate(0).unwrap();
     let at = |s: &str| time::bucket_start(time::parse(s).unwrap());
     // The session starts at 10:14:59 and counts in the 10:00 bucket; its tokens at 10:16 count in 10:15.
     let start = &buckets[&(
@@ -363,7 +363,7 @@ fn moved_or_compressed_codex_rollouts_count_once() {
     let settings = support::settings(home.path(), &[]);
     let store = store(home.path());
     let totals = |s: &Store| {
-        s.aggregate()
+        s.aggregate(0)
             .unwrap()
             .values()
             .fold((0, 0), |(sessions, tokens), v| {
@@ -446,7 +446,7 @@ fn growth_resumes_from_offset_and_incomplete_lines_wait() {
     let report = scan::sync(&settings, &store, now()).unwrap();
     assert_eq!(report.parsers[0].skipped_record_count, 0);
     let total = |s: &Store| {
-        s.aggregate()
+        s.aggregate(0)
             .unwrap()
             .values()
             .map(|v| v.tokens.total())
@@ -597,7 +597,7 @@ fn claude_deduplicates_by_message_and_request_keeping_largest_total() {
         .find(|p| p.tool == LocalTool::ClaudeCode as i32)
         .unwrap();
     assert_eq!(claude_status.state, ParserState::Ok as i32);
-    let buckets = store.aggregate().unwrap();
+    let buckets = store.aggregate(0).unwrap();
     let key = |s: &str| {
         (
             LocalTool::ClaudeCode as i32,
@@ -654,7 +654,7 @@ fn unreadable_records_produce_partial_aggregation() {
         (ParserState::Partial as i32, 2)
     );
     let total: u64 = store
-        .aggregate()
+        .aggregate(0)
         .unwrap()
         .values()
         .map(|v| v.tokens.input + v.tokens.output)
@@ -900,7 +900,7 @@ fn partial_retention_boundary_bucket_stays_pruned_across_syncs() {
     assert_eq!(store.pending_buckets(10).unwrap().len(), 0);
     // The retained record still contributes to the partial bucket, but the bucket itself
     // must not be recreated after pruning.
-    assert!(store.aggregate().unwrap().contains_key(&(
+    assert!(store.aggregate(0).unwrap().contains_key(&(
         LocalTool::ClaudeCode as i32,
         "claude-opus-5-5".into(),
         time::bucket_start(cutoff),
@@ -951,7 +951,7 @@ fn retained_bucket_is_uploaded_once_across_retention_syncs() {
         0
     );
     assert_eq!(store.pending_buckets(10).unwrap().len(), 0);
-    let retained = store.aggregate().unwrap();
+    let retained = store.aggregate(0).unwrap();
     assert_eq!(
         retained[&(
             LocalTool::ClaudeCode as i32,
@@ -977,13 +977,114 @@ fn backfill_reads_only_the_last_90_days() {
         ),
     );
     let (store, _) = sync_dir(home.path(), &[]);
-    let buckets = store.aggregate().unwrap();
+    let buckets = store.aggregate(now() - time::RETENTION_SECONDS).unwrap();
     assert!(
         buckets
             .keys()
             .all(|k| k.2 >= now() - time::RETENTION_SECONDS)
     );
     assert_eq!(buckets.values().map(|v| v.sessions).sum::<u64>(), 1);
+}
+#[test]
+fn claude_session_before_retention_is_not_recounted_after_prune_and_append() {
+    let home = tempfile::tempdir().unwrap();
+    let file = home.path().join(".claude/projects/p/sessions.jsonl");
+    let now = now();
+    let cutoff = now - time::RETENTION_SECONDS;
+    let old_start = now - 91 * 86_400;
+    let old_retained = now - 89 * 86_400;
+    let new_start = now - 10 * 86_400;
+    support::write(
+        &file,
+        &format!(
+            "{}\n{}\n{}\n{}\n",
+            claude(&time::rfc3339(old_start), "old", "old-first", None, 2, 1),
+            claude(
+                &time::rfc3339(old_retained),
+                "old",
+                "old-second",
+                None,
+                3,
+                1
+            ),
+            claude(&time::rfc3339(new_start), "new", "new-first", None, 5, 1),
+            claude(
+                &time::rfc3339(new_start + 60),
+                "new",
+                "new-second",
+                None,
+                7,
+                1
+            ),
+        ),
+    );
+    let settings = support::settings(home.path(), &[]);
+    let store = store(home.path());
+    scan::sync(&settings, &store, now).unwrap();
+    let buckets = store.aggregate(cutoff).unwrap();
+    let model = "claude-opus-5-5".to_owned();
+    let old_bucket = time::bucket_start(old_retained);
+    let new_bucket = time::bucket_start(new_start);
+    assert_eq!(
+        buckets[&(LocalTool::ClaudeCode as i32, model.clone(), old_bucket)].sessions,
+        0
+    );
+    assert_eq!(
+        buckets[&(LocalTool::ClaudeCode as i32, model.clone(), old_bucket)]
+            .tokens
+            .input,
+        3
+    );
+    assert_eq!(
+        buckets[&(LocalTool::ClaudeCode as i32, model.clone(), new_bucket)].sessions,
+        1
+    );
+    let old_identity = || {
+        let db = rusqlite::Connection::open(home.path().join("anydash/data/collector.db")).unwrap();
+        let started: i64 = db
+            .query_row(
+                "SELECT started FROM sessions WHERE tool = 2 AND session = ?1",
+                [parse::hash("old")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(started, old_start);
+    };
+    old_identity();
+    assert_eq!(buckets.values().map(|v| v.sessions).sum::<u64>(), 1);
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .unwrap()
+        .write_all(
+            format!(
+                "{}\n{}\n",
+                claude(&time::rfc3339(now), "old", "old-third", None, 11, 1),
+                claude(&time::rfc3339(now), "new", "new-third", None, 13, 1),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    scan::sync(&settings, &store, now + 60).unwrap();
+    old_identity();
+    let buckets = store.aggregate(cutoff + 60).unwrap();
+    assert_eq!(buckets.values().map(|v| v.sessions).sum::<u64>(), 1);
+    assert_eq!(
+        buckets[&(LocalTool::ClaudeCode as i32, model.clone(), new_bucket)].sessions,
+        1
+    );
+    assert_eq!(
+        buckets[&(LocalTool::ClaudeCode as i32, model, time::bucket_start(now))].sessions,
+        0
+    );
+    assert!(
+        store
+            .pending_buckets(100)
+            .unwrap()
+            .iter()
+            .all(|bucket| bucket.bucket >= cutoff)
+    );
 }
 #[test]
 fn path_detection_environment_user_added_and_disabled() {
@@ -1055,7 +1156,7 @@ fn path_detection_environment_user_added_and_disabled() {
     .unwrap();
     scan::sync(&settings, &store, now()).unwrap();
     let sessions: u64 = store
-        .aggregate()
+        .aggregate(0)
         .unwrap()
         .values()
         .map(|v| v.sessions)
