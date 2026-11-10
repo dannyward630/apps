@@ -384,11 +384,18 @@ func TestClassify(t *testing.T) {
 		{"rate limited", outcomeInput{executorInvoked: true, providerStatus: 429}, mcpav1.CallStatus_CALL_STATUS_PROVIDER_ERROR, ErrorClassRateLimited, "429"},
 		{"auth", outcomeInput{executorInvoked: true, providerStatus: 403}, mcpav1.CallStatus_CALL_STATUS_PROVIDER_AUTH_ERROR, ErrorClassProviderAuth, "auth"},
 		{"network", outcomeInput{executorInvoked: true, networkError: true}, mcpav1.CallStatus_CALL_STATUS_PROVIDER_ERROR, ErrorClassNetwork, "network"},
+		{"cancelled network", outcomeInput{executorInvoked: true, networkError: true, clientCancelled: true}, mcpav1.CallStatus_CALL_STATUS_CLIENT_CANCELLED, ErrorClassClientCancelled, ""},
 		{"interrupted", outcomeInput{executorInvoked: true, providerStatus: 200, streamFailed: true, sentStreamData: true}, mcpav1.CallStatus_CALL_STATUS_STREAM_INTERRUPTED, ErrorClassStreamInterrupted, "network"},
 		{"cancelled wins", outcomeInput{executorInvoked: true, providerStatus: 500, clientCancelled: true}, mcpav1.CallStatus_CALL_STATUS_CLIENT_CANCELLED, ErrorClassClientCancelled, "5xx"},
 		{"sdk refused", outcomeInput{customerStatus: 502}, mcpav1.CallStatus_CALL_STATUS_NO_CREDENTIAL, ErrorClassNoCredential, ""},
 		{"internal", outcomeInput{executorInvoked: true, providerStatus: 200, customerStatus: 500}, mcpav1.CallStatus_CALL_STATUS_INTERNAL_ERROR, ErrorClassInternal, ""},
 		{"rejected", outcomeInput{rejection: Reject(RejectionBudgetExhausted, "")}, mcpav1.CallStatus_CALL_STATUS_REJECTED_BUDGET, ErrorClassBudgetExhausted, ""},
+		{"cancelled body read", outcomeInput{rejection: Reject(RejectionInternal, ""), clientCancelled: true}, mcpav1.CallStatus_CALL_STATUS_CLIENT_CANCELLED, ErrorClassClientCancelled, ""},
+		{"cancelled dependency", outcomeInput{rejection: Reject(RejectionDependencyUnavailable, ""), clientCancelled: true}, mcpav1.CallStatus_CALL_STATUS_CLIENT_CANCELLED, ErrorClassClientCancelled, ""},
+		{"live dependency", outcomeInput{rejection: Reject(RejectionDependencyUnavailable, "")}, mcpav1.CallStatus_CALL_STATUS_REJECTED_DEPENDENCY, ErrorClassDependencyUnavailable, ""},
+		{"cancelled policy", outcomeInput{rejection: Reject(RejectionModelNotAllowed, ""), clientCancelled: true}, mcpav1.CallStatus_CALL_STATUS_REJECTED_MODEL_NOT_ALLOWED, ErrorClassModelNotAllowed, ""},
+		{"cancelled budget", outcomeInput{rejection: Reject(RejectionBudgetExhausted, ""), clientCancelled: true}, mcpav1.CallStatus_CALL_STATUS_REJECTED_BUDGET, ErrorClassBudgetExhausted, ""},
+		{"cancelled oversized body", outcomeInput{rejection: Reject(RejectionRequestTooLarge, ""), clientCancelled: true}, mcpav1.CallStatus_CALL_STATUS_INTERNAL_ERROR, ErrorClassRequestTooLarge, ""},
 	}
 	for _, tc := range cases {
 		got := classify(tc.in)

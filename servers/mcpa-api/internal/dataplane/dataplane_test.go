@@ -3,6 +3,7 @@
 package dataplane
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -134,6 +135,37 @@ func TestCallAuthorizerTenantAndBillingGates(t *testing.T) {
 		proxy.RejectionModelNotAllowed.HTTPStatus() != http.StatusForbidden ||
 		proxy.RejectionInvalidCallKey.HTTPStatus() != http.StatusUnauthorized {
 		t.Fatal("rejection statuses differ from the contract")
+	}
+}
+
+func TestCallAuthorizerClientCancellationDoesNotWarn(t *testing.T) {
+	fake := newFakeDelcore(t)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+	fake.set(func(f *fakeDelcore) {
+		f.authorizeEntered = entered
+		f.authorizeRelease = release
+	})
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	a := NewCallAuthorizer(nil, fake.client(t, time.Minute, time.Now), logger, time.Now, time.Second)
+	p := proxy.CallPrincipal{ResourceID: "019a0000-0000-7000-8000-000000000010", TenantID: "tenant-1", CallKeyID: "k", IssuerUserID: "user-1"}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.AuthorizeCall(ctx, p) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Delcore authorization was not called")
+	}
+	cancel()
+	var rejection *proxy.Rejection
+	if err := <-done; !errors.As(err, &rejection) || rejection.Code != proxy.RejectionDependencyUnavailable {
+		t.Fatalf("authorization error %v", err)
+	}
+	if strings.Contains(logs.String(), "invoke authorization failed") {
+		t.Fatalf("cancellation logged as dependency failure: %s", logs.String())
 	}
 }
 

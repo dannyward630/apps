@@ -169,7 +169,9 @@ func dependencyUnavailable() error {
 func (a *CallAuthorizer) AuthorizeCall(ctx context.Context, p proxy.CallPrincipal) error {
 	state, err := a.dc.TenantState(ctx, p.TenantID)
 	if err != nil {
-		a.log.Warn("tenant state check failed", "tenant_id", p.TenantID, "error", err)
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			a.log.Warn("tenant state check failed", "tenant_id", p.TenantID, "error", err)
+		}
 		return dependencyUnavailable()
 	}
 	if state != delcorev1.TenantState_TENANT_STATE_ACTIVE {
@@ -177,7 +179,9 @@ func (a *CallAuthorizer) AuthorizeCall(ctx context.Context, p proxy.CallPrincipa
 	}
 	d, err := a.dc.Authorize(ctx, p.TenantID, p.IssuerUserID, delcore.CapabilityInvokeModels, true)
 	if err != nil {
-		a.log.Warn("invoke authorization failed", "tenant_id", p.TenantID, "error", err)
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			a.log.Warn("invoke authorization failed", "tenant_id", p.TenantID, "error", err)
+		}
 		return dependencyUnavailable()
 	}
 	if !d.Allowed {

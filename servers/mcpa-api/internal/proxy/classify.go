@@ -153,6 +153,9 @@ type outcome struct {
 // payload bytes reached the caller is an interruption.
 func classify(in outcomeInput) outcome {
 	if in.rejection != nil {
+		if in.clientCancelled && (in.rejection.Code == RejectionInternal || in.rejection.Code == RejectionDependencyUnavailable) {
+			return outcome{status: mcpav1.CallStatus_CALL_STATUS_CLIENT_CANCELLED, statusClass: mcpav1.StatusClass_STATUS_CLASS_NONE, errorClass: ErrorClassClientCancelled}
+		}
 		status, class := rejectionOutcome(in.rejection.Code)
 		return outcome{status: status, statusClass: mcpav1.StatusClass_STATUS_CLASS_NONE, errorClass: class}
 	}
@@ -176,7 +179,7 @@ func classify(in outcomeInput) outcome {
 		// The cut-off is the provider's fault and the customer sees a 502,
 		// so it counts as a server-side failure in the bounded metric label.
 		out.failureClass = "5xx"
-	case in.networkError:
+	case in.networkError && !in.clientCancelled:
 		out.failureClass = "network"
 	case in.providerStatus == 401 || in.providerStatus == 403:
 		out.failureClass = "auth"
