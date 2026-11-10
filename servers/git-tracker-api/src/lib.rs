@@ -318,9 +318,9 @@ impl Server {
             }
             Op::Compare => {
                 let r = state
-                    .representative(string(&q, "targetCommit"), None, false)
+                    .compare_representative(string(&q, "targetCommit"))
                     .ok_or_else(Fault::missing)?;
-                let baseline = state.representative(string(&q, "baselineCommit"), None, false);
+                let baseline = state.compare_representative(string(&q, "baselineCommit"));
                 out = json!({"comparisons":state.comparisons(r,Some(baseline))});
             }
             Op::GetHistory => {

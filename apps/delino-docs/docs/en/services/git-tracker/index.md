@@ -142,7 +142,7 @@ After six hours without newly saved measurement data, an unfinished execution be
 
 Automatic PR comparisons freeze the merge-base commit and its representative completed execution on first upload. A missing baseline stays unavailable even if uploaded later. Automatic push comparisons walk first-parent ancestry separately for each row and use the nearest measured ancestor completed by the first-upload cutoff. Later jobs use that same cutoff. The table identifies each actual source commit and execution. Explicit baseline SHA comparisons do not use row-level ancestor fallback.
 
-The website's two-commit comparison uses only the selected commits' representative completed executions. New rows/columns and missing or incompatible data are not comparable and do not cause regression failure. Deleted baseline data is not reconstructed. Before completion an absent row is uncollected; after completion it is missing.
+The website's two-commit comparison prefers the latest registered completed branch execution for each selected commit. If a commit has no completed branch execution, it uses the latest registered completed pull request execution for that commit. The selected target execution supplies its stored dataset configuration. New rows/columns and missing or incompatible data are not comparable and do not cause regression failure. Deleted baseline data is not reconstructed. Before completion an absent row is uncollected; after completion it is missing.
 
 Graphs use equally spaced commits in first-parent order. They connect actual measured points across skipped commits and never carry forward or invent values. Filter by dataset, branch, column, items, dates and commit range. Use the data table for exact values and keyboard-accessible execution links.
 

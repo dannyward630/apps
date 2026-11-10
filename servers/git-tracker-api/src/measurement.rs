@@ -147,6 +147,10 @@ impl State {
             })
             .max_by_key(|r| &r.execution.registration_order)
     }
+    pub fn compare_representative(&self, commit: &str) -> Option<&Record> {
+        self.representative(commit, None, true)
+            .or_else(|| self.representative(commit, None, false))
+    }
     fn register(&mut self, c: &Context, now: DateTime<Utc>, ancestors: Vec<String>, base: String) {
         self.next += 1;
         let push = c.pull_request == 0 && c.baseline_commit.is_empty();

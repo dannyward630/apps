@@ -35,6 +35,96 @@ fn row(id: &str, value: &str) -> Row {
         ..Default::default()
     }
 }
+
+#[test]
+fn explicit_comparison_prefers_branch_on_both_sides_in_either_registration_order() {
+    for branch_first in [true, false] {
+        let mut state = State::default();
+        let at = Utc::now();
+        let branch_dataset = dataset();
+        let mut pull_request_dataset = dataset();
+        pull_request_dataset.columns[0].absolute_threshold = "1000".into();
+        for (commit, branch_value, pull_request_value) in
+            [("target", "10", "99"), ("baseline", "4", "9")]
+        {
+            let branch = context(&format!("branch-{commit}"), commit);
+            let mut pull_request = context(&format!("pr-{commit}"), commit);
+            pull_request.pull_request = 1;
+            let cases = if branch_first {
+                [
+                    (&branch, &branch_dataset, branch_value),
+                    (&pull_request, &pull_request_dataset, pull_request_value),
+                ]
+            } else {
+                [
+                    (&pull_request, &pull_request_dataset, pull_request_value),
+                    (&branch, &branch_dataset, branch_value),
+                ]
+            };
+            for (execution, configuration, value) in cases {
+                state
+                    .upload(
+                        execution,
+                        configuration,
+                        &[row("one", value)],
+                        at,
+                        vec![],
+                        String::new(),
+                    )
+                    .unwrap();
+                state.complete(execution, at).unwrap();
+            }
+        }
+        let target = state.compare_representative("target").unwrap();
+        let baseline = state.compare_representative("baseline").unwrap();
+        assert_eq!(target.execution.context.execution_id, "branch-target");
+        assert_eq!(baseline.execution.context.execution_id, "branch-baseline");
+        let compared = &state.comparisons(target, Some(Some(baseline)))[0];
+        assert_eq!(compared.value, "10");
+        assert_eq!(compared.baseline_value, "4");
+        assert_eq!(compared.baseline_execution_id, "branch-baseline");
+        assert_eq!(compared.status, COMPARISON_STATUS_REGRESSION);
+    }
+}
+
+#[test]
+fn explicit_comparison_falls_back_to_latest_completed_pull_request() {
+    let mut state = State::default();
+    let at = Utc::now();
+    for (id, value, completed) in [
+        ("pr-old", "9", true),
+        ("pr-new", "11", true),
+        ("branch-incomplete", "20", false),
+    ] {
+        let mut execution = context(id, "shared");
+        if id.starts_with("pr-") {
+            execution.pull_request = 1;
+        }
+        state
+            .upload(
+                &execution,
+                &dataset(),
+                &[row("one", value)],
+                at,
+                vec![],
+                String::new(),
+            )
+            .unwrap();
+        if completed {
+            state.complete(&execution, at).unwrap();
+        }
+    }
+    assert_eq!(
+        state
+            .compare_representative("shared")
+            .unwrap()
+            .execution
+            .context
+            .execution_id,
+        "pr-new"
+    );
+    assert!(state.compare_representative("missing").is_none());
+}
 #[test]
 fn exact_decimals_thresholds_units_and_bounds() {
     assert_eq!(

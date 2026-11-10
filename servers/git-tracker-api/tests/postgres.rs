@@ -1447,6 +1447,141 @@ async fn postgres_genuine_publication_database_error_keeps_persistence_accountin
 
 #[tokio::test]
 #[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_explicit_comparison_prefers_completed_branch_in_either_order() {
+    for branch_first in [true, false] {
+        let fixture = fixture().await;
+        let (status, connected) = fixture.connect().await;
+        assert_eq!(status, StatusCode::OK, "{connected}");
+        let repository_id = connected["repository"]["id"].as_str().unwrap();
+        let (_, issued) = fixture.call(
+            "IssueToken",
+            "Bearer manager",
+            json!({"repositoryId":repository_id,"expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()}),
+        ).await;
+        let token = format!("Bearer {}", issued["token"].as_str().unwrap());
+        let cases = if branch_first {
+            [("branch", 0, "10", "0"), ("pr", 1, "99", "1000")]
+        } else {
+            [("pr", 1, "99", "1000"), ("branch", 0, "10", "0")]
+        };
+        for (id, pull_request, value, threshold) in cases {
+            let context = json!({
+                "repositoryId":repository_id,
+                "executionId":id,
+                "commit":fixture.commit,
+                "branch":"main",
+                "pullRequest":pull_request,
+                "baselineCommit":if pull_request > 0 { fixture.commit.as_str() } else { "" },
+            });
+            let (status, uploaded) = fixture.call("Upload", &token, json!({
+                "context":context,
+                "dataset":{"id":"size","name":"Size","columns":[{"id":"bytes","unit":"B","direction":"DIRECTION_LOWER","absoluteThreshold":threshold}]},
+                "rows":[{"id":"one","values":{"bytes":value}}],
+            })).await;
+            assert_eq!(status, StatusCode::OK, "{uploaded}");
+            let (status, completed) = fixture
+                .call("Complete", &token, json!({"context":context}))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{completed}");
+        }
+        let (status, compared) = fixture
+            .call(
+                "Compare",
+                "",
+                json!({
+                    "repositoryId":repository_id,
+                    "targetCommit":fixture.commit,
+                    "baselineCommit":fixture.commit,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{compared}");
+        assert_eq!(compared["comparisons"][0]["value"], "10");
+        assert_eq!(compared["comparisons"][0]["baselineValue"], "10");
+        assert_eq!(compared["comparisons"][0]["baselineExecutionId"], "branch");
+
+        let (status, history) = fixture
+            .call(
+                "GetHistory",
+                "",
+                json!({"repositoryId":repository_id,"branch":"main"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        let executions = history["executions"].as_array().unwrap();
+        assert!(
+            executions
+                .iter()
+                .any(|execution| execution["context"]["executionId"] == "branch"
+                    && execution["representative"] == true)
+        );
+        assert!(
+            executions
+                .iter()
+                .any(|execution| execution["context"]["executionId"] == "pr"
+                    && execution["representative"] != true)
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_explicit_comparison_falls_back_to_latest_completed_pr() {
+    let fixture = fixture().await;
+    let (status, connected) = fixture.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let repository_id = connected["repository"]["id"].as_str().unwrap();
+    let (_, issued) = fixture.call(
+        "IssueToken",
+        "Bearer manager",
+        json!({"repositoryId":repository_id,"expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()}),
+    ).await;
+    let token = format!("Bearer {}", issued["token"].as_str().unwrap());
+    for (id, pull_request, value, complete) in [
+        ("pr-old", 1, "9", true),
+        ("pr-new", 1, "11", true),
+        ("branch-incomplete", 0, "20", false),
+    ] {
+        let context = json!({
+            "repositoryId":repository_id,
+            "executionId":id,
+            "commit":fixture.commit,
+            "branch":"main",
+            "pullRequest":pull_request,
+            "baselineCommit":if pull_request > 0 { fixture.commit.as_str() } else { "" },
+        });
+        let (status, uploaded) = fixture.call("Upload", &token, json!({
+            "context":context,
+            "dataset":{"id":"size","name":"Size","columns":[{"id":"bytes","unit":"B","direction":"DIRECTION_LOWER"}]},
+            "rows":[{"id":"one","values":{"bytes":value}}],
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{uploaded}");
+        if complete {
+            let (status, completed) = fixture
+                .call("Complete", &token, json!({"context":context}))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{completed}");
+        }
+    }
+    let (status, compared) = fixture
+        .call(
+            "Compare",
+            "",
+            json!({
+                "repositoryId":repository_id,
+                "targetCommit":fixture.commit,
+                "baselineCommit":fixture.commit,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{compared}");
+    assert_eq!(compared["comparisons"][0]["value"], "11");
+    assert_eq!(compared["comparisons"][0]["baselineValue"], "11");
+    assert_eq!(compared["comparisons"][0]["baselineExecutionId"], "pr-new");
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
 async fn postgres_repository_listing_bounds_anonymous_results_and_preserves_space_results() {
     let fixture = fixture().await;
     let own_space = uuid::Uuid::parse_str(&fixture.space).unwrap();
