@@ -24,7 +24,7 @@ Collector devices run adapters for the connections whose lease they hold and for
 - Credential reads are read-only: adapters never write, move or lock a CLI's credential files or keyring items.
 - Unknown enum-like provider values (such as a new plan type) never break parsing; adapters report them as text and keep the remaining metrics.
 - A response that cannot be parsed returns `FAILURE_CLASS_RESPONSE_UNREADABLE` for the affected metrics only; readable parts are still reported (`COLLECTION_STATUS_PARTIALLY_SUCCEEDED`).
-- Provider rate limits take precedence over the AnyDash refresh cadence; adapters honor `Retry-After` and documented limits. HTTP 429 or 401 in any request of a cycle fails the whole cycle; other failed sub-requests leave the affected metrics `FAILED` and the snapshot `PARTIALLY_SUCCEEDED`.
+- Provider rate limits take precedence over the AnyDash refresh cadence; adapters honor `Retry-After` and documented limits. Numeric `Retry-After` waits above one day are capped at one day; shorter waits and HTTP-date waits retain their stated duration. HTTP 429 or 401 in any request of a cycle fails the whole cycle; other failed sub-requests leave the affected metrics `FAILED` and the snapshot `PARTIALLY_SUCCEEDED`.
 - Decimal amounts are summed exactly in units of 10^-9 and reported without trailing zeros. Provider service names used as dimensions replace whitespace with `_`.
 
 ### Account fingerprints

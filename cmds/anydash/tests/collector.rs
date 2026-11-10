@@ -1104,6 +1104,59 @@ async fn provider_retry_waits_start_when_the_response_arrives() {
     );
 }
 #[tokio::test(flavor = "multi_thread")]
+async fn provider_retry_after_is_bounded_and_short_waits_are_exact() {
+    let home = tempfile::tempdir().unwrap();
+    let state = Arc::new(Mutex::new(Api::default()));
+    let (mock, core) = logged_in(home.path(), &state, Owner::Foreground).await;
+    vercel_connection(&core).await.unwrap();
+    let now = time::now();
+    core.heartbeat(now).await.unwrap();
+    let header = Arc::new(Mutex::new(String::new()));
+    let base = api(state);
+    let current = header.clone();
+    mock.set(move |r| {
+        if r.route() == "/v10/projects" {
+            Reply::text(429, "").with_header("Retry-After", &current.lock().unwrap())
+        } else {
+            base(r)
+        }
+    });
+    for (value, wait) in [
+        ("9223372036854775807", 86_400),
+        ("86400", 86_400),
+        ("60", 60),
+    ] {
+        *header.lock().unwrap() = value.into();
+        let before = time::now();
+        assert_eq!(
+            core.poll_connection("c1", now).await.unwrap(),
+            Some(CollectionStatus::RateLimited)
+        );
+        let after = time::now();
+        let next: i64 = rusqlite::Connection::open(home.path().join("anydash/data/collector.db"))
+            .unwrap()
+            .query_row(
+                "SELECT next_attempt FROM connections WHERE id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(next >= before + wait && next <= after + wait);
+        if value != "60" {
+            rusqlite::Connection::open(home.path().join("anydash/data/collector.db"))
+                .unwrap()
+                .execute(
+                    "UPDATE connections SET next_attempt = 0 WHERE id = 'c1'",
+                    [],
+                )
+                .unwrap();
+        }
+    }
+    let calls = mock.count("/v10/projects");
+    core.cycle(now + 15).await;
+    assert_eq!(mock.count("/v10/projects"), calls);
+}
+#[tokio::test(flavor = "multi_thread")]
 async fn offline_buffering_update_required_and_chunked_upload() {
     let home = tempfile::tempdir().unwrap();
     let state = Arc::new(Mutex::new(Api {

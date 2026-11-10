@@ -124,7 +124,7 @@ Paths, metrics and general parsing rules come from the [provider adapters contra
 
 ### Status output
 
-`anydash status` (and `GetCollectorStatus`) shows: collector run state and owner; device ID; collector version; the correlation ID, reason and time of the last error; each connection ID with provider, display name, credential presence, lease state and epoch, last status, failure class, last success and next attempt; parser state and skipped record count per tool; last local sync and upload times; pending bucket count and the oldest pending bucket; key source; autostart state; login progress; and notices: a new version available, update required, and unsupported records (update the collector). Users can copy every ID. App error screens show the same correlation ID, device ID, connection ID and collector version.
+`anydash status` (and `GetCollectorStatus`) shows: collector run state and owner; device ID; collector version; the correlation ID, reason and time of the last error; each connection ID with provider, display name, credential presence, lease state and epoch, last status, failure class, last success and next attempt; parser state and skipped record count per tool; last local sync and upload times; pending bucket count and the oldest pending bucket; key source; autostart state; login progress; and notices: a new version available, update required, and unsupported records (update the collector). Users can copy every ID. App error screens show the same correlation ID, device ID, connection ID and collector version. Numeric provider and API `Retry-After` waits are capped at one day before calculating the next attempt.
 
 ### User service
 

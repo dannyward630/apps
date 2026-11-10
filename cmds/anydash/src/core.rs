@@ -1469,7 +1469,8 @@ impl Core {
                 let wait = outcome
                     .retry_after
                     .unwrap_or_else(|| schedule::backoff(row.failures, schedule::jitter()));
-                row.next_attempt = completed + schedule::seconds(wait).max(1);
+                row.next_attempt =
+                    schedule::wait_until(completed, wait.max(Duration::from_secs(1)));
             }
             CollectionStatus::AuthExpired => {
                 row.next_attempt = regular;
@@ -1697,7 +1698,7 @@ impl Core {
                         s.next_upload = now + schedule::seconds(schedule::LOCAL_SYNC_INTERVAL);
                     }
                     Err(f) if f.reason == ErrorReason::RateLimited => {
-                        let retry_at = now + schedule::seconds(api::wait_for(&f, 1));
+                        let retry_at = schedule::wait_until(now, api::wait_for(&f, 1));
                         {
                             let mut s = lock(&self.state);
                             s.upload_retry_at = retry_at;
@@ -1729,7 +1730,7 @@ impl Core {
             Err(f) => {
                 if api::transient(&f) || f.reason == ErrorReason::RateLimited {
                     s.api_failures += 1;
-                    s.next_api = now + schedule::seconds(api::wait_for(&f, s.api_failures));
+                    s.next_api = schedule::wait_until(now, api::wait_for(&f, s.api_failures));
                 }
                 tracing::info!(event = "cycle_failed", reason = f.reason.as_str_name(), correlation_id = %f.correlation_id, next_attempt = %time::rfc3339(s.next_api));
             }
