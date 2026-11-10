@@ -96,7 +96,7 @@ External individuals and organizations, CI jobs and service operators.
 
 ### Deletion, telemetry, operations, and security
 
-- After confirmation, managers can permanently delete an entire repository's measurements, a dataset, or an execution. Preserve the baseline-deletion behavior above.
+- After confirmation, managers can permanently delete an entire repository's measurements, a dataset, or an execution. Unknown executions and datasets held by no current execution return not found and create no deletion audit or tombstone. Repeated deletion of a tombstoned execution and deletion of an empty repository succeed without another deletion audit. Dataset deletion marks only executions that held the dataset; other executions remain eligible to upload it, and only actual holders produce baseline-deleted comparisons. Preserve existing deletion markers and retry guards.
 - After Delcore finalizes space deletion, permanently delete that space's Git Tracker repository connections, tokens, configuration, and measurement history.
 - Provide structured Go `log/slog` logs, request/execution correlation, bounded error categories, health/readiness interfaces, Prometheus metrics, and OpenTelemetry traces.
 - Audit authorization changes, repository connection changes, token issuance/revocation, and data deletion. Exclude secret values and raw measurements from audit payloads. Make audit retention an operator-required setting and delete expired audit records.

@@ -148,7 +148,7 @@ Graphs use equally spaced commits in first-parent order. They connect actual mea
 
 ## Deletion and troubleshooting
 
-Managers can permanently delete a repository's measurements, a dataset or one execution after confirmation. A comparison whose baseline was deleted becomes unavailable. When Delcore finalizes space deletion, Git Tracker deletes the space's connections, tokens, configuration and history.
+Managers can permanently delete a repository's measurements, a dataset or one execution after confirmation. Deleting an unknown execution or a dataset with no current measurements reports that the target was not found. Deleting a dataset affects only executions that contained it; other executions can still upload that dataset. A comparison whose baseline measurements were deleted becomes unavailable, while a baseline that never contained the dataset treats it as new data. When Delcore finalizes space deletion, Git Tracker deletes the space's connections, tokens, configuration and history.
 
 For a permission error, verify the selected space and your current Git Tracker role. For upload conflicts, confirm execution identity, dataset configuration and complete row values. For interrupted or completed runs, use a new execution ID. For network/server errors, retry and retain the response correlation ID when asking for help. Never share tokens, credentials or private measurements in public reports.
 

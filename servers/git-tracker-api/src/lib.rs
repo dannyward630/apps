@@ -368,28 +368,48 @@ impl Server {
                 if q["confirmed"] != true {
                     return Err(Fault::invalid("deletion confirmation is required"));
                 }
-                match string(&q, "kind") {
+                let removed = match string(&q, "kind") {
                     "DELETE_KIND_REPOSITORY" => {
+                        let removed = !state.records.is_empty();
                         state
                             .deleted
                             .extend(state.records.keys().map(|id| (id.clone(), true)));
                         state.records.clear();
+                        removed
                     }
                     "DELETE_KIND_EXECUTION" => {
                         let id = string(&q, "id");
-                        state.deleted.insert(id.into(), true);
-                        state.records.remove(id);
+                        if state.deleted.get(id) == Some(&true) {
+                            false
+                        } else {
+                            if !state.records.contains_key(id) {
+                                return Err(Fault::missing());
+                            }
+                            state.deleted.insert(id.into(), true);
+                            state.records.remove(id);
+                            true
+                        }
                     }
                     "DELETE_KIND_DATASET" => {
                         let id = string(&q, "id");
+                        let mut removed = false;
                         for r in state.records.values_mut() {
-                            r.removed.insert(id.into(), true);
-                            r.execution.measurements.retain(|m| m.dataset.id != id);
+                            if r.execution.measurements.iter().any(|m| m.dataset.id == id) {
+                                r.removed.insert(id.into(), true);
+                                r.execution.measurements.retain(|m| m.dataset.id != id);
+                                removed = true;
+                            }
                         }
+                        if !removed {
+                            return Err(Fault::missing());
+                        }
+                        true
                     }
                     _ => return Err(Fault::invalid("invalid deletion kind")),
+                };
+                if removed {
+                    audit(&mut tx, &repo.space_id, "measurements_deleted", trace).await?;
                 }
-                audit(&mut tx, &repo.space_id, "measurements_deleted", trace).await?;
             }
             Op::ConnectRepository | Op::ListRepositories => unreachable!(),
         }

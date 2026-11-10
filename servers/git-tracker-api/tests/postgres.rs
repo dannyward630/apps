@@ -1447,6 +1447,172 @@ async fn postgres_genuine_publication_database_error_keeps_persistence_accountin
 
 #[tokio::test]
 #[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_delete_audits_only_existing_measurements() {
+    let f = fixture().await;
+    let (status, connected) = f.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let rid = connected["repository"]["id"].as_str().unwrap();
+    let initial_audits = f.audit_count().await;
+    let delete =
+        |kind: &str, id: &str| json!({"repositoryId":rid,"kind":kind,"id":id,"confirmed":true});
+    let (status, body) = f
+        .call(
+            "Delete",
+            "Bearer manager",
+            delete("DELETE_KIND_REPOSITORY", ""),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.audit_count().await, initial_audits);
+
+    for (kind, id) in [
+        ("DELETE_KIND_EXECUTION", "missing"),
+        ("DELETE_KIND_DATASET", "missing"),
+    ] {
+        let (_, body) = f.call("Delete", "Bearer manager", delete(kind, id)).await;
+        assert_eq!(body["code"], "not_found", "{body}");
+        assert_eq!(f.audit_count().await, initial_audits);
+    }
+    let state: Value = sqlx::query_scalar(&format!(
+        "SELECT state FROM {}.git_tracker_repositories WHERE id=$1",
+        f.schema
+    ))
+    .bind(uuid::Uuid::parse_str(rid).unwrap())
+    .fetch_one(&f.admin)
+    .await
+    .unwrap();
+    assert!(state["deleted"].as_object().unwrap().is_empty());
+
+    let (_, issued) = f.call("IssueToken", "Bearer manager", json!({"repositoryId":rid,"expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()})).await;
+    let token = format!("Bearer {}", issued["token"].as_str().unwrap());
+    let context =
+        json!({"repositoryId":rid,"executionId":"missing","commit":f.commit,"branch":"main"});
+    let dataset = json!({"id":"size","name":"Size","columns":[{"id":"bytes","unit":"B","direction":"DIRECTION_LOWER"}]});
+    let upload =
+        json!({"context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"1"}}]});
+    let (status, body) = f.call("Upload", &token, upload.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = f
+        .call(
+            "Delete",
+            "Bearer manager",
+            delete("DELETE_KIND_EXECUTION", "missing"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.audit_count().await, initial_audits + 2); // Token issuance and actual deletion.
+    let (status, body) = f
+        .call(
+            "Delete",
+            "Bearer manager",
+            delete("DELETE_KIND_EXECUTION", "missing"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.audit_count().await, initial_audits + 2);
+    let (_, body) = f.call("Upload", &token, upload).await;
+    assert_eq!(body["code"], "failed_precondition", "{body}");
+    let (_, body) = f.call("Complete", &token, json!({"context":context})).await;
+    assert_eq!(body["code"], "failed_precondition", "{body}");
+
+    let another =
+        json!({"repositoryId":rid,"executionId":"another","commit":f.commit,"branch":"main"});
+    let (status, body) = f.call("Upload", &token, json!({"context":another,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"2"}}]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = f
+        .call(
+            "Delete",
+            "Bearer manager",
+            delete("DELETE_KIND_REPOSITORY", ""),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.audit_count().await, initial_audits + 3);
+    let state: Value = sqlx::query_scalar(&format!(
+        "SELECT state FROM {}.git_tracker_repositories WHERE id=$1",
+        f.schema
+    ))
+    .bind(uuid::Uuid::parse_str(rid).unwrap())
+    .fetch_one(&f.admin)
+    .await
+    .unwrap();
+    assert!(state["records"].as_object().unwrap().is_empty());
+    assert_eq!(state["deleted"]["another"], true);
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_delete_dataset_marks_holders_only_and_preserves_baselines() {
+    let f = fixture().await;
+    let (status, connected) = f.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let rid = connected["repository"]["id"].as_str().unwrap();
+    let (_, issued) = f.call("IssueToken", "Bearer manager", json!({"repositoryId":rid,"expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()})).await;
+    let token = format!("Bearer {}", issued["token"].as_str().unwrap());
+    let dataset = |id: &str| json!({"id":id,"name":id,"columns":[{"id":"bytes","unit":"B","direction":"DIRECTION_LOWER"}]});
+    let context = |id: &str, pr: bool| json!({"repositoryId":rid,"executionId":id,"commit":f.commit,"branch":"main","pullRequest":if pr {1} else {0},"baselineCommit":if pr {f.commit.as_str()} else {""}});
+    for (id, pr, data) in [
+        ("baseline-new", false, "A"),
+        ("pr-new", true, "A"),
+        ("baseline-deleted", false, "D"),
+        ("pr-deleted", true, "A"),
+        ("nonholder", false, "A"),
+    ] {
+        let c = context(id, pr);
+        let (status, body) = f.call("Upload", &token, json!({"context":c,"dataset":dataset(data),"rows":[{"id":"one","values":{"bytes":"1"}}]})).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+        if id.starts_with("baseline-") {
+            let (status, body) = f.call("Complete", &token, json!({"context":c})).await;
+            assert_eq!(status, StatusCode::OK, "{id}: {body}");
+        }
+    }
+    let audits = f.audit_count().await;
+    let delete = json!({"repositoryId":rid,"kind":"DELETE_KIND_DATASET","id":"D","confirmed":true});
+    let (status, body) = f.call("Delete", "Bearer manager", delete.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.audit_count().await, audits + 1);
+    let (_, body) = f.call("Delete", "Bearer manager", delete).await;
+    assert_eq!(body["code"], "not_found", "{body}");
+    assert_eq!(f.audit_count().await, audits + 1);
+
+    let state: Value = sqlx::query_scalar(&format!(
+        "SELECT state FROM {}.git_tracker_repositories WHERE id=$1",
+        f.schema
+    ))
+    .bind(uuid::Uuid::parse_str(rid).unwrap())
+    .fetch_one(&f.admin)
+    .await
+    .unwrap();
+    assert_eq!(state["records"]["baseline-deleted"]["removed"]["D"], true);
+    for id in ["baseline-new", "pr-new", "pr-deleted", "nonholder"] {
+        assert!(state["records"][id]["removed"].get("D").is_none(), "{id}");
+    }
+    let (_, body) = f.call("Upload", &token, json!({"context":context("baseline-deleted", false),"dataset":dataset("D"),"rows":[{"id":"two","values":{"bytes":"2"}}]})).await;
+    assert_eq!(body["code"], "failed_precondition", "{body}");
+    for (id, expected) in [
+        ("pr-new", "COMPARISON_STATUS_NEW"),
+        ("pr-deleted", "COMPARISON_STATUS_BASELINE_DELETED"),
+        ("nonholder", "COMPARISON_STATUS_NEW"),
+    ] {
+        let (status, body) = f.call("Upload", &token, json!({"context":context(id, id.starts_with("pr-")),"dataset":dataset("D"),"rows":[{"id":"one","values":{"bytes":"2"}}]})).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+        if id.starts_with("pr-") {
+            assert_eq!(
+                body["comparisons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["datasetId"] == "D")
+                    .unwrap()["status"],
+                expected,
+                "{id}: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
 async fn postgres_explicit_comparison_prefers_completed_branch_in_either_order() {
     for branch_first in [true, false] {
         let fixture = fixture().await;
