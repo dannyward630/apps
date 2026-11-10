@@ -1157,6 +1157,54 @@ async fn provider_retry_after_is_bounded_and_short_waits_are_exact() {
     assert_eq!(mock.count("/v10/projects"), calls);
 }
 #[tokio::test(flavor = "multi_thread")]
+async fn reacquiring_a_lease_keeps_a_provider_rate_limit_only() {
+    let home = tempfile::tempdir().unwrap();
+    let state = Arc::new(Mutex::new(Api::default()));
+    let (mock, core) = logged_in(home.path(), &state, Owner::Foreground).await;
+    vercel_connection(&core).await.unwrap();
+    let base = api(state.clone());
+    mock.set(move |r| {
+        if r.route() == "/v10/projects" {
+            Reply::text(429, "").with_header("Retry-After", "3600")
+        } else {
+            base(r)
+        }
+    });
+    let now = time::now();
+    // The first lease acquisition still polls in the same cycle.
+    core.cycle(now).await;
+    assert_eq!(mock.count("/v10/projects"), 1);
+    let original = core.status(true).unwrap().connections[0]
+        .next_attempt_at
+        .unwrap()
+        .seconds;
+    assert!(original >= now + 3600);
+    core.release_all().await;
+    core.heartbeat(now + 120).await.unwrap();
+    let connection = &core.status(true).unwrap().connections[0];
+    assert!(connection.lease_held);
+    assert_eq!(connection.next_attempt_at.unwrap().seconds, original);
+    core.cycle(now + 120).await;
+    assert_eq!(mock.count("/v10/projects"), 1);
+
+    // A future ordinary failure backoff may be brought forward on acquisition.
+    let db = rusqlite::Connection::open(home.path().join("anydash/data/collector.db")).unwrap();
+    db.execute(
+        "UPDATE connections SET failure_class = ?1, next_attempt = ?2 WHERE id = 'c1'",
+        rusqlite::params![pb::FailureClass::ProviderError as i32, now + 3600],
+    )
+    .unwrap();
+    drop(db);
+    core.release_all().await;
+    core.heartbeat(now + 240).await.unwrap();
+    let connection = &core.status(true).unwrap().connections[0];
+    assert!(connection.lease_held);
+    assert_eq!(connection.next_attempt_at.unwrap().seconds, now + 240);
+    mock.set(api(state));
+    core.cycle(now + 240).await;
+    assert_eq!(mock.count("/v10/projects"), 2);
+}
+#[tokio::test(flavor = "multi_thread")]
 async fn offline_buffering_update_required_and_chunked_upload() {
     let home = tempfile::tempdir().unwrap();
     let state = Arc::new(Mutex::new(Api {

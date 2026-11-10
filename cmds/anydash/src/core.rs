@@ -1273,7 +1273,9 @@ impl Core {
                     tracing::info!(event = "lease_acquired", connection_id = %row.id, epoch = l.epoch);
                     row.lease_held = true;
                     row.lease_epoch = l.epoch;
-                    row.next_attempt = row.next_attempt.min(now);
+                    if !Self::rate_limit_pending(&row, now) {
+                        row.next_attempt = row.next_attempt.min(now);
+                    }
                 }
             }
             if a.refresh_requested {
@@ -1293,11 +1295,14 @@ impl Core {
         }
         Ok(response)
     }
+    const fn rate_limit_pending(row: &ConnectionRow, now: i64) -> bool {
+        row.failure_class == FailureClass::RateLimited as i32 && row.next_attempt > now
+    }
     /// A manual refresh makes the connection due now, unless a provider rate limit applies.
     fn manual_due(row: &mut ConnectionRow, now: i64) {
-        let rate_limited =
-            row.failure_class == FailureClass::RateLimited as i32 && row.next_attempt > now;
-        if !rate_limited && schedule::manual_wait(row.last_manual, now).is_none() {
+        if !Self::rate_limit_pending(row, now)
+            && schedule::manual_wait(row.last_manual, now).is_none()
+        {
             row.next_attempt = now;
             row.last_manual = now;
         }
