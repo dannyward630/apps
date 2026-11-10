@@ -532,12 +532,30 @@ async fn deletion_deadlines_and_account_data_deletion() {
         0
     );
     // AnyDash data deletion needs confirmation and keeps the account.
+    let personal_dash = f
+        .ok(
+            &user,
+            "DashboardService/CreateDashboard",
+            json!({"requestId":id(),"spaceId":a.personal,"name":"Board"}),
+        )
+        .await["dashboard"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     f.ok(
         &user,
-        "DashboardService/CreateDashboard",
-        json!({"requestId":id(),"spaceId":a.personal,"name":"Board"}),
+        "DashboardService/DeleteDashboard",
+        json!({"dashboardId":personal_dash}),
     )
     .await;
+    let personal_before = f
+        .ok(
+            &user,
+            "AccountService/ListActivity",
+            json!({"spaceId":a.personal}),
+        )
+        .await;
+    assert!(!personal_before["events"].as_array().unwrap().is_empty());
     f.fail(
         &user,
         "AccountService/DeleteAccountData",
@@ -590,6 +608,18 @@ async fn deletion_deadlines_and_account_data_deletion() {
         .map(|e| e["kind"].as_str().unwrap())
         .collect();
     assert_eq!(kinds, ["ACTIVITY_KIND_ACCOUNT_DATA_DELETION_REQUESTED"]);
+    let personal_after = f
+        .ok(
+            &user,
+            "AccountService/ListActivity",
+            json!({"spaceId":a.personal}),
+        )
+        .await;
+    assert!(
+        personal_after["events"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
     // The user can start again.
     let (fresh, _, _) = f.enroll(&a, "again", &d2).await;
     assert_ne!(fresh, d2);
@@ -735,6 +765,19 @@ async fn tenant_states_and_user_withdrawal() {
         .as_str()
         .unwrap()
         .to_owned();
+    f.ok(
+        &m,
+        "DashboardService/CreateDashboard",
+        json!({"requestId":id(),"spaceId":member.personal,"name":"Personal"}),
+    )
+    .await;
+    let personal_events = format!(
+        "SELECT count(*) FROM audit_events WHERE subject_user_id='{}' AND tenant_id='{}'",
+        member.user_id, member.personal
+    );
+    let team_events = format!("SELECT count(*) FROM audit_events WHERE tenant_id='{team}'");
+    assert!(f.count(&personal_events).await > 0);
+    assert!(f.count(&team_events).await > 0);
     // BLOCKED and DELETING stop all activity in the space: viewing, editing and uploads.
     for state in [
         "TENANT_STATE_BLOCKED",
@@ -778,8 +821,10 @@ async fn tenant_states_and_user_withdrawal() {
     f.set_state(&team, "TENANT_STATE_UNKNOWN");
     f.job(Job::TenantLifecycle).await;
     assert_eq!(
-        f.count("SELECT count(*) FROM dashboards WHERE deleted_at IS NULL")
-            .await,
+        f.count(&format!(
+            "SELECT count(*) FROM dashboards WHERE id='{dash}' AND deleted_at IS NULL"
+        ))
+        .await,
         1
     );
     f.set_state(&team, "TENANT_STATE_ACTIVE");
@@ -818,6 +863,7 @@ async fn tenant_states_and_user_withdrawal() {
         data["data"]["sharingEndReason"],
         "SHARING_END_REASON_OWNER_DATA_DELETED"
     );
+    let team_count_before = f.count(&team_events).await;
     f.job(Job::Deletion).await;
     assert_eq!(
         f.count(&format!(
@@ -843,6 +889,8 @@ async fn tenant_states_and_user_withdrawal() {
         .await,
         0
     );
+    assert_eq!(f.count(&personal_events).await, 0);
+    assert_eq!(f.count(&team_events).await, team_count_before);
     // The withdrawal is enqueued once.
     f.job(Job::TenantLifecycle).await;
     assert_eq!(

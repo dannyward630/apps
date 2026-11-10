@@ -398,8 +398,13 @@ pub async fn purge(
     .bind(cutoff)
     .execute(&mut *db)
     .await?;
-    // Activity visible only to the user; the deletion request event itself remains until expiry.
-    sqlx::query("DELETE FROM audit_events WHERE subject_user_id=$1 AND tenant_id IS NULL AND (occurred_at<$2 OR $3)")
+    // Resolve the personal tenant before withdrawal removes the account mapping. Team-space
+    // activity stays visible to the team, while the deletion request event remains until expiry.
+    sqlx::query(
+        "DELETE FROM audit_events WHERE subject_user_id=$1 \
+         AND (tenant_id IS NULL OR tenant_id=(SELECT personal_tenant_id FROM accounts WHERE user_id=$1)) \
+         AND (occurred_at<$2 OR $3)",
+    )
         .bind(user)
         .bind(requested)
         .bind(withdrawal)
