@@ -916,6 +916,141 @@ async fn tenant_states_and_user_withdrawal() {
     f.cleanup().await;
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn reconnect_after_withdrawal_remaps_subject_and_queues_old_data() {
+    let f = Fixture::setup().await;
+    let old = f.person("old");
+    let new = f.person("new");
+    let team = f.team("Shared", &[(&old, &["ROLE_OWNER"])]);
+    f.connect(&old).await;
+    let caller = f.user(&old);
+    let (device, _, _) = f.enroll(&old, "old device", "").await;
+    let personal_dashboard = f
+        .ok(
+            &caller,
+            "DashboardService/CreateDashboard",
+            json!({"requestId":id(),"spaceId":old.personal,"name":"Old personal"}),
+        )
+        .await["dashboard"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.ok(
+        &caller,
+        "DashboardService/CreateDashboard",
+        json!({"requestId":id(),"spaceId":team,"name":"Shared"}),
+    )
+    .await;
+    let team_events = format!("SELECT count(*) FROM audit_events WHERE tenant_id='{team}'");
+    let team_count = f.count(&team_events).await;
+    assert!(team_count > 0);
+
+    // Delcore re-registers the same Logto subject as a new user before the hourly sweep.
+    f.mock.lock().unwrap().users.insert(
+        old.subject.clone(),
+        support::Person {
+            subject: old.subject.clone(),
+            user_id: new.user_id.clone(),
+            personal: new.personal.clone(),
+        },
+    );
+    let connect = json!({"delcoreAccessToken":f.token(&old,support::DELCORE_RESOURCE)});
+    f.fail(
+        &caller,
+        "AccountService/ConnectAccount",
+        connect.clone(),
+        "ERROR_REASON_INTERNAL",
+    )
+    .await;
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM accounts WHERE user_id='{}' AND logto_subject='{}'",
+            old.user_id, old.subject
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        f.count("SELECT count(*) FROM deletion_jobs WHERE kind=5")
+            .await,
+        0
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM devices WHERE id='{device}' AND deleted_at IS NULL"
+        ))
+        .await,
+        1
+    );
+
+    f.set_state(&old.personal, "TENANT_STATE_DELETED");
+    let connected = f
+        .ok(&caller, "AccountService/ConnectAccount", connect.clone())
+        .await;
+    assert_eq!(connected["account"]["userId"], new.user_id);
+    assert_eq!(
+        f.ok(&caller, "AccountService/GetAccount", json!({})).await["account"]["userId"],
+        new.user_id
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM deletion_jobs WHERE kind=5 AND user_id='{}' AND tenant_id='{}' AND completed_at IS NULL",
+            old.user_id, old.personal
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM devices WHERE id='{device}' AND deleted_at IS NOT NULL"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        f.count(&format!("SELECT count(*) FROM dashboards WHERE id='{personal_dashboard}' AND deleted_at IS NOT NULL"))
+            .await,
+        1
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM accounts WHERE user_id='{}' AND logto_subject<>'{}' AND data_deleted_at IS NOT NULL",
+            old.user_id, old.subject
+        ))
+        .await,
+        1
+    );
+    assert_eq!(f.count(&team_events).await, team_count);
+    f.ok(&caller, "AccountService/ConnectAccount", connect)
+        .await;
+    f.job(Job::TenantLifecycle).await;
+    assert_eq!(
+        f.count("SELECT count(*) FROM deletion_jobs WHERE kind=5")
+            .await,
+        1
+    );
+    f.job(Job::Deletion).await;
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM accounts WHERE user_id='{}'",
+            old.user_id
+        ))
+        .await,
+        0
+    );
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM audit_events WHERE tenant_id='{}'",
+            old.personal
+        ))
+        .await,
+        0
+    );
+    assert_eq!(f.count(&team_events).await, team_count);
+    f.cleanup().await;
+}
+
 /// Layout validation names the violating layout field in `ErrorDetail.field` for both
 /// `AddWidget` and `UpdateWidgetLayout`.
 #[tokio::test]

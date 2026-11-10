@@ -7,6 +7,7 @@ use crate::{
     call::User,
     rate, validate,
 };
+use server_common::authority::TenantState;
 use sqlx::Row;
 
 const ACTIVITY_DAYS: i64 = 30;
@@ -141,15 +142,58 @@ pub async fn connect_account(
         validate::id("personal_space_id", &tenant.id).map_err(|_| ApiError::dependency())?;
     call.note(|a| a.user = Some(user_id));
     let mut tx = s.db.begin().await?;
-    let other: Option<Uuid> =
-        sqlx::query_scalar("SELECT user_id FROM accounts WHERE logto_subject=$1 AND user_id<>$2")
-            .bind(&subject)
-            .bind(user_id)
-            .fetch_optional(&mut *tx)
+    let other: Option<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT user_id,personal_tenant_id FROM accounts WHERE logto_subject=$1 AND user_id<>$2 FOR UPDATE",
+    )
+    .bind(&subject)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((old_user, old_tenant)) = other {
+        if s.delcore
+            .states(&[old_tenant.to_string()])
+            .await?
+            .as_slice()
+            != [TenantState::Deleted]
+        {
+            tracing::error!("Logto subject is already mapped to another Delcore user");
+            return Err(ApiError::internal());
+        }
+        let queued: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM deletion_jobs WHERE kind=$1 AND user_id=$2)",
+        )
+        .bind(DeletionKind::Withdrawal as i16)
+        .bind(old_user)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !queued {
+            block_user_data(
+                &mut tx,
+                old_user,
+                call.now,
+                &call.correlation,
+                call.client_kind.to_i32(),
+                SharingEndReason::OwnerDataDeleted,
+            )
             .await?;
-    if other.is_some() {
-        tracing::error!("Logto subject is already mapped to another Delcore user");
-        return Err(ApiError::internal());
+            enqueue_deletion(
+                &mut tx,
+                DeletionKind::Withdrawal,
+                None,
+                Some(old_user),
+                Some(old_tenant),
+                call.now,
+            )
+            .await?;
+        }
+        // The old row must remain for the deletion worker, but its non-null unique subject
+        // cannot keep the new identity from connecting. A fresh ID avoids tombstone collisions.
+        sqlx::query("UPDATE accounts SET logto_subject=$2,updated_at=$3 WHERE user_id=$1")
+            .bind(old_user)
+            .bind(format!("withdrawn:{old_user}:{}", crate::new_id()))
+            .bind(call.now)
+            .execute(&mut *tx)
+            .await?;
     }
     sqlx::query(
         "INSERT INTO accounts(user_id,logto_subject,personal_tenant_id,created_at,updated_at) VALUES($1,$2,$3,$4,$4) \

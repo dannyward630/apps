@@ -509,6 +509,18 @@ async fn tenant_lifecycle(s: &Server, now: DateTime<Utc>, correlation: &str) -> 
             continue;
         }
         let mut tx = s.db.begin().await?;
+        crate::rpc::lock_account(&mut tx, *user).await?;
+        // ConnectAccount can enqueue this withdrawal while the sweep is waiting for the row.
+        let queued: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM deletion_jobs WHERE kind=$1 AND user_id=$2)",
+        )
+        .bind(DeletionKind::Withdrawal as i16)
+        .bind(user)
+        .fetch_one(&mut *tx)
+        .await?;
+        if queued {
+            continue;
+        }
         crate::rpc::account::block_user_data(
             &mut tx,
             *user,
