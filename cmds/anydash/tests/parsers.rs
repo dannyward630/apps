@@ -876,6 +876,96 @@ fn bucket_versions_increase_and_vanished_sources_become_zero() {
     );
 }
 #[test]
+fn partial_retention_boundary_bucket_stays_pruned_across_syncs() {
+    let home = tempfile::tempdir().unwrap();
+    let settings = support::settings(home.path(), &[]);
+    let store = store(home.path());
+    let first_now = now() + 123;
+    let cutoff = first_now - time::RETENTION_SECONDS;
+    assert!(time::bucket_start(cutoff) < cutoff);
+    support::write(
+        &home.path().join(".claude/projects/p/boundary.jsonl"),
+        &format!(
+            "{}\n",
+            claude(&time::rfc3339(cutoff + 10), "boundary", "m1", None, 3, 2)
+        ),
+    );
+
+    assert_eq!(
+        scan::sync(&settings, &store, first_now)
+            .unwrap()
+            .changed_buckets,
+        0
+    );
+    assert_eq!(store.pending_buckets(10).unwrap().len(), 0);
+    // The retained record still contributes to the partial bucket, but the bucket itself
+    // must not be recreated after pruning.
+    assert!(store.aggregate().unwrap().contains_key(&(
+        LocalTool::ClaudeCode as i32,
+        "claude-opus-5-5".into(),
+        time::bucket_start(cutoff),
+    )));
+    for bucket in store.pending_buckets(10).unwrap() {
+        store.mark_uploaded(&bucket).unwrap();
+    }
+    assert_eq!(
+        scan::sync(&settings, &store, first_now + 60)
+            .unwrap()
+            .changed_buckets,
+        0
+    );
+    assert_eq!(store.pending_buckets(10).unwrap().len(), 0);
+}
+#[test]
+fn retained_bucket_is_uploaded_once_across_retention_syncs() {
+    let home = tempfile::tempdir().unwrap();
+    let settings = support::settings(home.path(), &[]);
+    let store = store(home.path());
+    let first_now = now() + 123;
+    let cutoff = first_now - time::RETENTION_SECONDS;
+    let retained_bucket = time::bucket_start(cutoff + 1000);
+    assert!(retained_bucket >= cutoff);
+    support::write(
+        &home.path().join(".claude/projects/p/retained.jsonl"),
+        &format!(
+            "{}\n",
+            claude(&time::rfc3339(cutoff + 1000), "retained", "m2", None, 5, 4)
+        ),
+    );
+
+    assert_eq!(
+        scan::sync(&settings, &store, first_now)
+            .unwrap()
+            .changed_buckets,
+        1
+    );
+    let pending = store.pending_buckets(10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].bucket, retained_bucket);
+    let version = pending[0].version;
+    store.mark_uploaded(&pending[0]).unwrap();
+    assert_eq!(
+        scan::sync(&settings, &store, first_now + 60)
+            .unwrap()
+            .changed_buckets,
+        0
+    );
+    assert_eq!(store.pending_buckets(10).unwrap().len(), 0);
+    let retained = store.aggregate().unwrap();
+    assert_eq!(
+        retained[&(
+            LocalTool::ClaudeCode as i32,
+            "claude-opus-5-5".into(),
+            retained_bucket
+        )]
+            .tokens
+            .input,
+        5
+    );
+    // A later refresh must not silently advance the already uploaded version.
+    assert_eq!(store.refresh_buckets(version + 1, cutoff + 60).unwrap(), 0);
+}
+#[test]
 fn backfill_reads_only_the_last_90_days() {
     let home = tempfile::tempdir().unwrap();
     support::write(

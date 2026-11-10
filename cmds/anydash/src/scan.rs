@@ -240,8 +240,7 @@ pub fn sync(settings: &Settings, store: &Store, now: i64) -> Result<SyncReport> 
         });
     }
     store.prune(cutoff)?;
-    report.changed_buckets =
-        store.refresh_buckets(time::now_micros(), time::bucket_start(cutoff))?;
+    report.changed_buckets = store.refresh_buckets(time::now_micros(), cutoff)?;
     Ok(report)
 }
 #[expect(

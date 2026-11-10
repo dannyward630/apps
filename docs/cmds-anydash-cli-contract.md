@@ -103,7 +103,7 @@ The local store is SQLite `<data dir>/collector.db` in WAL mode with a schema ve
 
 The collector migrates schema version 1 to version 2 in one transaction and keeps existing rows. Version 2 adds path indexes for Claude Code records and session starts, so re-reading a file can remove its old rows by path without scanning those tables. A newly discovered file has no old rows to remove.
 
-- Offline buffer: the collector keeps aggregating while offline or while uploads are rejected, keeps up to 90 days of buckets and uploads them automatically after reconnecting. Buckets older than 90 days are pruned and not recovered.
+- Offline buffer: the collector keeps aggregating while offline or while uploads are rejected, keeps up to 90 days of buckets and uploads them automatically after reconnecting. A bucket whose 15-minute start is before the exact 90-day cutoff is pruned and never stored again, even if records within that bucket are newer than the cutoff.
 - The store holds only token counts, model identifiers, timestamps, hashed session identifiers and paths. It never stores prompts or response bodies. Paths and session identifiers are never uploaded.
 - Original Codex and Claude Code session files are never modified or deleted.
 
