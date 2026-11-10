@@ -57,6 +57,9 @@ type UsageQuery struct {
 	// ResourceIDs.
 	Filter *mcpav1.CallFilter
 	Page   Page
+	// UsageCursor is set only for GetUsage's position-based cursor. Page.After
+	// carries a legacy UUID cursor until the compatibility period ends.
+	UsageCursor *store.UsageCursor
 }
 
 // UsageReader reads call records and daily aggregates. The data plane layer

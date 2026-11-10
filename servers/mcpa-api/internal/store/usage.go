@@ -363,16 +363,37 @@ func SumUsage(ctx context.Context, db DB, f UsageFilter) (UsageTotals, error) {
 	return t, err
 }
 
-// ListUsageRows returns aggregate buckets, newest day first. after is the
-// cursor (uuid.Nil for the first page).
-func ListUsageRows(ctx context.Context, db DB, f UsageFilter, after uuid.UUID, limit int) ([]UsageRow, error) {
-	args := append(filterArgs(f), after, limit)
+// UsageCursor identifies a daily aggregate's logical position, even after
+// the row is deleted.
+type UsageCursor struct {
+	Day time.Time
+	ID  uuid.UUID
+}
+
+// ResolveUsageCursor supports canonical UUID cursors issued before GetUsage
+// switched to position-based cursors. A missing row is invalid input to the
+// caller; it must not silently end the list.
+func ResolveUsageCursor(ctx context.Context, db DB, f UsageFilter, id uuid.UUID) (UsageCursor, error) {
+	var cursor UsageCursor
+	err := db.QueryRow(ctx, `SELECT day, id FROM usage_daily
+		WHERE tenant_id = $1 AND resource_id = ANY($2) AND id = $3`, f.TenantID, f.ResourceIDs, id).Scan(&cursor.Day, &cursor.ID)
+	return cursor, err
+}
+
+// ListUsageRows returns aggregate buckets, newest day first. The cursor
+// carries the last row's position, independent of that row's continued life.
+func ListUsageRows(ctx context.Context, db DB, f UsageFilter, after *UsageCursor, limit int) ([]UsageRow, error) {
+	var day any
+	id := uuid.Nil
+	if after != nil {
+		day, id = after.Day, after.ID
+	}
+	args := append(filterArgs(f), day, id, limit)
 	rows, err := db.Query(ctx, `SELECT id, day, resource_id, model, provider, call_key_id, status, call_count, request_bytes, response_bytes
 		FROM usage_daily
 		WHERE `+usageWhere+`
-			AND ($9 = '00000000-0000-0000-0000-000000000000'::uuid
-				OR (day, id) < (SELECT c.day, c.id FROM usage_daily c WHERE c.id = $9))
-		ORDER BY day DESC, id DESC LIMIT $10`, args...)
+			AND ($9::date IS NULL OR (day, id) < ($9::date, $10::uuid))
+		ORDER BY day DESC, id DESC LIMIT $11`, args...)
 	if err != nil {
 		return nil, err
 	}

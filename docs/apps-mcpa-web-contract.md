@@ -51,6 +51,8 @@ TypeScript, React and Rsbuild follow the repository frontend stack. Node.js 24 r
 
 The console never displays request or response bodies, because the server stores none. Estimated USD values are labeled as estimates and shown with at least two and at most six fraction digits, rounded half up. The API returns exact decimals, so this rounding is display-only.
 
+The usage screen passes the API's opaque `next_after_id` back as `page.after_id` when moving to the next page. Previous returns to the earlier cursor held in the console. The console does not decode usage cursors.
+
 Byte counts use binary units (B to PiB) and round to one fraction digit below 100 and none from 100. The value is rounded before the unit is chosen, so a count that rounds to 1024 of a unit is shown in the next unit (1,048,575 bytes shows as `1.0 MiB`). A budget meter is full whenever the budget is exhausted, including a zero limit.
 
 ### Interaction rules

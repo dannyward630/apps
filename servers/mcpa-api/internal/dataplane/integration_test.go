@@ -148,6 +148,128 @@ func TestIntegrationUsageFilterValidation(t *testing.T) {
 	}
 }
 
+func TestIntegrationUsageCursorSurvivesCheckpointMove(t *testing.T) {
+	e := newEnv(t)
+	resourceID := e.resource("usage-cursor-checkpoint")
+	_, keyID := e.callKey("owner", resourceID)
+	resource := uuid.MustParse(resourceID)
+	key := uuid.MustParse(keyID)
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	checkpoint := func(callID uuid.UUID, day time.Time, seq int64, final bool, bytes, delta int64) {
+		t.Helper()
+		_, err := e.db.ApplyCheckpoint(e.ctx, store.Checkpoint{
+			CallID: callID, TenantID: e.tenant, ResourceID: resource, CallKeyID: key,
+			Provider: mcpav1.Provider_PROVIDER_GEMINI, Model: callID.String(), Format: mcpav1.EndpointFormat_ENDPOINT_FORMAT_OPENAI,
+			StartTime: day, Seq: seq, DeltaRequestBytes: delta, RequestBytes: bytes,
+			Final: final, Status: mcpav1.CallStatus_CALL_STATUS_SUCCEEDED,
+			OutboxID: store.NewID(), RequestKey: store.NewID(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	newest, moving, oldest := store.NewID(), store.NewID(), store.NewID()
+	checkpoint(newest, today, 1, true, 10, 10)
+	checkpoint(moving, today.AddDate(0, 0, -1), 1, false, 10, 10)
+	checkpoint(oldest, today.AddDate(0, 0, -2), 1, true, 10, 10)
+	page := func(after string) *mcpav1.GetUsageResponse {
+		t.Helper()
+		return mustDo(e, "owner", e.rpc.GetUsage, &mcpav1.GetUsageRequest{TenantId: e.tenant,
+			Filter: &mcpav1.CallFilter{ResourceIds: []string{resourceID}}, Page: &mcpav1.Page{Size: 2, AfterId: after}})
+	}
+	first := page("")
+	if len(first.GetRows()) != 2 || first.GetNextAfterId() == "" || first.GetRows()[1].GetStatus() != mcpav1.CallStatus_CALL_STATUS_UNSPECIFIED {
+		t.Fatalf("first page: %+v", first)
+	}
+	var legacyID uuid.UUID
+	if err := e.db.Pool.QueryRow(e.ctx, `SELECT id FROM usage_daily WHERE resource_id = $1 AND model = $2`, resource, moving.String()).Scan(&legacyID); err != nil {
+		t.Fatal(err)
+	}
+	legacyPage := page(legacyID.String())
+	if len(legacyPage.GetRows()) != 1 || legacyPage.GetRows()[0].GetModel() != oldest.String() || legacyPage.GetNextAfterId() != "" {
+		t.Fatalf("existing legacy cursor: %+v", legacyPage)
+	}
+	checkpoint(moving, today.AddDate(0, 0, -1), 2, true, 10, 0)
+	if got := e.scalar(`SELECT count(*) FROM usage_daily WHERE id = $1`, legacyID); got != 0 {
+		t.Fatalf("moved bucket still exists: %d", got)
+	}
+	second := page(first.GetNextAfterId())
+	if len(second.GetRows()) != 1 || second.GetRows()[0].GetModel() != oldest.String() || second.GetNextAfterId() != "" {
+		t.Fatalf("page after moved bucket: %+v", second)
+	}
+	if first.GetRows()[0].GetModel() == second.GetRows()[0].GetModel() || first.GetRows()[1].GetModel() == second.GetRows()[0].GetModel() {
+		t.Fatalf("duplicate row across pages: first=%+v second=%+v", first.GetRows(), second.GetRows())
+	}
+	for _, raw := range []string{legacyID.String(), store.NewID().String(), "bad-cursor", first.GetNextAfterId()[:12]} {
+		_, err := do(e, "owner", e.rpc.GetUsage, &mcpav1.GetUsageRequest{TenantId: e.tenant,
+			Filter: &mcpav1.CallFilter{ResourceIds: []string{resourceID}}, Page: &mcpav1.Page{Size: 2, AfterId: raw}})
+		var connectErr *connect.Error
+		if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeInvalidArgument {
+			t.Fatalf("cursor %q error: %v", raw, err)
+		}
+		found := false
+		for _, detail := range connectErr.Details() {
+			value, detailErr := detail.Value()
+			if typed, ok := value.(*mcpav1.ErrorDetail); detailErr == nil && ok && typed.GetReason() == mcpav1.ErrorReason_ERROR_REASON_INVALID_INPUT {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("cursor %q lacks INVALID_INPUT detail: %v", raw, err)
+		}
+	}
+	_, err := do(e, "invoker", e.rpc.GetUsage, &mcpav1.GetUsageRequest{TenantId: e.tenant, Page: &mcpav1.Page{AfterId: legacyID.String()}})
+	var missingErr *connect.Error
+	if !errors.As(err, &missingErr) || missingErr.Code() != connect.CodeInvalidArgument {
+		t.Fatalf("missing legacy cursor without readable resources: %v", err)
+	}
+	_, err = do(e, "owner", e.rpc.ListCallRecords, &mcpav1.ListCallRecordsRequest{TenantId: e.tenant, Page: &mcpav1.Page{AfterId: first.GetNextAfterId()}})
+	var connectErr *connect.Error
+	if !errors.As(err, &connectErr) || connectErr.Code() != connect.CodeInvalidArgument {
+		t.Fatalf("ListCallRecords accepted a usage cursor: %v", err)
+	}
+}
+
+func TestIntegrationUsageCursorSurvivesRetention(t *testing.T) {
+	e := newEnv(t)
+	resourceID := e.resource("usage-cursor-retention")
+	_, keyID := e.callKey("owner", resourceID)
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	old := today.AddDate(-1, -2, 0)
+	older := today.AddDate(-1, -3, 0)
+	seed := func(day time.Time) {
+		t.Helper()
+		_, err := e.db.ApplyCheckpoint(e.ctx, store.Checkpoint{
+			CallID: store.NewID(), TenantID: e.tenant, ResourceID: uuid.MustParse(resourceID), CallKeyID: uuid.MustParse(keyID),
+			Provider: mcpav1.Provider_PROVIDER_GEMINI, Model: day.Format("2006-01-02"), Format: mcpav1.EndpointFormat_ENDPOINT_FORMAT_OPENAI,
+			StartTime: day, Seq: 1, DeltaRequestBytes: 1, RequestBytes: 1, Final: true,
+			Status: mcpav1.CallStatus_CALL_STATUS_SUCCEEDED, OutboxID: store.NewID(), RequestKey: store.NewID(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(old)
+	seed(older)
+	first := mustDo(e, "owner", e.rpc.GetUsage, &mcpav1.GetUsageRequest{TenantId: e.tenant,
+		Filter: &mcpav1.CallFilter{ResourceIds: []string{resourceID}}, Page: &mcpav1.Page{Size: 1}})
+	if len(first.GetRows()) != 1 || first.GetNextAfterId() == "" {
+		t.Fatalf("first retention page: %+v", first)
+	}
+	removed, err := store.PruneUsageDaily(e.ctx, e.db.Pool, today, 100)
+	if err != nil || removed != 2 {
+		t.Fatalf("prune removed %d rows: %v", removed, err)
+	}
+	// Retention removes every older row too. A late checkpoint can create a
+	// fresh older bucket after pruning, which the saved cursor must reach.
+	seed(older)
+	second := mustDo(e, "owner", e.rpc.GetUsage, &mcpav1.GetUsageRequest{TenantId: e.tenant,
+		Filter: &mcpav1.CallFilter{ResourceIds: []string{resourceID}}, Page: &mcpav1.Page{Size: 1, AfterId: first.GetNextAfterId()}})
+	if len(second.GetRows()) != 1 || second.GetRows()[0].GetModel() != older.Format("2006-01-02") || second.GetNextAfterId() != "" {
+		t.Fatalf("page after retention: %+v", second)
+	}
+}
+
 func TestIntegrationModelCallFinishesDuringGracefulDrain(t *testing.T) {
 	e := newEnv(t)
 	id := e.resource("drain")

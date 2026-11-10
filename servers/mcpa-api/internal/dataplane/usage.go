@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	mcpav1 "github.com/delinoio/apps/protos/mcpa/v1"
@@ -68,11 +69,24 @@ func storeErr(err error) error {
 // a time range selects every day that overlaps it.
 func (u *UsageReader) GetUsage(ctx context.Context, q service.UsageQuery) (*mcpav1.GetUsageResponse, error) {
 	f := usageFilter(q)
+	cursor := q.UsageCursor
+	if q.Page.After != uuid.Nil {
+		// A legacy UUID cursor requires its original row. Resolve it only
+		// within the caller's authorized tenant and resources.
+		legacy, err := store.ResolveUsageCursor(ctx, u.db.Pool, f, q.Page.After)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, apperr.InvalidInput("page.after_id refers to a missing usage row")
+		}
+		if err != nil {
+			return nil, storeErr(err)
+		}
+		cursor = &legacy
+	}
 	totals, err := store.SumUsage(ctx, u.db.Pool, f)
 	if err != nil {
 		return nil, storeErr(err)
 	}
-	rows, err := store.ListUsageRows(ctx, u.db.Pool, f, q.Page.After, q.Page.Size+1)
+	rows, err := store.ListUsageRows(ctx, u.db.Pool, f, cursor, q.Page.Size+1)
 	if err != nil {
 		return nil, storeErr(err)
 	}
@@ -83,7 +97,8 @@ func (u *UsageReader) GetUsage(ctx context.Context, q service.UsageQuery) (*mcpa
 	}}
 	if len(rows) > q.Page.Size {
 		rows = rows[:q.Page.Size]
-		out.NextAfterId = rows[len(rows)-1].ID.String()
+		last := rows[len(rows)-1]
+		out.NextAfterId = service.EncodeUsageCursor(last.Day, last.ID)
 	}
 	for _, r := range rows {
 		out.Rows = append(out.Rows, &mcpav1.UsageRow{

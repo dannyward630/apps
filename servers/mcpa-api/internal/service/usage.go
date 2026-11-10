@@ -106,7 +106,7 @@ func (s *Service) GetUsage(ctx context.Context, req *connect.Request[mcpav1.GetU
 	if err != nil {
 		return nil, err
 	}
-	page, err := ParsePage(req.Msg.GetPage())
+	page, cursor, err := ParseUsagePage(req.Msg.GetPage())
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +118,9 @@ func (s *Service) GetUsage(ctx context.Context, req *connect.Request[mcpav1.GetU
 		return nil, err
 	}
 	if len(ids) == 0 {
+		if page.After != uuid.Nil {
+			return nil, apperr.InvalidInput("page.after_id refers to a missing usage row")
+		}
 		return connect.NewResponse(&mcpav1.GetUsageResponse{
 			Metadata: apperr.Metadata(ctx),
 			Summary:  &mcpav1.UsageSummary{TotalGib: pricing.GiB(0), EstimatedUsd: pricing.EstimateUSD(0)},
@@ -127,7 +130,7 @@ func (s *Service) GetUsage(ctx context.Context, req *connect.Request[mcpav1.GetU
 	if reader == nil {
 		return nil, apperr.Unimplemented("usage views are not available on this server")
 	}
-	resp, err := reader.GetUsage(ctx, UsageQuery{TenantID: req.Msg.GetTenantId(), ResourceIDs: ids, Filter: req.Msg.GetFilter(), Page: page})
+	resp, err := reader.GetUsage(ctx, UsageQuery{TenantID: req.Msg.GetTenantId(), ResourceIDs: ids, Filter: req.Msg.GetFilter(), Page: page, UsageCursor: cursor})
 	if err != nil {
 		return nil, err
 	}

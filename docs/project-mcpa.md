@@ -72,6 +72,7 @@ Server runtime rollout, infrastructure and deployment-specific monitoring settin
 
 - Connect over `mcpa.v1.McpaService` is the management interface. The console, interactive MCP sessions and Delcore personal keys use the same handlers and the same authorization rules. MCP exposes every management feature as a tool.
 - The console consumes the protocol through `@connectrpc/connect-query` and the private `@repo/protos` workspace. It holds no service credentials and no provider secrets beyond the input field that submits an API key once.
+- Usage pagination cursors belong to the API. The console passes them through unchanged, including after a daily aggregate bucket moves or expires.
 
 ### Repository and licensing
 

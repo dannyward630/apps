@@ -20,7 +20,7 @@ The Managed CPA console, interactive MCP sessions and automation that uses Delco
 
 - `ErrorDetail` is attached to every Connect error. It carries `reason` (`ErrorReason`), a safe `trace_id`, and `reauthentication_url`, which is set for `ERROR_REASON_MFA_REQUIRED`.
 - `Metadata` carries the `trace_id` and is the first field of every response.
-- `Page` bounds list requests. `size` defaults to 50 and is at most 200. `after_id` is the opaque `next_after_id` of the previous page; an empty `next_after_id` ends the list.
+- `Page` bounds list requests. `size` defaults to 50 and is at most 200. `after_id` is the opaque `next_after_id` of the previous page; an empty `next_after_id` ends the list. `GetUsage` uses a position cursor that remains valid if its aggregate row is deleted. For one release, it also accepts a canonical UUID cursor while that row exists. Other list RPCs continue to use UUID cursors.
 - Timestamps use `google.protobuf.Timestamp`. Monetary and GiB values are canonical decimal strings, never floats. Byte counts, call counts and latency are `int64`.
 - Identifiers are UUID v7 strings. Tenant, user and group IDs are Delcore IDs.
 
