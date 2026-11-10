@@ -213,10 +213,13 @@ func IsUnauthenticated(err error) bool {
 	return errors.As(err, &e) && e.Kind == KindUnauthenticated
 }
 
-func (c *Client) fail(rpc string, err error) error {
+func (c *Client) fail(ctx context.Context, rpc string, err error) error {
+	callerCancelled := errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
 	var de *Error
 	if errors.As(err, &de) {
-		c.metrics.RecordDelcoreFailure(rpc, obs.DelcoreUnavailable)
+		if !callerCancelled {
+			c.metrics.RecordDelcoreFailure(rpc, obs.DelcoreUnavailable)
+		}
 		de.RPC = rpc
 		return de
 	}
@@ -231,16 +234,26 @@ func (c *Client) fail(rpc string, err error) error {
 			}
 		}
 	}
+	var metricKind obs.DelcoreFailureKind
 	switch out.Code {
 	case connect.CodeUnavailable, connect.CodeDeadlineExceeded, connect.CodeUnknown, connect.CodeCanceled, connect.CodeResourceExhausted, connect.CodeInternal:
 		out.Kind = KindUnavailable
-		c.metrics.RecordDelcoreFailure(rpc, obs.DelcoreUnavailable)
+		metricKind = obs.DelcoreUnavailable
 	case connect.CodeUnauthenticated:
 		out.Kind = KindUnauthenticated
-		c.metrics.RecordDelcoreFailure(rpc, obs.DelcoreError)
+		metricKind = obs.DelcoreError
+		if rpc == "AuthorizeApiKey" && out.Reason == delcorev1.ErrorReason_ERROR_REASON_UNAUTHENTICATED {
+			metricKind = obs.DelcoreDenied
+		}
+	case connect.CodeInvalidArgument:
+		out.Kind = KindRejected
+		metricKind = obs.DelcoreDenied
 	default:
 		out.Kind = KindRejected
-		c.metrics.RecordDelcoreFailure(rpc, obs.DelcoreError)
+		metricKind = obs.DelcoreError
+	}
+	if !callerCancelled {
+		c.metrics.RecordDelcoreFailure(rpc, metricKind)
 	}
 	return out
 }
@@ -274,13 +287,13 @@ func (c *Client) Authorize(ctx context.Context, tenantID, userID string, capabil
 	if d, ok := c.authorizeCache.get(key); ok {
 		return d, nil
 	}
-	ctx, cancel := c.callCtx(ctx)
+	callCtx, cancel := c.callCtx(ctx)
 	defer cancel()
-	resp, err := c.m2m.Authorize(ctx, connect.NewRequest(&delcorev1.AuthorizeRequest{
+	resp, err := c.m2m.Authorize(callCtx, connect.NewRequest(&delcorev1.AuthorizeRequest{
 		TenantId: tenantID, UserId: userID, Capability: string(capability), Paid: paid,
 	}))
 	if err != nil {
-		return Decision{}, c.fail("Authorize", err)
+		return Decision{}, c.fail(ctx, "Authorize", err)
 	}
 	d := Decision{Allowed: resp.Msg.GetAllowed(), Reasons: resp.Msg.GetReasons()}
 	if d.Allowed {
@@ -311,13 +324,13 @@ func (c *Client) AuthorizeAPIKey(ctx context.Context, secret string, capability 
 	if d, ok := c.keyCache.get(key); ok {
 		return d, nil
 	}
-	ctx, cancel := c.callCtx(ctx)
+	callCtx, cancel := c.callCtx(ctx)
 	defer cancel()
-	resp, err := c.m2m.AuthorizeApiKey(ctx, connect.NewRequest(&delcorev1.AuthorizeApiKeyRequest{
+	resp, err := c.m2m.AuthorizeApiKey(callCtx, connect.NewRequest(&delcorev1.AuthorizeApiKeyRequest{
 		Secret: secret, Capability: string(capability), Paid: paid,
 	}))
 	if err != nil {
-		return KeyDecision{}, c.fail("AuthorizeApiKey", err)
+		return KeyDecision{}, c.fail(ctx, "AuthorizeApiKey", err)
 	}
 	m := resp.Msg
 	d := KeyDecision{
@@ -352,11 +365,11 @@ func (c *Client) TenantState(ctx context.Context, tenantID string) (delcorev1.Te
 // GetTenantStates returns the state of each requested tenant. A missing
 // entry maps to TENANT_STATE_UNSPECIFIED, which callers treat as inactive.
 func (c *Client) GetTenantStates(ctx context.Context, tenantIDs []string) (map[string]delcorev1.TenantState, error) {
-	ctx, cancel := c.callCtx(ctx)
+	callCtx, cancel := c.callCtx(ctx)
 	defer cancel()
-	resp, err := c.m2m.GetTenantStates(ctx, connect.NewRequest(&delcorev1.GetTenantStatesRequest{TenantIds: tenantIDs}))
+	resp, err := c.m2m.GetTenantStates(callCtx, connect.NewRequest(&delcorev1.GetTenantStatesRequest{TenantIds: tenantIDs}))
 	if err != nil {
-		return nil, c.fail("GetTenantStates", err)
+		return nil, c.fail(ctx, "GetTenantStates", err)
 	}
 	out := make(map[string]delcorev1.TenantState, len(tenantIDs))
 	for _, e := range resp.Msg.GetStates() {
@@ -368,11 +381,11 @@ func (c *Client) GetTenantStates(ctx context.Context, tenantIDs []string) (map[s
 // CheckTenantLifecycle returns the IDs whose deletion Delcore finalized.
 // Callers may pass at most 100 IDs.
 func (c *Client) CheckTenantLifecycle(ctx context.Context, tenantIDs []string) ([]string, error) {
-	ctx, cancel := c.callCtx(ctx)
+	callCtx, cancel := c.callCtx(ctx)
 	defer cancel()
-	resp, err := c.m2m.CheckTenantLifecycle(ctx, connect.NewRequest(&delcorev1.CheckTenantLifecycleRequest{TenantIds: tenantIDs}))
+	resp, err := c.m2m.CheckTenantLifecycle(callCtx, connect.NewRequest(&delcorev1.CheckTenantLifecycleRequest{TenantIds: tenantIDs}))
 	if err != nil {
-		return nil, c.fail("CheckTenantLifecycle", err)
+		return nil, c.fail(ctx, "CheckTenantLifecycle", err)
 	}
 	return resp.Msg.GetFinalizedTenantIds(), nil
 }
@@ -396,7 +409,7 @@ func (c *Client) BillingPeriod(ctx context.Context, tenantID string) (Period, er
 		return Period{}, err
 	}
 	if resp.GetPeriodStart() == nil || resp.GetPeriodEnd() == nil {
-		return Period{}, c.fail("ListMeterAggregates", connect.NewError(connect.CodeFailedPrecondition, errors.New("billing period bounds are missing")))
+		return Period{}, c.fail(ctx, "ListMeterAggregates", connect.NewError(connect.CodeFailedPrecondition, errors.New("billing period bounds are missing")))
 	}
 	p := Period{Start: resp.GetPeriodStart().AsTime(), End: resp.GetPeriodEnd().AsTime()}
 	c.periodCache.put(tenantID, p, c.ttl)
@@ -409,11 +422,11 @@ func (c *Client) ListMeterAggregates(ctx context.Context, req *delcorev1.ListMet
 	if req.GetServiceId() == "" {
 		req.ServiceId = c.serviceID
 	}
-	ctx, cancel := c.callCtx(ctx)
+	callCtx, cancel := c.callCtx(ctx)
 	defer cancel()
-	resp, err := c.m2m.ListMeterAggregates(ctx, connect.NewRequest(req))
+	resp, err := c.m2m.ListMeterAggregates(callCtx, connect.NewRequest(req))
 	if err != nil {
-		return nil, c.fail("ListMeterAggregates", err)
+		return nil, c.fail(ctx, "ListMeterAggregates", err)
 	}
 	return resp.Msg, nil
 }
@@ -425,11 +438,11 @@ func (c *Client) IngestEvent(ctx context.Context, requestKey string, event *delc
 	if event.GetServiceId() == "" {
 		event.ServiceId = c.serviceID
 	}
-	ctx, cancel := c.callCtx(ctx)
+	callCtx, cancel := c.callCtx(ctx)
 	defer cancel()
-	resp, err := c.m2m.IngestEvent(ctx, connect.NewRequest(&delcorev1.IngestEventRequest{RequestKey: requestKey, Event: event}))
+	resp, err := c.m2m.IngestEvent(callCtx, connect.NewRequest(&delcorev1.IngestEventRequest{RequestKey: requestKey, Event: event}))
 	if err != nil {
-		return nil, c.fail("IngestEvent", err)
+		return nil, c.fail(ctx, "IngestEvent", err)
 	}
 	return resp.Msg, nil
 }
@@ -454,7 +467,7 @@ func (c *Client) GetCurrentUser(ctx context.Context, userToken string) (CurrentU
 		resp, err := c.user.GetCurrentUser(callCtx, req)
 		cancel()
 		if err != nil {
-			return CurrentUser{}, c.fail("GetCurrentUser", err)
+			return CurrentUser{}, c.fail(ctx, "GetCurrentUser", err)
 		}
 		if out.UserID == "" {
 			out.UserID = resp.Msg.GetUserId()
@@ -463,12 +476,12 @@ func (c *Client) GetCurrentUser(ctx context.Context, userToken string) (CurrentU
 		after = resp.Msg.GetNextAfterId()
 		if after == "" {
 			if out.UserID == "" {
-				return CurrentUser{}, c.fail("GetCurrentUser", connect.NewError(connect.CodeInternal, errors.New("empty user ID")))
+				return CurrentUser{}, c.fail(ctx, "GetCurrentUser", connect.NewError(connect.CodeInternal, errors.New("empty user ID")))
 			}
 			return out, nil
 		}
 	}
-	return CurrentUser{}, c.fail("GetCurrentUser", connect.NewError(connect.CodeInternal, errors.New("too many pages")))
+	return CurrentUser{}, c.fail(ctx, "GetCurrentUser", connect.NewError(connect.CodeInternal, errors.New("too many pages")))
 }
 
 // ListGroups reads every group of a tenant, with member user IDs, using a
@@ -485,7 +498,7 @@ func (c *Client) ListGroups(ctx context.Context, userToken, tenantID string) ([]
 		resp, err := c.user.ListGroups(callCtx, req)
 		cancel()
 		if err != nil {
-			return nil, c.fail("ListGroups", err)
+			return nil, c.fail(ctx, "ListGroups", err)
 		}
 		out = append(out, resp.Msg.GetGroups()...)
 		after = resp.Msg.GetNextAfterId()
@@ -493,7 +506,7 @@ func (c *Client) ListGroups(ctx context.Context, userToken, tenantID string) ([]
 			return out, nil
 		}
 	}
-	return nil, c.fail("ListGroups", connect.NewError(connect.CodeInternal, errors.New("too many pages")))
+	return nil, c.fail(ctx, "ListGroups", connect.NewError(connect.CodeInternal, errors.New("too many pages")))
 }
 
 // Timestamp converts t for Delcore events.

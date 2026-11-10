@@ -305,6 +305,8 @@ const (
 	// The occurrence is older than the accepted lateness bound or the tenant
 	// reporting grace period has ended.
 	ErrorReason_ERROR_REASON_REPORTING_WINDOW_CLOSED ErrorReason = 14
+	// Delcore could not authenticate the calling service for AuthorizeApiKey.
+	ErrorReason_ERROR_REASON_SERVICE_AUTHENTICATION_FAILED ErrorReason = 15
 )
 
 // Enum value maps for ErrorReason.
@@ -325,23 +327,25 @@ var (
 		12: "ERROR_REASON_EVENT_NOT_FOUND",
 		13: "ERROR_REASON_EVENT_CANCELLED",
 		14: "ERROR_REASON_REPORTING_WINDOW_CLOSED",
+		15: "ERROR_REASON_SERVICE_AUTHENTICATION_FAILED",
 	}
 	ErrorReason_value = map[string]int32{
-		"ERROR_REASON_UNSPECIFIED":             0,
-		"ERROR_REASON_INVALID_INPUT":           1,
-		"ERROR_REASON_UNAUTHENTICATED":         2,
-		"ERROR_REASON_FORBIDDEN":               3,
-		"ERROR_REASON_CONFLICT":                4,
-		"ERROR_REASON_PRECONDITION":            5,
-		"ERROR_REASON_DEPENDENCY":              6,
-		"ERROR_REASON_STALE_REVISION":          7,
-		"ERROR_REASON_NO_MATCHING_METER":       8,
-		"ERROR_REASON_INVALID_ATTRIBUTE":       9,
-		"ERROR_REASON_CARDINALITY_EXCEEDED":    10,
-		"ERROR_REASON_EVENT_IDENTITY_CONFLICT": 11,
-		"ERROR_REASON_EVENT_NOT_FOUND":         12,
-		"ERROR_REASON_EVENT_CANCELLED":         13,
-		"ERROR_REASON_REPORTING_WINDOW_CLOSED": 14,
+		"ERROR_REASON_UNSPECIFIED":                   0,
+		"ERROR_REASON_INVALID_INPUT":                 1,
+		"ERROR_REASON_UNAUTHENTICATED":               2,
+		"ERROR_REASON_FORBIDDEN":                     3,
+		"ERROR_REASON_CONFLICT":                      4,
+		"ERROR_REASON_PRECONDITION":                  5,
+		"ERROR_REASON_DEPENDENCY":                    6,
+		"ERROR_REASON_STALE_REVISION":                7,
+		"ERROR_REASON_NO_MATCHING_METER":             8,
+		"ERROR_REASON_INVALID_ATTRIBUTE":             9,
+		"ERROR_REASON_CARDINALITY_EXCEEDED":          10,
+		"ERROR_REASON_EVENT_IDENTITY_CONFLICT":       11,
+		"ERROR_REASON_EVENT_NOT_FOUND":               12,
+		"ERROR_REASON_EVENT_CANCELLED":               13,
+		"ERROR_REASON_REPORTING_WINDOW_CLOSED":       14,
+		"ERROR_REASON_SERVICE_AUTHENTICATION_FAILED": 15,
 	}
 )
 
@@ -9369,7 +9373,7 @@ const file_delcore_v1_delcore_proto_rawDesc = "" +
 	"\x14TENANT_STATE_BLOCKED\x10\x02\x12\x19\n" +
 	"\x15TENANT_STATE_DELETING\x10\x03\x12\x18\n" +
 	"\x14TENANT_STATE_DELETED\x10\x04\x12\x18\n" +
-	"\x14TENANT_STATE_UNKNOWN\x10\x05*\x88\x04\n" +
+	"\x14TENANT_STATE_UNKNOWN\x10\x05*\xb8\x04\n" +
 	"\vErrorReason\x12\x1c\n" +
 	"\x18ERROR_REASON_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aERROR_REASON_INVALID_INPUT\x10\x01\x12 \n" +
@@ -9386,7 +9390,8 @@ const file_delcore_v1_delcore_proto_rawDesc = "" +
 	"$ERROR_REASON_EVENT_IDENTITY_CONFLICT\x10\v\x12 \n" +
 	"\x1cERROR_REASON_EVENT_NOT_FOUND\x10\f\x12 \n" +
 	"\x1cERROR_REASON_EVENT_CANCELLED\x10\r\x12(\n" +
-	"$ERROR_REASON_REPORTING_WINDOW_CLOSED\x10\x0e*W\n" +
+	"$ERROR_REASON_REPORTING_WINDOW_CLOSED\x10\x0e\x12.\n" +
+	"*ERROR_REASON_SERVICE_AUTHENTICATION_FAILED\x10\x0f*W\n" +
 	"\tPriceKind\x12\x1a\n" +
 	"\x16PRICE_KIND_UNSPECIFIED\x10\x00\x12\x14\n" +
 	"\x10PRICE_KIND_USAGE\x10\x01\x12\x18\n" +

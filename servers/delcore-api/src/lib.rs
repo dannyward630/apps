@@ -52,6 +52,9 @@ impl Fault {
     pub fn unauthenticated() -> Self {
         Self::new(ErrorCode::Unauthenticated, 2, "authentication failed")
     }
+    pub fn service_authentication_failed() -> Self {
+        Self::new(ErrorCode::Unauthenticated, 15, "authentication failed")
+    }
     pub fn denied() -> Self {
         Self::new(ErrorCode::PermissionDenied, 3, "operation is not permitted")
     }
@@ -107,6 +110,14 @@ impl Fault {
     }
     pub fn connect(self) -> connectrpc::ConnectError {
         connectrpc::ConnectError::new(self.code, self.message)
+    }
+}
+
+fn authentication_failure(op: Op) -> Fault {
+    if op == Op::AuthorizeApiKey {
+        Fault::service_authentication_failed()
+    } else {
+        Fault::unauthenticated()
     }
 }
 impl std::fmt::Display for Fault {
@@ -442,7 +453,7 @@ impl Server {
             .auth
             .verify(authorization)
             .await
-            .map_err(|_| Fault::unauthenticated())?;
+            .map_err(|_| authentication_failure(op))?;
         let q = serde_json::to_value(&request)?;
         let key = server_common::string(&q, "requestKey");
         if op.mutation() && !rpc::canonical(key) {

@@ -13,22 +13,28 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/oauth2"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	delcorev1 "github.com/delinoio/apps/protos/delcore/v1"
 	"github.com/delinoio/apps/protos/delcore/v1/delcorev1connect"
+	"github.com/delinoio/apps/servers/mcpa-api/internal/obs"
 )
 
 // fakeDelcore is a scriptable Delcore server.
 type fakeDelcore struct {
 	delcorev1connect.UnimplementedDelcoreServiceHandler
-	mu          sync.Mutex
-	allowed     bool
-	down        bool
-	state       delcorev1.TenantState
-	calls       map[string]int
-	authHeaders []string
+	mu             sync.Mutex
+	allowed        bool
+	down           bool
+	authError      connect.Code
+	keyErrorReason delcorev1.ErrorReason
+	authBlock      bool
+	authEntered    chan struct{}
+	state          delcorev1.TenantState
+	calls          map[string]int
+	authHeaders    []string
 }
 
 func (f *fakeDelcore) record(name string, h http.Header) error {
@@ -57,14 +63,25 @@ func (f *fakeDelcore) set(fn func(*fakeDelcore)) {
 	fn(f)
 }
 
-func (f *fakeDelcore) Authorize(_ context.Context, req *connect.Request[delcorev1.AuthorizeRequest]) (*connect.Response[delcorev1.AuthorizeResponse], error) {
+func (f *fakeDelcore) Authorize(ctx context.Context, req *connect.Request[delcorev1.AuthorizeRequest]) (*connect.Response[delcorev1.AuthorizeResponse], error) {
 	if err := f.record("Authorize", req.Header()); err != nil {
 		return nil, err
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	resp := &delcorev1.AuthorizeResponse{Allowed: f.allowed}
-	if !f.allowed {
+	code, block, entered, allowed := f.authError, f.authBlock, f.authEntered, f.allowed
+	f.mu.Unlock()
+	if code != 0 {
+		return nil, connect.NewError(code, errors.New("authorization failed"))
+	}
+	if block {
+		if entered != nil {
+			entered <- struct{}{}
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	resp := &delcorev1.AuthorizeResponse{Allowed: allowed}
+	if !allowed {
 		resp.Reasons = []delcorev1.BlockReason{delcorev1.BlockReason_BLOCK_REASON_PERMISSION}
 	}
 	return connect.NewResponse(resp), nil
@@ -75,7 +92,15 @@ func (f *fakeDelcore) AuthorizeApiKey(_ context.Context, req *connect.Request[de
 		return nil, err
 	}
 	if req.Msg.GetSecret() != "dlk_good" {
-		return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("invalid key"))
+		reason := f.keyErrorReason
+		if reason == delcorev1.ErrorReason_ERROR_REASON_UNSPECIFIED {
+			reason = delcorev1.ErrorReason_ERROR_REASON_UNAUTHENTICATED
+		}
+		ce := connect.NewError(connect.CodeUnauthenticated, errors.New("authentication failed"))
+		if detail, err := connect.NewErrorDetail(&delcorev1.ErrorDetail{Reason: reason}); err == nil {
+			ce.AddDetail(detail)
+		}
+		return nil, ce
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -290,6 +315,134 @@ func TestAuthorizeAPIKey(t *testing.T) {
 	if n := f.count("AuthorizeApiKey"); n != 2 {
 		t.Fatalf("allowed key result must be cached: %d", n)
 	}
+}
+
+func TestDelcoreFailureMetrics(t *testing.T) {
+	counter := func(m *obs.Metrics, rpc string, kind obs.DelcoreFailureKind) float64 {
+		return testutil.ToFloat64(m.DelcoreFailures.WithLabelValues(rpc, string(kind)))
+	}
+	newClient := func(t *testing.T, f *fakeDelcore) (*Client, *obs.Metrics) {
+		t.Helper()
+		c, _ := newTestClient(t, f)
+		m := obs.NewMetrics()
+		c.metrics = m
+		return c, m
+	}
+
+	t.Run("invalid API keys are denied", func(t *testing.T) {
+		c, m := newClient(t, &fakeDelcore{})
+		for range 6 {
+			if _, err := c.AuthorizeAPIKey(context.Background(), "dlk_bad", CapabilityAccessResources, false); !IsUnauthenticated(err) {
+				t.Fatalf("invalid key error: %v", err)
+			}
+		}
+		if got := counter(m, "AuthorizeApiKey", obs.DelcoreDenied); got != 6 {
+			t.Fatalf("denied = %v, want 6", got)
+		}
+		if got := counter(m, "AuthorizeApiKey", obs.DelcoreError) + counter(m, "AuthorizeApiKey", obs.DelcoreUnavailable); got != 0 {
+			t.Fatalf("error or unavailable = %v, want 0", got)
+		}
+	})
+
+	t.Run("service authentication failure is an error", func(t *testing.T) {
+		c, m := newClient(t, &fakeDelcore{keyErrorReason: delcorev1.ErrorReason_ERROR_REASON_SERVICE_AUTHENTICATION_FAILED})
+		_, err := c.AuthorizeAPIKey(context.Background(), "dlk_bad", CapabilityAccessResources, false)
+		if !IsUnauthenticated(err) || ReasonOf(err) != delcorev1.ErrorReason_ERROR_REASON_SERVICE_AUTHENTICATION_FAILED {
+			t.Fatalf("service authentication error: %v, reason %s", err, ReasonOf(err))
+		}
+		if got := counter(m, "AuthorizeApiKey", obs.DelcoreError); got != 1 {
+			t.Fatalf("error = %v, want 1", got)
+		}
+		if got := counter(m, "AuthorizeApiKey", obs.DelcoreDenied) + counter(m, "AuthorizeApiKey", obs.DelcoreUnavailable); got != 0 {
+			t.Fatalf("denied or unavailable = %v, want 0", got)
+		}
+	})
+
+	t.Run("invalid tenant is denied", func(t *testing.T) {
+		c, m := newClient(t, &fakeDelcore{authError: connect.CodeInvalidArgument})
+		_, err := c.Authorize(context.Background(), "bad-tenant", "u", CapabilityAccessResources, false)
+		var de *Error
+		if !errors.As(err, &de) || de.Kind != KindRejected || de.Code != connect.CodeInvalidArgument {
+			t.Fatalf("invalid tenant error: %v", err)
+		}
+		if got := counter(m, "Authorize", obs.DelcoreDenied); got != 1 {
+			t.Fatalf("denied = %v, want 1", got)
+		}
+		if got := counter(m, "Authorize", obs.DelcoreError); got != 0 {
+			t.Fatalf("error = %v, want 0", got)
+		}
+	})
+
+	t.Run("non-key unauthenticated remains an error", func(t *testing.T) {
+		c, m := newClient(t, &fakeDelcore{authError: connect.CodeUnauthenticated})
+		_, err := c.Authorize(context.Background(), "t", "u", CapabilityAccessResources, false)
+		if !IsUnauthenticated(err) {
+			t.Fatalf("unauthenticated error: %v", err)
+		}
+		if got := counter(m, "Authorize", obs.DelcoreError); got != 1 {
+			t.Fatalf("error = %v, want 1", got)
+		}
+	})
+
+	t.Run("authorization denial remains denied", func(t *testing.T) {
+		c, m := newClient(t, &fakeDelcore{allowed: false})
+		decision, err := c.Authorize(context.Background(), "t", "u", CapabilityAccessResources, false)
+		if err != nil || decision.Allowed {
+			t.Fatalf("denied decision: %+v %v", decision, err)
+		}
+		if got := counter(m, "Authorize", obs.DelcoreDenied); got != 1 {
+			t.Fatalf("denied = %v, want 1", got)
+		}
+	})
+
+	t.Run("caller cancellation is not a failure", func(t *testing.T) {
+		entered := make(chan struct{}, 1)
+		c, m := newClient(t, &fakeDelcore{authBlock: true, authEntered: entered})
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() {
+			_, err := c.Authorize(ctx, "t", "u", CapabilityAccessResources, false)
+			result <- err
+		}()
+		<-entered
+		cancel()
+		var de *Error
+		if err := <-result; !errors.As(err, &de) || de.Kind != KindUnavailable {
+			t.Fatalf("canceled call error: %v", err)
+		}
+		for _, kind := range []obs.DelcoreFailureKind{obs.DelcoreDenied, obs.DelcoreError, obs.DelcoreUnavailable} {
+			if got := counter(m, "Authorize", kind); got != 0 {
+				t.Fatalf("%s = %v, want 0", kind, got)
+			}
+		}
+	})
+
+	for _, code := range []connect.Code{connect.CodeUnavailable, connect.CodeInternal} {
+		t.Run(code.String(), func(t *testing.T) {
+			c, m := newClient(t, &fakeDelcore{authError: code})
+			_, err := c.Authorize(context.Background(), "t", "u", CapabilityAccessResources, false)
+			var de *Error
+			if !errors.As(err, &de) || de.Kind != KindUnavailable {
+				t.Fatalf("service fault error: %v", err)
+			}
+			if got := counter(m, "Authorize", obs.DelcoreUnavailable); got != 1 {
+				t.Fatalf("unavailable = %v, want 1", got)
+			}
+		})
+	}
+
+	t.Run("client timeout remains unavailable", func(t *testing.T) {
+		c, m := newClient(t, &fakeDelcore{authBlock: true})
+		c.timeout = 20 * time.Millisecond
+		_, err := c.Authorize(context.Background(), "t", "u", CapabilityAccessResources, false)
+		var de *Error
+		if !errors.As(err, &de) || de.Kind != KindUnavailable {
+			t.Fatalf("timeout error: %v", err)
+		}
+		if got := counter(m, "Authorize", obs.DelcoreUnavailable); got != 1 {
+			t.Fatalf("unavailable = %v, want 1", got)
+		}
+	})
 }
 
 func TestBillingPeriod(t *testing.T) {

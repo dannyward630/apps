@@ -4,7 +4,10 @@ package authz
 
 import (
 	"context"
+	"errors"
 	"testing"
+
+	"connectrpc.com/connect"
 
 	delcorev1 "github.com/delinoio/apps/protos/delcore/v1"
 	mcpav1 "github.com/delinoio/apps/protos/mcpa/v1"
@@ -92,9 +95,10 @@ func TestHasOtherManager(t *testing.T) {
 }
 
 type fakeDelcore struct {
-	allowed bool
-	key     delcore.KeyDecision
-	calls   []delcore.Capability
+	allowed      bool
+	key          delcore.KeyDecision
+	calls        []delcore.Capability
+	authorizeErr error
 }
 
 func (f *fakeDelcore) Authorize(_ context.Context, _, _ string, c delcore.Capability, paid bool) (delcore.Decision, error) {
@@ -102,6 +106,9 @@ func (f *fakeDelcore) Authorize(_ context.Context, _, _ string, c delcore.Capabi
 		panic("management must use paid=false")
 	}
 	f.calls = append(f.calls, c)
+	if f.authorizeErr != nil {
+		return delcore.Decision{}, f.authorizeErr
+	}
 	return delcore.Decision{Allowed: f.allowed}, nil
 }
 
@@ -141,6 +148,17 @@ func TestCapabilityRequirement(t *testing.T) {
 	f.key.Allowed = false
 	if err := a.Capability(ctx, key, "t1", delcore.CapabilityAccessResources); apperr.As(err).Reason != mcpav1.ErrorReason_ERROR_REASON_PERMISSION_DENIED {
 		t.Fatalf("key without grant: %v", err)
+	}
+}
+
+func TestCapabilityInvalidDelcoreTenant(t *testing.T) {
+	f := &fakeDelcore{authorizeErr: &delcore.Error{
+		Kind: delcore.KindRejected, Code: connect.CodeInvalidArgument, Cause: errors.New("invalid tenant"),
+	}}
+	a := &Authorizer{dc: f}
+	console := auth.NewUserPrincipal(mcpav1.ActorKind_ACTOR_KIND_CONSOLE, "u1", "s", nil)
+	if err := a.Capability(context.Background(), console, "bad-tenant", delcore.CapabilityAccessResources); apperr.As(err).Reason != mcpav1.ErrorReason_ERROR_REASON_INVALID_INPUT {
+		t.Fatalf("invalid tenant should map to invalid input: %v", err)
 	}
 }
 

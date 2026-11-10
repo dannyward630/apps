@@ -7,6 +7,18 @@ use tracing::{
     span::{Attributes, Id, Record},
 };
 use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
+
+#[test]
+fn service_authentication_failures_have_an_operation_scoped_reason() {
+    let service_fault = authentication_failure(Op::AuthorizeApiKey);
+    assert_eq!(service_fault.code, Fault::unauthenticated().code);
+    assert_eq!(service_fault.reason, 15);
+    assert_eq!(
+        authentication_failure(Op::Authorize).reason,
+        Fault::unauthenticated().reason
+    );
+}
+
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
 #[derive(Default)]

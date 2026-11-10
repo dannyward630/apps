@@ -78,6 +78,8 @@ enum ErrorReason {
   // The occurrence is older than the accepted lateness bound or the tenant
   // reporting grace period has ended.
   ERROR_REASON_REPORTING_WINDOW_CLOSED = 14;
+  // Delcore could not authenticate the calling service for AuthorizeApiKey.
+  ERROR_REASON_SERVICE_AUTHENTICATION_FAILED = 15;
 }
 message ErrorDetail {
   ErrorReason reason = 1;
