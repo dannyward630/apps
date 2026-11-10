@@ -27,6 +27,10 @@ pub struct Policy {
     pub procedure: Option<ProcedureResolver>,
 }
 
+/// Server-generated identity for one Git Tracker HTTP request. Incoming headers never populate it.
+#[derive(Clone, Copy, Debug)]
+pub struct CorrelationId(pub uuid::Uuid);
+
 /// Pending observation of a known DevBase procedure, shared between the service handler and
 /// this middleware. The middleware stores one in the request extensions. A handler that finishes
 /// does not record metrics itself; it publishes its outcome with [`Accounting::report`] and the
@@ -102,6 +106,7 @@ fn request_span(
     procedure: Option<&'static str>,
     method: &Method,
     path: &str,
+    correlation: Option<CorrelationId>,
 ) -> tracing::Span {
     match policy.service {
         Service::DevBase => tracing::info_span!(
@@ -113,7 +118,12 @@ fn request_span(
                 "other"
             },
         ),
-        Service::GitTracker => tracing::info_span!("api.request", method = %method, path = %path),
+        Service::GitTracker => tracing::info_span!(
+            "api.request",
+            method = %method,
+            path = %path,
+            correlation_id = %correlation.expect("Git Tracker request identity").0,
+        ),
     }
 }
 
@@ -122,11 +132,31 @@ pub async fn middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let correlation =
+        matches!(policy.service, Service::GitTracker).then(|| CorrelationId(uuid::Uuid::now_v7()));
+    if let Some(correlation) = correlation {
+        request.extensions_mut().insert(correlation);
+    }
+    let procedure = policy
+        .procedure
+        .and_then(|resolve| resolve(request.uri().path()));
+    // Create the Git Tracker span before CORS and preflight can return early.
+    let git_span = correlation.map(|id| {
+        request_span(
+            &policy,
+            procedure,
+            request.method(),
+            request.uri().path(),
+            Some(id),
+        )
+    });
     let origin = request.headers().get("origin").cloned();
     if let Some(origin) = &origin
         && (policy.origin.is_empty() || origin.as_bytes() != policy.origin.as_bytes())
     {
-        return StatusCode::FORBIDDEN.into_response();
+        let mut response = StatusCode::FORBIDDEN.into_response();
+        stamp_correlation(&mut response, correlation);
+        return response;
     }
     let preflight = request.method() == Method::OPTIONS && origin.is_some();
     let mut response = if preflight {
@@ -134,10 +164,15 @@ pub async fn middleware(
     } else {
         // Capture the procedure and start time before the request is moved so that the elapsed
         // time covers body reading as well as handler execution.
-        let procedure = policy
-            .procedure
-            .and_then(|resolve| resolve(request.uri().path()));
-        let span = request_span(&policy, procedure, request.method(), request.uri().path());
+        let span = git_span.unwrap_or_else(|| {
+            request_span(
+                &policy,
+                procedure,
+                request.method(),
+                request.uri().path(),
+                None,
+            )
+        });
         let accounting = Accounting::default();
         if procedure.is_some() {
             request.extensions_mut().insert(accounting.clone());
@@ -156,14 +191,14 @@ pub async fn middleware(
                 // client deadline below, so it can never count a request a second time.
                 settlement.settle(response.status() == StatusCode::GATEWAY_TIMEOUT);
                 if is_untyped_client_deadline(policy.service, &response) {
-                    timeout_response(policy.service)
+                    timeout_response(policy.service, correlation)
                 } else {
                     response
                 }
             }
             Err(_) => {
                 settlement.settle(true);
-                timeout_response(policy.service)
+                timeout_response(policy.service, correlation)
             }
         }
     };
@@ -182,13 +217,12 @@ pub async fn middleware(
             ),
         );
         h.insert("Access-Control-Max-Age", HeaderValue::from_static("600"));
-        h.insert(
-            "Access-Control-Expose-Headers",
-            HeaderValue::from_static(match policy.service {
-                Service::DevBase => "X-Devbase-Trace-Id, Retry-After",
-                Service::GitTracker => "X-Correlation-Id",
-            }),
-        );
+        if matches!(policy.service, Service::DevBase) {
+            h.insert(
+                "Access-Control-Expose-Headers",
+                HeaderValue::from_static("X-Devbase-Trace-Id, Retry-After"),
+            );
+        }
     }
     if matches!(policy.service, Service::GitTracker) {
         response
@@ -207,7 +241,39 @@ pub async fn middleware(
             }])
             .inc();
     }
+    stamp_correlation(&mut response, correlation);
     response
+}
+
+fn stamp_correlation(response: &mut Response, correlation: Option<CorrelationId>) {
+    let Some(correlation) = correlation else {
+        return;
+    };
+    if !response.headers().contains_key("X-Correlation-Id") {
+        response.headers_mut().insert(
+            "X-Correlation-Id",
+            HeaderValue::from_str(&correlation.0.to_string()).expect("UUID header value"),
+        );
+    }
+    // Expose the ID even for requests without Origin and for rejected origins. The latter still
+    // has no Allow-Origin grant. Append to handler-selected exposure entries without replacing them.
+    let exposed = response
+        .headers()
+        .get_all("Access-Control-Expose-Headers")
+        .iter()
+        .any(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .any(|name| name.trim().eq_ignore_ascii_case("X-Correlation-Id"))
+            })
+        });
+    if !exposed {
+        response.headers_mut().append(
+            "Access-Control-Expose-Headers",
+            HeaderValue::from_static("X-Correlation-Id"),
+        );
+    }
 }
 
 /// Records one request and one latency sample for a whole-request timeout of a known DevBase
@@ -253,8 +319,8 @@ fn is_untyped_client_deadline(service: Service, response: &Response) -> bool {
     response.status() == StatusCode::GATEWAY_TIMEOUT && !response.headers().contains_key(header)
 }
 
-fn timeout_response(service: Service) -> Response {
-    let trace = crate::id();
+fn timeout_response(service: Service, correlation: Option<CorrelationId>) -> Response {
+    let trace = correlation.map_or_else(crate::id, |id| id.0.to_string());
     tracing::warn!(correlation_id = %trace, category = "timeout", "request deadline exceeded");
     let mut error = connectrpc::ConnectError::new(
         connectrpc::ErrorCode::DeadlineExceeded,
@@ -291,7 +357,12 @@ fn timeout_response(service: Service) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, body::Bytes, routing::post};
+    use axum::{
+        Router,
+        body::Bytes,
+        extract::Extension,
+        routing::{get, post},
+    };
     use base64::Engine;
     use buffa::Message;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -388,6 +459,134 @@ mod tests {
             metrics: Arc::new(Metrics::new(service)),
             procedure,
         }
+    }
+
+    #[tokio::test]
+    async fn git_tracker_boundary_stamps_early_and_handler_responses() {
+        let metrics = Arc::new(Metrics::new(Service::GitTracker));
+        let app = Router::new()
+            .route(
+                "/healthz",
+                get(|Extension(id): Extension<CorrelationId>| async move { id.0.to_string() }),
+            )
+            .route(
+                "/existing",
+                get(|| async {
+                    (
+                        [
+                            ("X-Correlation-Id", "handler-selected"),
+                            ("Access-Control-Expose-Headers", "X-External-Trace"),
+                        ],
+                        StatusCode::OK,
+                    )
+                }),
+            )
+            .route(
+                "/already-exposed",
+                get(|| async {
+                    (
+                        [("Access-Control-Expose-Headers", "X-Correlation-Id, X-Extra")],
+                        StatusCode::OK,
+                    )
+                }),
+            )
+            .fallback(|| async { StatusCode::NOT_FOUND })
+            .layer(axum::middleware::from_fn_with_state(
+                Policy {
+                    origin: "https://console.example".into(),
+                    timeout: Duration::from_secs(1),
+                    service: Service::GitTracker,
+                    metrics: metrics.clone(),
+                    procedure: None,
+                },
+                middleware,
+            ));
+        let send = |method, path, origin: Option<&str>| {
+            let app = app.clone();
+            let origin = origin.map(str::to_owned);
+            async move {
+                let mut request = Request::builder().method(method).uri(path);
+                if let Some(origin) = origin {
+                    request = request.header("Origin", origin);
+                }
+                tower::ServiceExt::oneshot(app, request.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+        let health = send(Method::GET, "/healthz", None).await;
+        let health_id = health.headers()["x-correlation-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(uuid::Uuid::parse_str(&health_id).is_ok());
+        assert_eq!(
+            health.headers()["access-control-expose-headers"],
+            "X-Correlation-Id"
+        );
+        assert_eq!(
+            axum::body::to_bytes(health.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            health_id
+        );
+
+        let preflight = send(Method::OPTIONS, "/healthz", Some("https://console.example")).await;
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert!(
+            uuid::Uuid::parse_str(preflight.headers()["x-correlation-id"].to_str().unwrap())
+                .is_ok()
+        );
+        assert_eq!(
+            preflight.headers()["access-control-expose-headers"],
+            "X-Correlation-Id"
+        );
+        let forbidden = send(Method::GET, "/healthz", Some("https://other.example")).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert!(
+            uuid::Uuid::parse_str(forbidden.headers()["x-correlation-id"].to_str().unwrap())
+                .is_ok()
+        );
+        assert!(
+            !forbidden
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+        assert_eq!(
+            forbidden.headers()["access-control-expose-headers"],
+            "X-Correlation-Id"
+        );
+        let missing = send(Method::GET, "/missing", None).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert!(
+            uuid::Uuid::parse_str(missing.headers()["x-correlation-id"].to_str().unwrap()).is_ok()
+        );
+        assert_eq!(
+            missing.headers()["access-control-expose-headers"],
+            "X-Correlation-Id"
+        );
+        let existing = send(Method::GET, "/existing", None).await;
+        assert_eq!(existing.headers()["x-correlation-id"], "handler-selected");
+        let exposures: Vec<_> = existing
+            .headers()
+            .get_all("access-control-expose-headers")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(exposures, ["X-External-Trace", "X-Correlation-Id"]);
+        let already_exposed = send(Method::GET, "/already-exposed", None).await;
+        let exposures: Vec<_> = already_exposed
+            .headers()
+            .get_all("access-control-expose-headers")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(exposures, ["X-Correlation-Id, X-Extra"]);
+        // The existing CORS rejection remains outside request accounting.
+        assert_eq!(
+            metrics.requests.with_label_values(&["client_error"]).get(),
+            1
+        );
     }
 
     /// Routes `/rpc/<scenario>` through the middleware. Each handler publishes an outcome as the
@@ -842,6 +1041,45 @@ mod tests {
         fields
             .iter()
             .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+    }
+
+    #[tokio::test]
+    async fn git_tracker_request_span_uses_the_response_identity_even_for_early_rejection() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let capture = SpanCapture::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let app = Router::new().fallback(|| async { StatusCode::OK }).layer(
+            axum::middleware::from_fn_with_state(
+                Policy {
+                    origin: "https://console.example".into(),
+                    ..policy(Service::GitTracker, None)
+                },
+                middleware,
+            ),
+        );
+        for origin in ["https://console.example", "https://other.example"] {
+            let response = tower::ServiceExt::oneshot(
+                app.clone(),
+                Request::get("/healthz")
+                    .header("Origin", origin)
+                    .header("X-Correlation-Id", "caller-selected")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let id = response.headers()["x-correlation-id"].to_str().unwrap();
+            assert!(uuid::Uuid::parse_str(id).is_ok());
+            let spans = capture.0.lock().unwrap();
+            let fields = &spans.last().unwrap().1;
+            assert_eq!(field(fields, "correlation_id"), Some(id));
+            assert!(
+                !fields
+                    .iter()
+                    .any(|(_, value)| value.contains("caller-selected"))
+            );
+        }
     }
 
     #[tokio::test]

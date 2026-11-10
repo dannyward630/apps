@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
-use axum::{
-    Router,
-    body::Bytes,
-    extract::DefaultBodyLimit,
-    http::{HeaderMap, StatusCode},
-    middleware,
-    routing::{get, post},
-};
-use git_tracker_api::{Server, auth::Actions, github::GitHub};
+use axum::{Router, http::StatusCode, middleware, routing::get};
+use git_tracker_api::{Server, auth::Actions, github::GitHub, http::webhook_route};
 use server_common::{
     authority::Authority,
     config::{duration, required, valid_origin},
@@ -68,7 +61,6 @@ async fn run() -> anyhow::Result<()> {
                 .with_max_message_size(8 << 20)
                 .with_max_request_body_size(8 << 20),
         );
-    let webhook = server.clone();
     let ready = db.clone();
     let metrics = server.metrics.clone();
     let app = Router::new()
@@ -102,34 +94,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }),
         )
-        .route(
-            "/github/events",
-            post(move |headers: HeaderMap, body: Bytes| {
-                let server = webhook.clone();
-                async move {
-                    let event = headers
-                        .get("X-GitHub-Event")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let signature = headers
-                        .get("X-Hub-Signature-256")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    match server.webhook(event, signature, &body).await {
-                        Ok(()) => StatusCode::NO_CONTENT,
-                        Err(f) => {
-                            server.record_failure(&f);
-                            match f.code {
-                                connectrpc::ErrorCode::Unauthenticated => StatusCode::UNAUTHORIZED,
-                                connectrpc::ErrorCode::InvalidArgument => StatusCode::BAD_REQUEST,
-                                _ => StatusCode::SERVICE_UNAVAILABLE,
-                            }
-                        }
-                    }
-                }
-            })
-            .layer(DefaultBodyLimit::max(2 << 20)),
-        )
+        .route("/github/events", webhook_route(server.clone()))
         .fallback_service(rpc)
         .layer(middleware::from_fn_with_state(
             Policy {

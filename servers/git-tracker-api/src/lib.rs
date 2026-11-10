@@ -7,6 +7,7 @@ pub mod decimal;
 pub mod github;
 #[cfg(test)]
 mod history_range_tests;
+pub mod http;
 pub mod maintenance;
 pub mod measurement;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -19,7 +20,9 @@ use serde_json::{Value, json};
 use server_common::{
     Fault, Result,
     authority::{Authority, Role},
-    canonical_id, integer, now, string, uuid,
+    canonical_id,
+    http::CorrelationId,
+    integer, now, string, uuid,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool, Row};
@@ -191,7 +194,10 @@ impl Server {
                 None
             }
         };
-        let trace = server_common::id();
+        let trace = ctx
+            .extensions()
+            .get::<CorrelationId>()
+            .map_or_else(server_common::id, |id| id.0.to_string());
         let authorization = ctx
             .headers()
             .get("authorization")
