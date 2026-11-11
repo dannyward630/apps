@@ -132,6 +132,8 @@ curl --fail-with-body \
 
 使用相同的 `context` 调用 `/gittracker.v1.GitTrackerService/Complete`。对于 PR 上传，需包含 `pullRequest`，并使用 PR 的基分支和头部提交。`baselineCommit` 用于选择明确指定的完整基线 SHA。历史提交使用相同的上传 API。发送十进制字符串前，不要通过 JavaScript `Number` 进行转换。
 
+随上传或完成操作发送的文本中不得包含 NUL（`\u0000`）字符。Git Tracker 会以客户端错误拒绝该请求，并指出受影响的字段。其他受支持的 Unicode 文本和控制字符仍然有效。
+
 ## 执行和比较规则
 
 首次上传会冻结该次执行中每个数据集的配置。后续提交不同的配置会被拒绝。以相同数值重复提交已有行是幂等的。冲突的值会被拒绝。批次具有原子性：只要有一行无效或冲突，该请求中的所有数据都不会保存。

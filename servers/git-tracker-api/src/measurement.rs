@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
-use crate::decimal;
+use crate::{NulFault, decimal, reject_context_nul, reject_nul};
 use chrono::{DateTime, Utc};
 use delino_protocol::gittracker::v1::{ComparisonStatus::*, Direction::*, ExecutionState::*, *};
 use num_traits::Signed;
@@ -47,7 +47,32 @@ fn find<'a>(
     }
     (None, None)
 }
+pub fn reject_nul_input(dataset: &Dataset, rows: &[Row]) -> Result<()> {
+    reject_nul("dataset ID", &dataset.id, NulFault::Precondition)?;
+    reject_nul("dataset name", &dataset.name, NulFault::Precondition)?;
+    for column in &dataset.columns {
+        for (field, value) in [
+            ("column ID", column.id.as_str()),
+            ("column name", column.name.as_str()),
+            ("column unit", column.unit.as_str()),
+            ("absolute threshold", column.absolute_threshold.as_str()),
+            ("percentage threshold", column.percentage_threshold.as_str()),
+        ] {
+            reject_nul(field, value, NulFault::Precondition)?;
+        }
+    }
+    for row in rows {
+        reject_nul("row ID", &row.id, NulFault::Precondition)?;
+        reject_nul("row name", &row.name, NulFault::Precondition)?;
+        for (column, value) in &row.values {
+            reject_nul("row value column ID", column, NulFault::Precondition)?;
+            reject_nul("row value", value, NulFault::Precondition)?;
+        }
+    }
+    Ok(())
+}
 pub fn validate(dataset: &Dataset, rows: &[Row]) -> Result<()> {
+    reject_nul_input(dataset, rows)?;
     if dataset.id.is_empty() || dataset.name.is_empty() || dataset.columns.is_empty() {
         return Err(Fault::precondition(
             "dataset id, name and columns are required",
@@ -217,6 +242,7 @@ impl State {
         ancestors: Vec<String>,
         base: String,
     ) -> Result<()> {
+        reject_context_nul(c)?;
         if self.deleted.get(&c.execution_id) == Some(&true) {
             return Err(Fault::precondition("execution was deleted"));
         }
@@ -293,6 +319,7 @@ impl State {
         Ok(())
     }
     pub fn complete(&mut self, c: &Context, now: DateTime<Utc>) -> Result<()> {
+        reject_context_nul(c)?;
         if self.deleted.get(&c.execution_id) == Some(&true) {
             return Err(Fault::precondition("execution was deleted"));
         }

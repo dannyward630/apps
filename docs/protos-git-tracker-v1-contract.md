@@ -55,6 +55,7 @@ External individuals and organizations, CI jobs and service operators.
 - Each CI job uploads measurements with the common execution ID, repository, commit, dataset configuration, and applicable branch/PR and comparison context. Different jobs can upload different rows of the same dataset. All columns of a row must be uploaded together.
 - Repeating the same row with the same values in the same execution/dataset is an idempotent retransmission. Different values for that row are rejected, not overwritten.
 - An upload request is atomic. If any row is invalid or conflicts, save none of that request and identify the invalid row and reason.
+- `Upload` and `Complete` reject NUL (`\u0000`) in client text that would be stored. The client error names the field without repeating its value. Other accepted Unicode text and control characters remain valid; commit IDs, repository IDs, thresholds and numeric values retain their existing syntax rules.
 - Data appears immediately on the website as measuring/in progress. It is not yet the commit's representative result.
 - The user adds a final CI job, such as `mark as done`, that explicitly calls the completion API for the commit and execution ID. It reports only that measurement is finished; it does not submit CI success/failure/cancellation or perform aggregate CI regression gating.
 - Completion is idempotent. Repeated completion succeeds without changing data, completion time, or execution ordering.

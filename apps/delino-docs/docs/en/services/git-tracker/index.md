@@ -132,6 +132,8 @@ curl --fail-with-body \
 
 Call `/gittracker.v1.GitTrackerService/Complete` with the same `context`. For PR uploads include `pullRequest` and use the PR base branch and head commit. `baselineCommit` selects an explicit full baseline SHA. Historical commits use the same upload API. Do not convert decimal strings through JavaScript `Number` before sending them.
 
+Do not include a NUL (`\u0000`) character in text sent with an upload or completion. Git Tracker rejects it with a client error that names the affected field. Other supported Unicode text and control characters remain valid.
+
 ## Execution and comparison rules
 
 The first upload freezes each dataset's configuration for that execution. Different later configuration is rejected. Repeating an existing row with identical numeric values is idempotent. Conflicting values are rejected. A batch is atomic: an invalid or conflicting row saves none of that request.

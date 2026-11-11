@@ -601,6 +601,7 @@ async fn permissions_atomic_upload_oidc_visibility_and_cleanup(
 /// transaction open (it holds the repository row lock while it fetches metadata) and order a
 /// connection attempt behind it without sleeping.
 struct GitHubMock {
+    provider_requests: std::sync::atomic::AtomicU64,
     private: std::sync::atomic::AtomicBool,
     fail_metadata: std::sync::atomic::AtomicBool,
     user_status: std::sync::atomic::AtomicU16,
@@ -673,6 +674,7 @@ async fn fixture_with_deadlines(
     let space = uuid::Uuid::now_v7().to_string();
     let commit = "a".repeat(40);
     let github = Arc::new(GitHubMock {
+        provider_requests: 0.into(),
         private: false.into(),
         fail_metadata: false.into(),
         user_status: 200.into(),
@@ -696,6 +698,8 @@ async fn fixture_with_deadlines(
             let p = r.uri().path().to_owned();
             if p.starts_with("/delcore.v1.DelcoreService/") {
                 delcore_requests.fetch_add(1, Ordering::SeqCst);
+            } else {
+                github.provider_requests.fetch_add(1, Ordering::SeqCst);
             }
             let auth = r
                 .headers()
@@ -1037,6 +1041,173 @@ async fn postgres_pull_request_oidc_explicit_baseline_uses_connected_repository_
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{uploaded}");
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_nul_uploads_and_completion_are_client_faults_without_persistence() {
+    use std::sync::atomic::Ordering;
+
+    let f = fixture().await;
+    let (status, connected) = f.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let rid = connected["repository"]["id"].as_str().unwrap();
+    let (_, issued) = f
+        .call(
+            "IssueToken",
+            "Bearer manager",
+            json!({
+                "repositoryId":rid,
+                "expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()
+            }),
+        )
+        .await;
+    let token = format!("Bearer {}", issued["token"].as_str().unwrap());
+    let stored = || async {
+        sqlx::query_scalar::<_, Value>(&format!(
+            "SELECT state FROM {}.git_tracker_repositories WHERE id=$1",
+            f.schema
+        ))
+        .bind(uuid::Uuid::parse_str(rid).unwrap())
+        .fetch_one(&f.admin)
+        .await
+        .unwrap()
+    };
+    let persistence_failures = f
+        .server
+        .metrics
+        .events
+        .with_label_values(&["persistence", "failure"]);
+    let baseline_state = stored().await;
+    let baseline_audit = f.audit_count().await;
+    let baseline_failures = persistence_failures.get();
+
+    for (index, field) in [
+        "repository ID",
+        "execution ID",
+        "commit",
+        "branch",
+        "baseline commit",
+        "dataset ID",
+        "dataset name",
+        "column ID",
+        "column name",
+        "column unit",
+        "absolute threshold",
+        "percentage threshold",
+        "row ID",
+        "row name",
+        "row value column ID",
+        "row value",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut context = json!({
+            "repositoryId":rid,"executionId":format!("nul-{index}"),
+            "commit":f.commit,"branch":"missing"
+        });
+        let mut dataset = json!({"id":"size","name":"Size","columns":[{
+            "id":"bytes","name":"Bytes","unit":"B","direction":"DIRECTION_LOWER"
+        }]});
+        let mut rows = json!([{"id":"one","name":"One","values":{"bytes":"1"}}]);
+        match field {
+            "repository ID" => context["repositoryId"] = format!("{rid}\0").into(),
+            "execution ID" => context["executionId"] = "run\0".into(),
+            "commit" => context["commit"] = "a\0".into(),
+            "branch" => context["branch"] = "main\0".into(),
+            "baseline commit" => context["baselineCommit"] = "a\0".into(),
+            "dataset ID" => dataset["id"] = "size\0".into(),
+            "dataset name" => dataset["name"] = "Size\0".into(),
+            "column ID" => dataset["columns"][0]["id"] = "bytes\0".into(),
+            "column name" => dataset["columns"][0]["name"] = "Bytes\0".into(),
+            "column unit" => dataset["columns"][0]["unit"] = "B\0".into(),
+            "absolute threshold" => dataset["columns"][0]["absoluteThreshold"] = "1\0".into(),
+            "percentage threshold" => dataset["columns"][0]["percentageThreshold"] = "1\0".into(),
+            "row ID" => rows[0]["id"] = "one\0".into(),
+            "row name" => rows[0]["name"] = "One\0".into(),
+            "row value column ID" => rows[0]["values"]["bytes\0"] = "1".into(),
+            "row value" => rows[0]["values"]["bytes"] = "1\0".into(),
+            _ => unreachable!(),
+        }
+        let before_provider = f.github.provider_requests.load(Ordering::SeqCst);
+        let (status, body) = f
+            .call(
+                "Upload",
+                &token,
+                json!({
+                    "context":context,"dataset":dataset,"rows":rows
+                }),
+            )
+            .await;
+        assert!(status.is_client_error(), "{field}: {status} {body}");
+        assert_eq!(
+            body["message"],
+            format!("{field}: NUL character is not allowed")
+        );
+        assert_eq!(
+            f.github.provider_requests.load(Ordering::SeqCst),
+            before_provider,
+            "{field}"
+        );
+        assert_eq!(stored().await, baseline_state, "{field}");
+        assert_eq!(f.audit_count().await, baseline_audit, "{field}");
+        assert_eq!(persistence_failures.get(), baseline_failures, "{field}");
+    }
+
+    for field in ["execution ID", "branch", "baseline commit"] {
+        let mut context = json!({
+            "repositoryId":rid,"executionId":"nul-complete","commit":f.commit,"branch":"missing"
+        });
+        match field {
+            "execution ID" => context["executionId"] = "run\0".into(),
+            "branch" => context["branch"] = "main\0".into(),
+            "baseline commit" => context["baselineCommit"] = "a\0".into(),
+            _ => unreachable!(),
+        }
+        let before_provider = f.github.provider_requests.load(Ordering::SeqCst);
+        let (status, body) = f.call("Complete", &token, json!({"context":context})).await;
+        assert!(status.is_client_error(), "{field}: {status} {body}");
+        assert_eq!(
+            body["message"],
+            format!("{field}: NUL character is not allowed")
+        );
+        assert_eq!(
+            f.github.provider_requests.load(Ordering::SeqCst),
+            before_provider
+        );
+        assert_eq!(stored().await, baseline_state);
+        assert_eq!(f.audit_count().await, baseline_audit);
+        assert_eq!(persistence_failures.get(), baseline_failures);
+    }
+
+    let context =
+        json!({"repositoryId":rid,"executionId":"unicode-run","commit":f.commit,"branch":"main"});
+    let dataset = json!({"id":"größe-μs","name":"Size\u{1}","columns":[{
+        "id":"bytes","name":"Bytes\u{3}","unit":"B","direction":"DIRECTION_LOWER"
+    }]});
+    let rows = json!([{"id":"élément","name":"One\u{2}","values":{"bytes":"1"}}]);
+    let request = json!({"context":context,"dataset":dataset,"rows":rows});
+    let (status, body) = f.call("Upload", &token, request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let saved = stored().await;
+    assert_eq!(saved["next"], 1);
+    let (status, body) = f.call("Upload", &token, request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(stored().await, saved);
+    let mut changed = request;
+    changed["rows"][0]["values"]["bytes"] = "2".into();
+    let (status, body) = f.call("Upload", &token, changed).await;
+    assert!(status.is_client_error(), "{body}");
+    assert_eq!(body["code"], "failed_precondition");
+    assert_eq!(stored().await, saved);
+    let (status, body) = f.call("Complete", &token, json!({"context":context})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let completed = stored().await;
+    let (status, body) = f.call("Complete", &token, json!({"context":context})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(stored().await, completed);
+    assert_eq!(persistence_failures.get(), baseline_failures);
 }
 
 #[tokio::test]

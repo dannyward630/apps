@@ -132,6 +132,8 @@ curl --fail-with-body \
 
 Rufen Sie `/gittracker.v1.GitTrackerService/Complete` mit demselben `context` auf. Geben Sie bei PR-Uploads `pullRequest` an und verwenden Sie den Basis-Branch und den Head-Commit des PR. `baselineCommit` wählt einen expliziten vollständigen Baseline-SHA aus. Historische Commits verwenden dieselbe Upload-API. Konvertieren Sie Dezimalzeichenfolgen vor dem Senden nicht über JavaScript-`Number`.
 
+Fügen Sie kein NUL-Zeichen (`\u0000`) in Text ein, der mit einem Upload oder Abschluss gesendet wird. Git Tracker lehnt es mit einem Clientfehler ab, der das betroffene Feld nennt. Anderer unterstützter Unicode-Text und andere unterstützte Steuerzeichen bleiben gültig.
+
 ## Regeln für Ausführungen und Vergleiche
 
 Der erste Upload schreibt die Konfiguration jedes Datensatzes für diese Ausführung fest. Eine spätere abweichende Konfiguration wird abgelehnt. Das wiederholte Hochladen einer vorhandenen Zeile mit identischen numerischen Werten ist idempotent. Widersprüchliche Werte werden abgelehnt. Ein Batch ist atomar: Bei einer ungültigen oder widersprüchlichen Zeile wird nichts aus dieser Anfrage gespeichert.

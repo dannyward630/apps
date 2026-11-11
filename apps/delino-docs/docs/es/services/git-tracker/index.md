@@ -132,6 +132,8 @@ curl --fail-with-body \
 
 Llama a `/gittracker.v1.GitTrackerService/Complete` con el mismo `context`. Para las cargas de PR, incluye `pullRequest` y usa la rama base y el commit de cabecera de la PR. `baselineCommit` selecciona un SHA completo explícito como referencia. Los commits históricos usan la misma API de carga. No conviertas las cadenas decimales mediante `Number` de JavaScript antes de enviarlas.
 
+No incluyas un carácter NUL (`\u0000`) en el texto enviado con una carga o finalización. Git Tracker lo rechaza con un error de cliente que indica el campo afectado. El resto del texto Unicode y de los caracteres de control admitidos siguen siendo válidos.
+
 ## Reglas de ejecución y comparación
 
 La primera carga fija la configuración de cada conjunto de datos para esa ejecución. Se rechaza cualquier configuración posterior diferente. Repetir una fila existente con valores numéricos idénticos es idempotente. Los valores en conflicto se rechazan. Un lote es atómico: si una fila es inválida o presenta conflictos, no se guarda nada de esa solicitud.

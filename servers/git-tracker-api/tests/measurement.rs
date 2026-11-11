@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 use chrono::{Duration, Utc};
 use delino_protocol::gittracker::v1::{ComparisonStatus::*, Direction::*, ExecutionState::*, *};
-use git_tracker_api::{decimal, measurement::State};
+use git_tracker_api::{
+    decimal,
+    measurement::{State, validate},
+};
 fn column(unit: &str) -> Column {
     Column {
         id: "size".into(),
@@ -33,6 +36,97 @@ fn row(id: &str, value: &str) -> Row {
         id: id.into(),
         values: [("size".into(), value.into())].into_iter().collect(),
         ..Default::default()
+    }
+}
+
+#[test]
+fn nul_input_is_rejected_by_measurement_validation_and_direct_state_calls() {
+    for field in [
+        "dataset ID",
+        "dataset name",
+        "column ID",
+        "column name",
+        "column unit",
+        "absolute threshold",
+        "percentage threshold",
+        "row ID",
+        "row name",
+        "row value column ID",
+        "row value",
+    ] {
+        let mut dataset = dataset();
+        let mut rows = vec![row("one", "1")];
+        match field {
+            "dataset ID" => dataset.id.push('\0'),
+            "dataset name" => dataset.name.push('\0'),
+            "column ID" => dataset.columns[0].id.push('\0'),
+            "column name" => dataset.columns[0].name.push('\0'),
+            "column unit" => dataset.columns[0].unit.push('\0'),
+            "absolute threshold" => dataset.columns[0].absolute_threshold.push('\0'),
+            "percentage threshold" => dataset.columns[0].percentage_threshold.push('\0'),
+            "row ID" => rows[0].id.push('\0'),
+            "row name" => rows[0].name.push('\0'),
+            "row value column ID" => {
+                rows[0].values.insert("size\0".into(), "1".into());
+            }
+            "row value" => *rows[0].values.get_mut("size").unwrap() = "1\0".into(),
+            _ => unreachable!(),
+        }
+        let fault = validate(&dataset, &rows).unwrap_err();
+        assert_eq!(fault.code, connectrpc::ErrorCode::FailedPrecondition);
+        assert!(fault.message.contains(field), "{field}: {}", fault.message);
+        assert!(!fault.message.contains('\0'));
+        let mut state = State::default();
+        let direct = state
+            .upload(
+                &context("run", "a"),
+                &dataset,
+                &rows,
+                Utc::now(),
+                vec![],
+                String::new(),
+            )
+            .unwrap_err();
+        assert_eq!(direct.message, fault.message);
+        assert!(state.records.is_empty());
+        assert_eq!(state.next, 0);
+    }
+    for field in [
+        "repository ID",
+        "execution ID",
+        "commit",
+        "branch",
+        "baseline commit",
+    ] {
+        let mut context = context("run", "a");
+        match field {
+            "repository ID" => context.repository_id.push('\0'),
+            "execution ID" => context.execution_id.push('\0'),
+            "commit" => context.commit.push('\0'),
+            "branch" => context.branch.push('\0'),
+            "baseline commit" => context.baseline_commit.push('\0'),
+            _ => unreachable!(),
+        }
+        let mut state = State::default();
+        for fault in [
+            state
+                .upload(
+                    &context,
+                    &dataset(),
+                    &[row("one", "1")],
+                    Utc::now(),
+                    vec![],
+                    String::new(),
+                )
+                .unwrap_err(),
+            state.complete(&context, Utc::now()).unwrap_err(),
+        ] {
+            assert_eq!(fault.code, connectrpc::ErrorCode::InvalidArgument);
+            assert!(fault.message.contains(field), "{field}: {}", fault.message);
+            assert!(!fault.message.contains('\0'));
+        }
+        assert!(state.records.is_empty());
+        assert_eq!(state.next, 0);
     }
 }
 

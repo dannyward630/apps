@@ -132,6 +132,8 @@ curl --fail-with-body \
 
 Appelez `/gittracker.v1.GitTrackerService/Complete` avec le même `context`. Pour les envois de PR, incluez `pullRequest` et utilisez la branche de base et le commit de tête de la PR. `baselineCommit` sélectionne un SHA de référence complet explicite. Les commits historiques utilisent la même API d’envoi. Ne convertissez pas les chaînes décimales à l’aide du type JavaScript `Number` avant de les envoyer.
 
+N’incluez pas de caractère NUL (`\u0000`) dans le texte envoyé avec un envoi ou une finalisation. Git Tracker le rejette avec une erreur client qui nomme le champ concerné. Les autres textes Unicode et caractères de contrôle pris en charge restent valides.
+
 ## Règles d’exécution et de comparaison
 
 Le premier envoi fige la configuration de chaque jeu de données pour cette exécution. Toute configuration ultérieure différente est rejetée. Répéter une ligne existante avec des valeurs numériques identiques est idempotent. Les valeurs contradictoires sont rejetées. Un lot est atomique : si une ligne est invalide ou contradictoire, aucune donnée de cette requête n’est enregistrée.

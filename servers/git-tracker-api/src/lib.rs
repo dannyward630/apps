@@ -106,7 +106,35 @@ pub fn valid_sha(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+#[derive(Clone, Copy)]
+pub(crate) enum NulFault {
+    Invalid,
+    Precondition,
+}
+pub(crate) fn reject_nul(field: &'static str, value: &str, kind: NulFault) -> Result<()> {
+    if value.contains('\0') {
+        let message = format!("{field}: NUL character is not allowed");
+        return Err(match kind {
+            NulFault::Invalid => Fault::invalid(message),
+            NulFault::Precondition => Fault::precondition(message),
+        });
+    }
+    Ok(())
+}
+pub(crate) fn reject_context_nul(c: &Context) -> Result<()> {
+    for (field, value) in [
+        ("repository ID", c.repository_id.as_str()),
+        ("execution ID", c.execution_id.as_str()),
+        ("commit", c.commit.as_str()),
+        ("branch", c.branch.as_str()),
+        ("baseline commit", c.baseline_commit.as_str()),
+    ] {
+        reject_nul(field, value, NulFault::Invalid)?;
+    }
+    Ok(())
+}
 fn valid_context(c: &Context) -> Result<()> {
+    reject_context_nul(c)?;
     if c.repository_id.is_empty()
         || c.execution_id.is_empty()
         || c.execution_id.len() > 200
@@ -289,6 +317,7 @@ impl Server {
                     serde_json::from_value(q.get("dataset").cloned().unwrap_or(json!({})))?;
                 let rows: Vec<delino_protocol::gittracker::v1::Row> =
                     serde_json::from_value(q.get("rows").cloned().unwrap_or(json!([])))?;
+                measurement::reject_nul_input(&d, &rows)?;
                 let (parents, base) = if state.retry(c, &d, &rows) {
                     (vec![], String::new())
                 } else {
@@ -866,6 +895,38 @@ impl GitTrackerService for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_nul_faults_name_only_the_field() {
+        let original = Context {
+            repository_id: "repository".into(),
+            execution_id: "run".into(),
+            commit: "a".repeat(40),
+            branch: "main".into(),
+            ..Default::default()
+        };
+        for field in [
+            "repository ID",
+            "execution ID",
+            "commit",
+            "branch",
+            "baseline commit",
+        ] {
+            let mut context = original.clone();
+            match field {
+                "repository ID" => context.repository_id.push('\0'),
+                "execution ID" => context.execution_id.push('\0'),
+                "commit" => context.commit.push('\0'),
+                "branch" => context.branch.push('\0'),
+                "baseline commit" => context.baseline_commit.push('\0'),
+                _ => unreachable!(),
+            }
+            let fault = valid_context(&context).unwrap_err();
+            assert_eq!(fault.code, connectrpc::ErrorCode::InvalidArgument);
+            assert!(fault.message.contains(field), "{field}: {}", fault.message);
+            assert!(!fault.message.contains('\0'));
+        }
+    }
 
     #[test]
     fn repository_listing_selects_identity_columns_only() {
