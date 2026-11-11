@@ -144,7 +144,7 @@ Paths, metrics and general parsing rules come from the [provider adapters contra
 - Official tokens are read from stdin or a named environment variable, never from command arguments.
 - Uploads contain only aggregates; see the [server contract](servers-anydash-api-contract.md#local-usage-upload-and-aggregation).
 - Local IPC is restricted to the current OS user.
-- Logout releases held leases, then revokes the refresh token that is current after that release (releasing can rotate the device credentials; no rotation runs between revocation and deletion) and deletes the device credentials; `disconnect` deletes a provider token.
+- Logout without device credentials returns `NOT_LOGGED_IN` before accessing the encryption key. Otherwise, logout releases held leases, then revokes the refresh token that is current after that release (releasing can rotate the device credentials; no rotation runs between revocation and deletion) and deletes the device credentials; `disconnect` deletes a provider token.
 
 ## Logging
 

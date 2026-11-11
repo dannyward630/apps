@@ -5,21 +5,24 @@
 mod support;
 use anydash::{
     collector,
-    core::{Core, Owner},
+    core::{Core, Options, Owner},
     ipc,
+    keys::{SecureStore, Unavailable},
     pb::{
         self, AcquireLeaseRequest, AcquireLeaseResponse, AddConnectionCredentialRequest,
         BucketOutcome, BucketResult, CollectionStatus, CollectorRunState, Connection,
         ConnectionAssignment, CreateConnectionRequest, CreateConnectionResponse, Device,
         DeviceCredentials, EnrollmentState, ErrorDetail, ErrorReason, GetCollectorStatusRequest,
-        GetCollectorStatusResponse, HeartbeatRequest, HeartbeatResponse, Lease, LocalNotice,
-        PollEnrollmentResponse, Provider, QuitRequest, QuitResponse, RefreshDeviceTokenRequest,
-        RefreshDeviceTokenResponse, ReleaseLeaseResponse, RenewLeaseRequest, RenewLeaseResponse,
-        ReportParserStatusResponse, ReportSnapshotRequest, ReportSnapshotResponse,
-        RevokeDeviceCredentialsRequest, RevokeDeviceCredentialsResponse, StartEnrollmentRequest,
-        StartEnrollmentResponse, UnregisterConnectionDeviceResponse, UploadUsageRequest,
-        UploadUsageResponse,
+        GetCollectorStatusResponse, HeartbeatRequest, HeartbeatResponse, KeySource, Lease,
+        LocalNotice, PollEnrollmentResponse, Provider, QuitRequest, QuitResponse,
+        RefreshDeviceTokenRequest, RefreshDeviceTokenResponse, ReleaseLeaseResponse,
+        RenewLeaseRequest, RenewLeaseResponse, ReportParserStatusResponse, ReportSnapshotRequest,
+        ReportSnapshotResponse, RevokeDeviceCredentialsRequest, RevokeDeviceCredentialsResponse,
+        StartEnrollmentRequest, StartEnrollmentResponse, UnregisterConnectionDeviceResponse,
+        UploadUsageRequest, UploadUsageResponse,
     },
+    providers::Endpoints,
+    settings::Settings,
     store::Tokens,
     time,
 };
@@ -33,6 +36,18 @@ use std::{
 };
 use support::{Mock, Recorded, Reply};
 const DEVICE: &str = "01890000-0000-7000-8000-00000000d001";
+struct NoKeyAccess;
+impl SecureStore for NoKeyAccess {
+    fn get(&self, _: &str, _: &str) -> Result<Option<String>, Unavailable> {
+        panic!("logout without credentials must not access the OS key store")
+    }
+    fn set(&self, _: &str, _: &str, _: &str) -> Result<(), Unavailable> {
+        panic!("logout without credentials must not access the OS key store")
+    }
+    fn delete(&self, _: &str, _: &str) -> Result<(), Unavailable> {
+        panic!("logout without credentials must not access the OS key store")
+    }
+}
 #[derive(Default)]
 struct Api {
     approved: bool,
@@ -302,6 +317,36 @@ async fn logged_in(home: &Path, state: &Arc<Mutex<Api>>, owner: Owner) -> (Mock,
         EnrollmentState::Consumed as i32
     );
     (mock, core)
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_without_credentials_does_not_load_a_key() {
+    for forced_env in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let anydash_home = home.path().join("anydash");
+        let mut vars = vec![
+            ("ANYDASH_HOME", anydash_home.to_str().unwrap()),
+            ("ANYDASH_API_URL", "http://127.0.0.1:9"),
+        ];
+        if forced_env {
+            vars.push(("ANYDASH_KEY_SOURCE", "env"));
+        }
+        let core = Core::open(Options {
+            settings: Settings::with_vars(home.path().to_path_buf(), &vars),
+            endpoints: Endpoints::mock("http://127.0.0.1:9", "grok"),
+            os: Arc::new(NoKeyAccess),
+            owner: Owner::Direct,
+        })
+        .unwrap();
+        assert_eq!(
+            core.logout().await.unwrap_err().reason,
+            ErrorReason::NotLoggedIn
+        );
+        assert!(!anydash_home.join("config/encryption.key").exists());
+        assert_eq!(
+            core.status(true).unwrap().key_source,
+            KeySource::Unspecified as i32
+        );
+    }
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn enrollment_logout_keeps_registration_and_relogin_reattaches() {
