@@ -318,6 +318,7 @@ impl Server {
                 let rows: Vec<delino_protocol::gittracker::v1::Row> =
                     serde_json::from_value(q.get("rows").cloned().unwrap_or(json!([])))?;
                 measurement::reject_nul_input(&d, &rows)?;
+                state.precheck_upload(c, &d, &rows, now())?;
                 let (parents, base) = if state.retry(c, &d, &rows) {
                     (vec![], String::new())
                 } else {

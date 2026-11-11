@@ -131,6 +131,59 @@ fn nul_input_is_rejected_by_measurement_validation_and_direct_state_calls() {
 }
 
 #[test]
+fn upload_precheck_is_pure_and_leaves_ancestry_to_upload() {
+    let mut state = State::default();
+    let at = Utc::now();
+    let c = context("run", "a");
+    let d = dataset();
+    let rows = [row("one", "1")];
+    state.precheck_upload(&c, &d, &rows, at).unwrap();
+    assert_eq!(state.next, 0);
+    assert!(state.records.is_empty());
+
+    state
+        .upload(&c, &d, &rows, at, vec!["parent".into()], String::new())
+        .unwrap();
+    let next = state.next;
+    let registration = state.records["run"].execution.registration_order.clone();
+    state
+        .precheck_upload(&c, &d, &[row("one", "1.0")], at)
+        .unwrap();
+    assert!(state.retry(&c, &d, &[row("one", "1.0")]));
+    assert_eq!(state.next, next);
+    assert_eq!(
+        state.records["run"].execution.registration_order,
+        registration
+    );
+
+    state
+        .precheck_upload(&c, &d, &[row("two", "2")], at)
+        .unwrap();
+    let fault = state
+        .upload(
+            &c,
+            &d,
+            &[row("two", "2")],
+            at,
+            vec!["different".into(), "parent".into()],
+            String::new(),
+        )
+        .unwrap_err();
+    assert_eq!(fault.message, "Git ancestry changed");
+    assert_eq!(state.next, next);
+    assert_eq!(
+        state.records["run"].execution.registration_order,
+        registration
+    );
+    assert_eq!(state.records["run"].execution.measurements[0].rows.len(), 1);
+
+    let closed = at + Duration::hours(6);
+    let fault = state.precheck_upload(&c, &d, &rows, closed).unwrap_err();
+    assert_eq!(fault.message, "execution is closed");
+    assert_eq!(state.records["run"].execution.measurements[0].rows.len(), 1);
+}
+
+#[test]
 fn explicit_comparison_prefers_branch_on_both_sides_in_either_registration_order() {
     for branch_first in [true, false] {
         let mut state = State::default();

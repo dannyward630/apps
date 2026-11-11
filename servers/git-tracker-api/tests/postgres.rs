@@ -270,6 +270,17 @@ async fn permissions_atomic_upload_oidc_visibility_and_cleanup(
         json!({"context":bad_commit,"dataset":dataset,"rows":[]}),
     )
     .await;
+    assert_eq!(failed["code"], "failed_precondition");
+    assert_eq!(failed["message"], "upload requires at least one row");
+    assert_eq!(github_failures.get(), before);
+    let (_, failed) = call(
+        &http,
+        &base,
+        "Upload",
+        &auth,
+        json!({"context":bad_commit,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"1"}}]}),
+    )
+    .await;
     assert_eq!(failed["code"], "unavailable");
     assert_eq!(github_failures.get(), before + 1);
     let mut pr_context = context.clone();
@@ -1041,6 +1052,238 @@ async fn postgres_pull_request_oidc_explicit_baseline_uses_connected_repository_
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{uploaded}");
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_upload_precheck_keeps_client_faults_out_of_github() {
+    use std::sync::atomic::Ordering;
+
+    let f = fixture().await;
+    let (status, connected) = f.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let rid = connected["repository"]["id"].as_str().unwrap();
+    let (_, issued) = f
+        .call(
+            "IssueToken",
+            "Bearer manager",
+            json!({"repositoryId":rid,"expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()}),
+        )
+        .await;
+    let token = format!("Bearer {}", issued["token"].as_str().unwrap());
+    let stored = || async {
+        sqlx::query_scalar::<_, Value>(&format!(
+            "SELECT state FROM {}.git_tracker_repositories WHERE id=$1",
+            f.schema
+        ))
+        .bind(uuid::Uuid::parse_str(rid).unwrap())
+        .fetch_one(&f.admin)
+        .await
+        .unwrap()
+    };
+    let github_failures = f
+        .server
+        .metrics
+        .events
+        .with_label_values(&["github", "failure"]);
+    let persistence_failures = f
+        .server
+        .metrics
+        .events
+        .with_label_values(&["persistence", "failure"]);
+    let context =
+        |id: &str| json!({"repositoryId":rid,"executionId":id,"commit":f.commit,"branch":"main"});
+    let dataset = json!({"id":"size","name":"Size","columns":[{
+        "id":"bytes","unit":"B","direction":"DIRECTION_LOWER"
+    }]});
+    let rows = json!([{"id":"one","values":{"bytes":"1"}}]);
+    let mut cases = Vec::new();
+    let mut unsupported = dataset.clone();
+    unsupported["columns"][0]["unit"] = "parsec".into();
+    cases.push((
+        "unsupported unit",
+        unsupported,
+        rows.clone(),
+        "unsupported column unit",
+    ));
+    cases.push((
+        "empty rows",
+        dataset.clone(),
+        json!([]),
+        "upload requires at least one row",
+    ));
+    let mut duplicate_columns = dataset.clone();
+    duplicate_columns["columns"]
+        .as_array_mut()
+        .unwrap()
+        .push(dataset["columns"][0].clone());
+    cases.push((
+        "duplicate columns",
+        duplicate_columns,
+        rows.clone(),
+        "column IDs must be unique and nonempty",
+    ));
+    cases.push((
+        "duplicate rows",
+        dataset.clone(),
+        json!([rows[0], rows[0]]),
+        "row IDs must be unique and nonempty",
+    ));
+    cases.push((
+        "invalid decimal",
+        dataset.clone(),
+        json!([{"id":"one","values":{"bytes":"invalid"}}]),
+        "row one: invalid decimal",
+    ));
+    let baseline = stored().await;
+    let baseline_audit = f.audit_count().await;
+    for (name, dataset, rows, message) in cases {
+        let before_provider = f.github.provider_requests.load(Ordering::SeqCst);
+        let (status, body) = f
+            .call(
+                "Upload",
+                &token,
+                json!({"context":context(name),"dataset":dataset,"rows":rows}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {body}");
+        assert_eq!(body["code"], "failed_precondition", "{name}: {body}");
+        assert_eq!(body["message"], message, "{name}: {body}");
+        assert_eq!(
+            f.github.provider_requests.load(Ordering::SeqCst),
+            before_provider,
+            "{name}"
+        );
+        assert_eq!(stored().await, baseline, "{name}");
+        assert_eq!(f.audit_count().await, baseline_audit, "{name}");
+        assert_eq!(github_failures.get(), 0, "{name}");
+        assert_eq!(persistence_failures.get(), 0, "{name}");
+    }
+
+    let run = context("run");
+    let request = json!({"context":run,"dataset":dataset,"rows":rows});
+    let before_provider = f.github.provider_requests.load(Ordering::SeqCst);
+    let (status, body) = f.call("Upload", &token, request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(f.github.provider_requests.load(Ordering::SeqCst) > before_provider);
+    let saved = stored().await;
+    assert_eq!(saved["next"], 1);
+    let mut retransmission = request.clone();
+    retransmission["rows"][0]["values"]["bytes"] = "1.0".into();
+    let before_provider = f.github.provider_requests.load(Ordering::SeqCst);
+    let (status, body) = f.call("Upload", &token, retransmission).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        f.github.provider_requests.load(Ordering::SeqCst),
+        before_provider
+    );
+    assert_eq!(stored().await, saved);
+
+    let mut conflicts = Vec::new();
+    let mut other_context = request.clone();
+    other_context["context"]["branch"] = "other".into();
+    conflicts.push(("context", other_context, "execution context conflicts"));
+    let mut other_dataset = request.clone();
+    other_dataset["dataset"]["name"] = "Other".into();
+    conflicts.push(("dataset", other_dataset, "dataset configuration conflicts"));
+    let mut other_value = request.clone();
+    other_value["rows"][0]["values"]["bytes"] = "2".into();
+    conflicts.push(("row", other_value.clone(), "row one: values conflict"));
+    let mut multirow = other_value;
+    multirow["rows"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, json!({"id":"new","values":{"bytes":"3"}}));
+    conflicts.push(("atomic multirow", multirow, "row one: values conflict"));
+    for (name, request, message) in conflicts {
+        let before_provider = f.github.provider_requests.load(Ordering::SeqCst);
+        let (status, body) = f.call("Upload", &token, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {body}");
+        assert_eq!(body["message"], message, "{name}: {body}");
+        assert_eq!(
+            f.github.provider_requests.load(Ordering::SeqCst),
+            before_provider,
+            "{name}"
+        );
+        assert_eq!(stored().await, saved, "{name}");
+        assert_eq!(f.audit_count().await, baseline_audit, "{name}");
+        assert_eq!(github_failures.get(), 0, "{name}");
+        assert_eq!(persistence_failures.get(), 0, "{name}");
+    }
+
+    let (status, body) = f.call("Complete", &token, json!({"context":run})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let completed = stored().await;
+    let before_provider = f.github.provider_requests.load(Ordering::SeqCst);
+    let (_, body) = f.call("Upload", &token, request.clone()).await;
+    assert_eq!(body["message"], "execution is closed");
+    assert_eq!(
+        f.github.provider_requests.load(Ordering::SeqCst),
+        before_provider
+    );
+    assert_eq!(stored().await, completed);
+
+    let open = json!({"context":context("open"),"dataset":dataset,"rows":rows});
+    let (status, body) = f.call("Upload", &token, open.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let delete =
+        |kind: &str, id: &str| json!({"repositoryId":rid,"kind":kind,"id":id,"confirmed":true});
+    let (status, body) = f
+        .call(
+            "Delete",
+            "Bearer manager",
+            delete("DELETE_KIND_EXECUTION", "run"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let deleted_execution = stored().await;
+    let deleted_audit = f.audit_count().await;
+    let before_provider = f.github.provider_requests.load(Ordering::SeqCst);
+    let (_, body) = f.call("Upload", &token, request).await;
+    assert_eq!(body["message"], "execution was deleted");
+    assert_eq!(
+        f.github.provider_requests.load(Ordering::SeqCst),
+        before_provider
+    );
+    assert_eq!(stored().await, deleted_execution);
+    assert_eq!(f.audit_count().await, deleted_audit);
+    let (status, body) = f
+        .call(
+            "Delete",
+            "Bearer manager",
+            delete("DELETE_KIND_DATASET", "size"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let deleted_dataset = stored().await;
+    let deleted_audit = f.audit_count().await;
+    let before_provider = f.github.provider_requests.load(Ordering::SeqCst);
+    let (_, body) = f.call("Upload", &token, open).await;
+    assert_eq!(body["message"], "dataset was deleted from this execution");
+    assert_eq!(
+        f.github.provider_requests.load(Ordering::SeqCst),
+        before_provider
+    );
+    assert_eq!(stored().await, deleted_dataset);
+    assert_eq!(f.audit_count().await, deleted_audit);
+
+    let mut invalid_commit = context("invalid-commit");
+    invalid_commit["commit"] = "b".repeat(40).into();
+    let before_provider = f.github.provider_requests.load(Ordering::SeqCst);
+    let before_github_failure = github_failures.get();
+    let (_, body) = f
+        .call(
+            "Upload",
+            &token,
+            json!({"context":invalid_commit,"dataset":dataset,"rows":rows}),
+        )
+        .await;
+    assert_eq!(body["code"], "unavailable", "{body}");
+    assert!(f.github.provider_requests.load(Ordering::SeqCst) > before_provider);
+    assert_eq!(github_failures.get(), before_github_failure + 1);
+    assert_eq!(persistence_failures.get(), 0);
+    assert_eq!(stored().await, deleted_dataset);
+    assert_eq!(f.audit_count().await, deleted_audit);
 }
 
 #[tokio::test]

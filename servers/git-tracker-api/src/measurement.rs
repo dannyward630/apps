@@ -233,14 +233,12 @@ impl State {
             old_d == Some(d) && old.is_some_and(|old| equal(old, row))
         })
     }
-    pub fn upload(
-        &mut self,
+    pub fn precheck_upload(
+        &self,
         c: &Context,
         d: &Dataset,
         rows: &[Row],
         now: DateTime<Utc>,
-        ancestors: Vec<String>,
-        base: String,
     ) -> Result<()> {
         reject_context_nul(c)?;
         if self.deleted.get(&c.execution_id) == Some(&true) {
@@ -265,27 +263,41 @@ impl State {
             {
                 return Err(Fault::precondition("execution is closed"));
             }
-            if ancestors.len() > r.ancestors.len() && !ancestors.starts_with(&r.ancestors) {
-                return Err(Fault::precondition("Git ancestry changed"));
-            }
         }
-        let mut added = false;
         for row in rows {
             let (old_d, old) = find(r, &d.id, &row.id);
             if old_d.is_some_and(|old| old != d) {
                 return Err(Fault::precondition("dataset configuration conflicts"));
             }
-            if let Some(old) = old {
-                if !equal(old, row) {
-                    return Err(Fault::precondition(format!(
-                        "row {}: values conflict",
-                        row.id
-                    )));
-                }
-            } else {
-                added = true
+            if let Some(old) = old
+                && !equal(old, row)
+            {
+                return Err(Fault::precondition(format!(
+                    "row {}: values conflict",
+                    row.id
+                )));
             }
         }
+        Ok(())
+    }
+    pub fn upload(
+        &mut self,
+        c: &Context,
+        d: &Dataset,
+        rows: &[Row],
+        now: DateTime<Utc>,
+        ancestors: Vec<String>,
+        base: String,
+    ) -> Result<()> {
+        self.precheck_upload(c, d, rows, now)?;
+        let r = self.records.get(&c.execution_id);
+        if let Some(r) = r
+            && ancestors.len() > r.ancestors.len()
+            && !ancestors.starts_with(&r.ancestors)
+        {
+            return Err(Fault::precondition("Git ancestry changed"));
+        }
+        let added = rows.iter().any(|row| find(r, &d.id, &row.id).1.is_none());
         if r.is_none() {
             self.register(c, now, ancestors.clone(), base)
         }
