@@ -1997,6 +1997,165 @@ fn webhook_event() -> (String, Vec<u8>) {
     )
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_large_signed_webhook_respects_body_and_rpc_limits() {
+    use server_common::http::Policy;
+
+    let f = fixture().await;
+    let (status, connected) = f.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    for (github_id, installation) in [(43_i64, "2"), (44, "1")] {
+        sqlx::query("INSERT INTO git_tracker_repositories(id,github_id,space_id,full_name,installation_id,public) VALUES($1,$2,$3,$4,$5,true)")
+            .bind(uuid::Uuid::now_v7())
+            .bind(github_id)
+            .bind(uuid::Uuid::parse_str(&f.space).unwrap())
+            .bind(format!("owner/repo{github_id}"))
+            .bind(installation)
+            .execute(&f.server.db)
+            .await
+            .unwrap();
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/github/events", listener.local_addr().unwrap());
+    let rpc_url = format!(
+        "http://{}/gittracker.v1.GitTrackerService/ListRepositories",
+        listener.local_addr().unwrap()
+    );
+    let rpc = connectrpc::Router::new()
+        .add_service(f.server.clone())
+        .into_axum_service()
+        .with_limits(
+            connectrpc::Limits::default()
+                .with_max_message_size(8 << 20)
+                .with_max_request_body_size(8 << 20),
+        );
+    let app = Router::new()
+        .route(
+            "/github/events",
+            git_tracker_api::http::webhook_route(f.server.clone()),
+        )
+        .fallback_service(rpc)
+        .layer(axum::middleware::from_fn_with_state(
+            Policy {
+                origin: String::new(),
+                timeout: Duration::from_secs(60),
+                service: Service::GitTracker,
+                metrics: f.server.metrics.clone(),
+                procedure: None,
+            },
+            server_common::http::middleware,
+        ));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(65))
+        .build()
+        .unwrap();
+    let signature = |body: &[u8]| {
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"fixture-only").unwrap();
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    };
+    let state = |github_id| {
+        sqlx::query_as::<_, (bool, bool)>(
+            "SELECT connected,public FROM git_tracker_repositories WHERE github_id=$1",
+        )
+        .bind(github_id)
+        .fetch_one(&f.server.db)
+    };
+    let before_audit = f.audit_count().await;
+    let mut invalid =
+        b"{\"action\":\"deleted\",\"installation\":{\"id\":1},\"padding\":\"".to_vec();
+    invalid.resize((3 << 20) - 2, b'x');
+    invalid.extend_from_slice(b"\"}");
+    for supplied_signature in [None, Some("sha256=00")] {
+        let mut request = client
+            .post(&url)
+            .header("X-GitHub-Event", "installation")
+            .body(invalid.clone());
+        if let Some(signature) = supplied_signature {
+            request = request.header("X-Hub-Signature-256", signature);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("X-Correlation-Id"));
+        assert!(
+            response
+                .headers()
+                .contains_key("Access-Control-Expose-Headers")
+        );
+        assert_eq!(state(42).await.unwrap(), (true, true));
+        assert_eq!(f.audit_count().await, before_audit);
+    }
+    assert_eq!(
+        client
+            .post(&url)
+            .body(vec![b'x'; (26 << 20) + 1])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(state(42).await.unwrap(), (true, true));
+
+    let mut large =
+        b"{\"action\":\"removed\",\"installation\":{\"id\":1},\"repositories_removed\":[".to_vec();
+    for index in 0..100_000 {
+        if index != 0 {
+            large.push(b',');
+        }
+        let id = if index == 0 { 42 } else { 100_000 + index };
+        large.extend_from_slice(format!("{{\"id\":{id}}}").as_bytes());
+    }
+    large.extend_from_slice(b"],\"padding\":\"");
+    large.resize((20 << 20) - 2, b'x');
+    large.extend_from_slice(b"\"}");
+    assert_eq!(large.len(), 20 << 20);
+    let started = std::time::Instant::now();
+    let response = client
+        .post(&url)
+        .header("X-GitHub-Event", "installation_repositories")
+        .header("X-Hub-Signature-256", signature(&large))
+        .body(large)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(started.elapsed() < Duration::from_secs(60));
+    assert_eq!(state(42).await.unwrap(), (false, false));
+    assert_eq!(state(43).await.unwrap(), (true, true));
+    assert_eq!(state(44).await.unwrap(), (true, true));
+    assert_eq!(f.audit_count().await, before_audit + 1);
+    assert_eq!(
+        f.server
+            .metrics
+            .events
+            .with_label_values(&["webhook", "success"])
+            .get(),
+        1
+    );
+    assert_eq!(
+        f.server
+            .metrics
+            .events
+            .with_label_values(&["webhook", "rejected"])
+            .get(),
+        3
+    );
+    let rpc_response = client
+        .post(rpc_url)
+        .header("Connect-Protocol-Version", "1")
+        .header("Content-Type", "application/json")
+        .body(format!("{{\"padding\":\"{}\"}}", "x".repeat((8 << 20) + 1)))
+        .send()
+        .await
+        .unwrap();
+    let rpc_body = rpc_response.text().await.unwrap();
+    assert!(rpc_body.contains("resource_exhausted"), "{rpc_body}");
+    task.abort();
+}
+
 /// Which committed private update runs while a same-space connection waits for the row lock.
 #[derive(Clone, Copy)]
 enum Interleaving {

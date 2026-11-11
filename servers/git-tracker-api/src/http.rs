@@ -33,7 +33,7 @@ pub fn webhook_route(server: Arc<Server>) -> MethodRouter {
             }
         },
     )
-    .layer(DefaultBodyLimit::max(2 << 20))
+    .layer(DefaultBodyLimit::max(25 << 20))
 }
 
 async fn webhook_response(

@@ -3,12 +3,39 @@ use crate::{Server, audit, repository};
 use chrono::{DateTime, Utc};
 use connectrpc::ErrorCode;
 use hmac::{Hmac, Mac};
+use serde::Deserialize;
 use serde_json::Value;
 use server_common::{Fault, Result, integer, now, string, uuid};
 use sha2::Sha256;
 // PostgreSQL timestamps use microseconds since 2000-01-01, while chrono uses the Unix epoch.
 const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 const PG_MIN_TIMESTAMP_MICROS: i64 = -211_813_488_000_000_000;
+
+// Serde skips every field that the webhook effect does not consume. Keep the small ID values
+// flexible because the existing handler accepts JSON integers and decimal integer strings.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct WebhookEvent {
+    action: Value,
+    installation: WebhookId,
+    repository: WebhookId,
+    repositories_removed: Vec<WebhookId>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct WebhookId {
+    id: Value,
+}
+
+impl WebhookId {
+    fn integer(&self) -> i64 {
+        self.id
+            .as_i64()
+            .or_else(|| self.id.as_str().and_then(|value| value.parse().ok()))
+            .unwrap_or(0)
+    }
+}
 /// Returns the instant before which audit rows have expired, or `None` when `retention` reaches
 /// back past PostgreSQL's earliest `timestamptz` or chrono subtraction overflows. In either case
 /// no stored audit row can be older than the cutoff. The cutoff stays exact or is absent.
@@ -197,23 +224,26 @@ impl Server {
         mac.update(raw);
         mac.verify_slice(&signature)
             .map_err(|_| Fault::unauthenticated())?;
-        let event: Value = serde_json::from_slice(raw)?;
-        let installation = integer(&event["installation"], "id").to_string();
-        let github = integer(&event["repository"], "id");
-        let action = string(&event, "action");
+        let event: WebhookEvent = serde_json::from_slice(raw)?;
+        let installation = event.installation.integer().to_string();
+        let github = event.repository.integer();
+        let action = event.action.as_str().unwrap_or("");
         let mut tx = self.db.begin().await?;
         match event_type {
             "installation" if matches!(action, "deleted" | "suspend") => {
                 sqlx::query("UPDATE git_tracker_repositories SET connected=false,public=false WHERE installation_id=$1").bind(&installation).execute(&mut *tx).await?;
             }
             "installation_repositories" => {
-                for removed in event["repositories_removed"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                {
-                    sqlx::query("UPDATE git_tracker_repositories SET connected=false,public=false WHERE github_id=$1 AND installation_id=$2").bind(integer(removed,"id")).bind(&installation).execute(&mut *tx).await?;
-                }
+                let removed: Vec<i64> = event
+                    .repositories_removed
+                    .iter()
+                    .map(WebhookId::integer)
+                    .collect();
+                sqlx::query("UPDATE git_tracker_repositories SET connected=false,public=false WHERE github_id = ANY($1) AND installation_id=$2")
+                    .bind(&removed)
+                    .bind(&installation)
+                    .execute(&mut *tx)
+                    .await?;
             }
             "repository" if action == "deleted" => {
                 sqlx::query("UPDATE git_tracker_repositories SET connected=false,public=false WHERE github_id=$1").bind(github).execute(&mut *tx).await?;
@@ -250,6 +280,25 @@ impl Server {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn webhook_fields_keep_integer_strings_and_ignore_unused_payload() {
+        let event: WebhookEvent = serde_json::from_str(
+            r#"{"action":"removed","installation":{"id":"1","unused":{"token":"ignored"}},"repository":{"id":42},"repositories_removed":[{"id":"43","unused":[1,2,3]},{"id":44}],"sender":{"unused":"ignored"}}"#,
+        )
+        .unwrap();
+        assert_eq!(event.action.as_str(), Some("removed"));
+        assert_eq!(event.installation.integer(), 1);
+        assert_eq!(event.repository.integer(), 42);
+        assert_eq!(
+            event
+                .repositories_removed
+                .iter()
+                .map(WebhookId::integer)
+                .collect::<Vec<_>>(),
+            [43, 44]
+        );
+    }
 
     fn at(rfc3339: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(rfc3339).unwrap().to_utc()
