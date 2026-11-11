@@ -19,7 +19,81 @@ pub const MAX_ANCESTORS: usize = 1000;
 pub const ANCESTRY_DEADLINE: Duration = Duration::from_secs(20);
 /// Page size for the GraphQL pull request commit connection (the GitHub maximum).
 const COMMIT_PAGE: usize = 100;
+const COMMENT_IDENTIFIER_CHARS: usize = 120;
+const COMMENT_CODE_SEPARATOR: &str = "<!---->";
 const COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){databaseId pullRequest(number:$number){id number state baseRefName headRefOid commits(first:100,after:$after){totalCount nodes{commit{oid}} pageInfo{hasNextPage endCursor}}}}}";
+
+fn comment_code_span(value: &str, output: &mut String) {
+    let longest_run = value
+        .bytes()
+        .fold((0, 0), |(longest, current), byte| {
+            let current = if byte == b'`' { current + 1 } else { 0 };
+            (longest.max(current), current)
+        })
+        .0;
+    let fence = "`".repeat(longest_run + 1);
+    let all_spaces = value.bytes().all(|byte| byte == b' ');
+    let pad = !all_spaces
+        && (value.starts_with(' ')
+            || value.starts_with('`')
+            || value.ends_with(' ')
+            || value.ends_with('`'));
+    output.push_str(&fence);
+    if pad {
+        output.push(' ');
+    }
+    if value.is_empty() {
+        // Markdown has no empty code span. One space renders as a blank code node.
+        output.push(' ');
+    } else {
+        for character in value.chars() {
+            if character == '|' {
+                output.push('\\');
+            }
+            output.push(character);
+        }
+    }
+    if pad {
+        output.push(' ');
+    }
+    output.push_str(&fence);
+}
+
+fn comment_literal(value: &str, max_chars: Option<usize>) -> String {
+    let mut display = String::new();
+    match max_chars {
+        Some(max_chars) => {
+            for (index, character) in value.chars().enumerate() {
+                if index == max_chars {
+                    display.push('…');
+                    break;
+                }
+                display.push(character);
+            }
+        }
+        None => display.push_str(value),
+    }
+    let display = display.replace(['\r', '\n'], " ");
+    let mut output = String::new();
+    let mut start = 0;
+    let mut backslashes = 0;
+    for (index, character) in display.char_indices() {
+        if character == '|' && backslashes % 2 == 1 {
+            // GFM table parsing consumes an escaped pipe's backslash. Split before a pipe that
+            // follows an odd backslash run so the displayed backslashes remain literal.
+            comment_code_span(&display[start..index], &mut output);
+            output.push_str(COMMENT_CODE_SEPARATOR);
+            start = index;
+        }
+        backslashes = if character == '\\' {
+            backslashes + 1
+        } else {
+            0
+        };
+    }
+    comment_code_span(&display[start..], &mut output);
+    output
+}
 
 #[derive(Clone, Copy)]
 enum Discovery {
@@ -659,22 +733,16 @@ impl GitHub {
             escape(&r.id),
             escape(&c.execution_id)
         );
-        fn clean(v: &str) -> String {
-            v.replace('|', "\\|")
-                .replace(['\n', '\r'], " ")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-        }
         for v in comparisons {
             let status = serde_json::to_value(v.status)?;
             let line = format!(
                 "| {} / {} / {} | {} {} | {} | {} |\n",
-                clean(&v.dataset_id),
-                clean(&v.row_id),
-                clean(&v.column_id),
-                clean(&v.value),
-                clean(&v.unit),
-                clean(&v.delta),
+                comment_literal(&v.dataset_id, Some(COMMENT_IDENTIFIER_CHARS)),
+                comment_literal(&v.row_id, Some(COMMENT_IDENTIFIER_CHARS)),
+                comment_literal(&v.column_id, Some(COMMENT_IDENTIFIER_CHARS)),
+                comment_literal(&v.value, None),
+                comment_literal(&v.unit, None),
+                comment_literal(&v.delta, None),
                 status
                     .as_str()
                     .unwrap_or("")
@@ -731,4 +799,48 @@ impl GitHub {
 fn github_failure(mut fault: Fault) -> Fault {
     fault.source = server_common::error::FaultSource::GitHub;
     fault
+}
+
+#[cfg(test)]
+mod comment_tests {
+    use super::{COMMENT_IDENTIFIER_CHARS, comment_literal};
+
+    #[test]
+    fn literal_comment_fields_use_bounded_code_spans() {
+        let cases = [
+            ("plain", "`plain`"),
+            ("a`b", "``a`b``"),
+            ("```", "```` ``` ````"),
+            ("", "` `"),
+            ("x\\", "`x\\`"),
+            ("a|b", "`a\\|b`"),
+            (" a ", "`  a  `"),
+            ("   ", "`   `"),
+            ("a\r\nb", "`a  b`"),
+        ];
+        for (input, expected) in cases {
+            let rendered = comment_literal(input, Some(COMMENT_IDENTIFIER_CHARS));
+            assert_eq!(rendered, expected);
+            assert!(rendered.chars().count() <= 130);
+        }
+        let rendered = comment_literal(&"a".repeat(300), Some(COMMENT_IDENTIFIER_CHARS));
+        assert_eq!(rendered, format!("`{}…`", "a".repeat(120)));
+        assert!(rendered.chars().count() <= 130);
+    }
+
+    #[test]
+    fn literal_comment_fields_preserve_unicode_and_escaped_pipe_boundaries() {
+        assert_eq!(comment_literal("x\\|y", None), "`x\\`<!---->`\\|y`");
+        assert_eq!(comment_literal("x\\\\|y", None), "`x\\\\\\|y`");
+        assert_eq!(
+            comment_literal("😀".repeat(121).as_str(), Some(120)),
+            format!("`{}…`", "😀".repeat(120))
+        );
+        let ticks = "`".repeat(120);
+        let rendered = comment_literal(&ticks, Some(120));
+        assert_eq!(
+            rendered,
+            format!("{} {ticks} {}", "`".repeat(121), "`".repeat(121))
+        );
+    }
 }

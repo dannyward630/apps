@@ -620,6 +620,8 @@ struct GitHubMock {
     repository_admin: std::sync::atomic::AtomicBool,
     repository_delay_ms: std::sync::atomic::AtomicU64,
     membership_mode: std::sync::atomic::AtomicU8,
+    capture_comments: std::sync::atomic::AtomicBool,
+    comments: std::sync::Mutex<Vec<(String, String)>>,
     gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     resolve_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
@@ -636,6 +638,82 @@ struct Fixture {
     commit: String,
     finalized: Arc<std::sync::Mutex<Vec<String>>>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_pull_request_comment_renders_identifiers_literally_on_post_and_patch() {
+    use std::sync::atomic::Ordering;
+
+    let f = fixture().await;
+    let (status, connected) = f.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let repository_id = connected["repository"]["id"].as_str().unwrap();
+    let (_, issued) = f
+        .call(
+            "IssueToken",
+            "Bearer manager",
+            json!({"repositoryId":repository_id,"expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()}),
+        )
+        .await;
+    let token = format!("Bearer {}", issued["token"].as_str().unwrap());
+    f.github.capture_comments.store(true, Ordering::SeqCst);
+
+    let dataset_id = "@org/team";
+    let row_id = "[x](https://example.invalid/)![i](https://example.invalid/i.png) #1 owner/repo#1 :+1: x\\|y `z`";
+    let column_id = "c|d";
+    let dataset = json!({"id":dataset_id,"name":"Size","columns":[{"id":column_id,"unit":"B","direction":"DIRECTION_LOWER"}]});
+    let context = json!({"repositoryId":repository_id,"executionId":"literal-comment","commit":f.commit,"branch":"main","pullRequest":"1","baselineCommit":f.commit});
+    let (status, uploaded) = f
+        .call(
+            "Upload",
+            &token,
+            json!({"context":context,"dataset":dataset,"rows":[{"id":row_id,"values":{column_id:"1"}}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{uploaded}");
+    assert!(uploaded.get("warnings").is_none(), "{uploaded}");
+
+    let large_row_id = format!("{}END", "n".repeat(1 << 20));
+    let (status, uploaded) = f
+        .call(
+            "Upload",
+            &token,
+            json!({"context":context,"dataset":dataset,"rows":[{"id":large_row_id,"values":{column_id:"2"}}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{uploaded}");
+    assert!(uploaded.get("warnings").is_none(), "{uploaded}");
+
+    let comments = f.github.comments.lock().unwrap().clone();
+    assert_eq!(comments.len(), 2);
+    assert_eq!(comments[0].0, "POST");
+    assert_eq!(comments[1].0, "PATCH");
+    for (_, body) in comments.iter() {
+        assert!(body.starts_with("<!-- git-tracker -->\n### Git Tracker\n"));
+        assert!(body.contains("[Execution details](https://git-tracker.delino.io/"));
+        assert!(body.contains("| Dataset / item / column | Value | Change | Result |"));
+        assert!(body.contains("`@org/team`"));
+        assert!(body.contains("`c\\|d`"));
+        assert!(body.contains("<!---->"));
+        assert!(body.contains("owner/repo#1 :+1:"));
+        assert!(!body.contains("More rows are available"));
+    }
+    assert!(comments[1].1.contains(&format!("`{}…`", "n".repeat(120))));
+    assert!(comments[1].1.len() < 60_000);
+    let (status, details) = f
+        .call(
+            "GetExecution",
+            "",
+            json!({"repositoryId":repository_id,"executionId":"literal-comment"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{details}");
+    let measurement = &details["execution"]["measurements"][0];
+    assert_eq!(measurement["dataset"]["id"], dataset_id);
+    let rows = measurement["rows"].as_array().unwrap();
+    assert!(rows.iter().any(|row| row["id"] == row_id));
+    assert!(rows.iter().any(|row| row["id"] == large_row_id));
 }
 
 async fn fixture() -> Fixture {
@@ -693,6 +771,8 @@ async fn fixture_with_deadlines(
         repository_admin: true.into(),
         repository_delay_ms: 0.into(),
         membership_mode: 0.into(),
+        capture_comments: false.into(),
+        comments: std::sync::Mutex::new(Vec::new()),
         gate: std::sync::Mutex::new(None),
         resolve_gate: std::sync::Mutex::new(None),
     });
@@ -752,6 +832,33 @@ async fn fixture_with_deadlines(
                     StatusCode::from_u16(status).unwrap(),
                     Json(json!({"message":"provider-body-must-stay-private"})),
                 );
+            }
+            if github.capture_comments.load(Ordering::SeqCst) {
+                if p == "/repos/owner/repo/issues/1/comments"
+                    && r.method() == axum::http::Method::GET
+                {
+                    let comments = github.comments.lock().unwrap();
+                    let out = if comments.is_empty() {
+                        json!([])
+                    } else {
+                        json!([{"id":1,"body":"<!-- git-tracker -->","performed_via_github_app":{"id":1}}])
+                    };
+                    return (StatusCode::OK, Json(out));
+                }
+                if (p == "/repos/owner/repo/issues/1/comments"
+                    && r.method() == axum::http::Method::POST)
+                    || (p == "/repos/owner/repo/issues/comments/1"
+                        && r.method() == axum::http::Method::PATCH)
+                {
+                    let method = r.method().as_str().to_owned();
+                    let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    github.comments.lock().unwrap().push((
+                        method,
+                        request["body"].as_str().unwrap().to_owned(),
+                    ));
+                    return (StatusCode::OK, Json(json!({"id":1})));
+                }
             }
             let private = github.private.load(Ordering::SeqCst);
             let membership_mode = github.membership_mode.load(Ordering::SeqCst);
