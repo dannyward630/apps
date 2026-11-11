@@ -132,6 +132,14 @@ pub async fn middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let git_tracker_api = matches!(policy.service, Service::GitTracker)
+        && request
+            .uri()
+            .path()
+            .starts_with("/gittracker.v1.GitTrackerService/");
+    let git_tracker_webhook = matches!(policy.service, Service::GitTracker)
+        && request.method() == Method::POST
+        && request.uri().path() == "/github/events";
     let correlation =
         matches!(policy.service, Service::GitTracker).then(|| CorrelationId(uuid::Uuid::now_v7()));
     if let Some(correlation) = correlation {
@@ -155,6 +163,7 @@ pub async fn middleware(
         && (policy.origin.is_empty() || origin.as_bytes() != policy.origin.as_bytes())
     {
         let mut response = StatusCode::FORBIDDEN.into_response();
+        record_git_tracker_response(&policy, git_tracker_api, false, response.status());
         stamp_correlation(&mut response, correlation);
         return response;
     }
@@ -228,7 +237,25 @@ pub async fn middleware(
         response
             .headers_mut()
             .insert("Cache-Control", HeaderValue::from_static("no-store"));
-        let code = response.status().as_u16();
+        record_git_tracker_response(
+            &policy,
+            git_tracker_api,
+            git_tracker_webhook && !preflight,
+            response.status(),
+        );
+    }
+    stamp_correlation(&mut response, correlation);
+    response
+}
+
+/// Counts only the Git Tracker API population used by its error-rate alert. Routed webhook
+/// POSTs have a separate, bounded outcome series, including extractor and timeout responses.
+fn record_git_tracker_response(policy: &Policy, api: bool, webhook: bool, status: StatusCode) {
+    if !matches!(policy.service, Service::GitTracker) {
+        return;
+    }
+    let code = status.as_u16();
+    if api {
         policy
             .metrics
             .requests
@@ -241,8 +268,22 @@ pub async fn middleware(
             }])
             .inc();
     }
-    stamp_correlation(&mut response, correlation);
-    response
+    if webhook {
+        policy
+            .metrics
+            .events
+            .with_label_values(&[
+                "webhook",
+                if code >= 500 {
+                    "failure"
+                } else if code >= 400 {
+                    "rejected"
+                } else {
+                    "success"
+                },
+            ])
+            .inc();
+    }
 }
 
 fn stamp_correlation(response: &mut Response, correlation: Option<CorrelationId>) {
@@ -371,9 +412,14 @@ mod tests {
     async fn timeouts_include_correlation_for_handlers_and_slow_bodies() {
         for service in [Service::DevBase, Service::GitTracker] {
             let metrics = Arc::new(Metrics::new(service));
+            let path = if matches!(service, Service::GitTracker) {
+                "/gittracker.v1.GitTrackerService/Slow"
+            } else {
+                "/rpc"
+            };
             let app = Router::new()
                 .route(
-                    "/rpc",
+                    path,
                     post(|_: Bytes| async {
                         tokio::time::sleep(Duration::from_secs(10)).await;
                     }),
@@ -394,7 +440,7 @@ mod tests {
             for slow_body in [false, true] {
                 let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
                 let length = if slow_body { 1 } else { 0 };
-                socket.write_all(format!("POST /rpc HTTP/1.1\r\nHost: localhost\r\nOrigin: https://console.example\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                socket.write_all(format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: https://console.example\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
                 let mut raw = String::new();
                 tokio::time::timeout(Duration::from_secs(2), socket.read_to_string(&mut raw))
                     .await
@@ -582,10 +628,199 @@ mod tests {
             .map(|value| value.to_str().unwrap())
             .collect();
         assert_eq!(exposures, ["X-Correlation-Id, X-Extra"]);
-        // The existing CORS rejection remains outside request accounting.
+        // None of these probe and synthetic paths contributes to API accounting.
         assert_eq!(
             metrics.requests.with_label_values(&["client_error"]).get(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn git_tracker_counts_only_api_paths_and_routed_webhook_posts() {
+        let metrics = Arc::new(Metrics::new(Service::GitTracker));
+        let app = Router::new()
+            .route("/healthz", get(|| async { StatusCode::OK }))
+            .route("/readyz", get(|| async { StatusCode::SERVICE_UNAVAILABLE }))
+            .route("/metrics", get(|| async { StatusCode::OK }))
+            .route(
+                "/github/events",
+                post(
+                    |body: Result<Bytes, axum::extract::rejection::BytesRejection>| async move {
+                        match body {
+                            Err(rejection) => rejection.into_response(),
+                            Ok(body) => match body.as_ref() {
+                                b"ok" => StatusCode::NO_CONTENT.into_response(),
+                                b"bad" => StatusCode::UNAUTHORIZED.into_response(),
+                                _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                            },
+                        }
+                    },
+                )
+                .layer(axum::extract::DefaultBodyLimit::max(4)),
+            )
+            .route(
+                "/gittracker.v1.GitTrackerService/Example",
+                axum::routing::any(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/gittracker.v1.GitTrackerService/Failure",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Policy {
+                    origin: "https://console.example".into(),
+                    timeout: Duration::from_secs(1),
+                    service: Service::GitTracker,
+                    metrics: metrics.clone(),
+                    procedure: None,
+                },
+                middleware,
+            ));
+        let send = |method: Method, path: &'static str, origin: Option<&'static str>, body| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder().method(method).uri(path);
+                if let Some(origin) = origin {
+                    request = request.header("Origin", origin);
+                }
+                tower::ServiceExt::oneshot(app, request.body(axum::body::Body::from(body)).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+        let api = |outcome| metrics.requests.with_label_values(&[outcome]).get();
+        let webhook = |category| {
+            metrics
+                .events
+                .with_label_values(&["webhook", category])
+                .get()
+        };
+
+        for path in ["/healthz", "/readyz", "/metrics"] {
+            send(Method::GET, path, None, "").await;
+        }
+        send(
+            Method::OPTIONS,
+            "/github/events",
+            Some("https://console.example"),
+            "",
+        )
+        .await;
+        send(
+            Method::POST,
+            "/github/events",
+            Some("https://other.example"),
+            "ok",
+        )
+        .await;
+        assert_eq!(
+            (api("success"), api("client_error"), api("server_error")),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            (webhook("success"), webhook("rejected"), webhook("failure")),
+            (0, 0, 0)
+        );
+
+        for (body, status) in [
+            ("ok", StatusCode::NO_CONTENT),
+            ("bad", StatusCode::UNAUTHORIZED),
+            ("fail", StatusCode::SERVICE_UNAVAILABLE),
+            ("large", StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            assert_eq!(
+                send(Method::POST, "/github/events", None, body)
+                    .await
+                    .status(),
+                status
+            );
+        }
+        assert_eq!(
+            (webhook("success"), webhook("rejected"), webhook("failure")),
+            (1, 2, 1)
+        );
+        assert_eq!(
+            (api("success"), api("client_error"), api("server_error")),
+            (0, 0, 0)
+        );
+
+        let prefix = "/gittracker.v1.GitTrackerService/Example";
+        assert_eq!(
+            send(Method::POST, prefix, None, "").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(Method::OPTIONS, prefix, Some("https://console.example"), "")
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let denied = send(Method::POST, prefix, Some("https://other.example"), "").await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(!denied.headers().contains_key("Access-Control-Allow-Origin"));
+        assert!(denied.headers().contains_key("X-Correlation-Id"));
+        assert_eq!(
+            send(
+                Method::GET,
+                "/gittracker.v1.GitTrackerService/Failure",
+                None,
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            (api("success"), api("client_error"), api("server_error")),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            (webhook("success"), webhook("rejected"), webhook("failure")),
+            (1, 2, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn git_tracker_webhook_timeout_records_one_failure() {
+        let metrics = Arc::new(Metrics::new(Service::GitTracker));
+        let app = Router::new()
+            .route(
+                "/github/events",
+                post(|| async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Policy {
+                    origin: String::new(),
+                    timeout: Duration::from_millis(10),
+                    service: Service::GitTracker,
+                    metrics: metrics.clone(),
+                    procedure: None,
+                },
+                middleware,
+            ));
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::post("/github/events")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            metrics
+                .events
+                .with_label_values(&["webhook", "failure"])
+                .get(),
             1
+        );
+        assert!(
+            !metrics
+                .encode()
+                .contains("git_tracker_http_requests_total{")
         );
     }
 
@@ -841,6 +1076,20 @@ mod tests {
                     }),
                 )
                 .route(
+                    "/gittracker.v1.GitTrackerService/Bare",
+                    post(|| async { StatusCode::GATEWAY_TIMEOUT }),
+                )
+                .route(
+                    "/gittracker.v1.GitTrackerService/Typed",
+                    post(|| async {
+                        (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            [("X-Correlation-Id", "existing-trace")],
+                            "typed",
+                        )
+                    }),
+                )
+                .route(
                     "/typed",
                     post(|| async {
                         (
@@ -897,7 +1146,7 @@ mod tests {
         });
         let response = tower::ServiceExt::oneshot(
             git_tracker.clone(),
-            Request::post("/bare")
+            Request::post("/gittracker.v1.GitTrackerService/Bare")
                 .header("Origin", "https://console.example")
                 .body(axum::body::Body::empty())
                 .unwrap(),
@@ -934,7 +1183,7 @@ mod tests {
 
         // Git Tracker: a 504 that already carries its correlation ID is passed through unchanged
         // and still counts once.
-        let (parts, body) = send(git_tracker, "/typed").await;
+        let (parts, body) = send(git_tracker, "/gittracker.v1.GitTrackerService/Typed").await;
         assert_eq!(parts.headers["x-correlation-id"], "existing-trace");
         assert_eq!(&body[..], b"typed");
         assert_eq!(

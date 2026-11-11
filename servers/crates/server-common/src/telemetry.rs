@@ -81,6 +81,9 @@ impl Metrics {
                     ["persistence", "failure"],
                     ["github", "failure"],
                     ["execution", "interrupted"],
+                    ["webhook", "success"],
+                    ["webhook", "rejected"],
+                    ["webhook", "failure"],
                 ] {
                     events.with_label_values(&labels);
                 }
@@ -175,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn git_tracker_initializes_only_alerted_event_series() {
+    fn git_tracker_initializes_alerted_and_webhook_event_series() {
         let metrics = Metrics::new(Service::GitTracker);
         let mut samples = event_samples(&metrics);
         samples.sort();
@@ -184,7 +187,10 @@ mod tests {
             [
                 "git_tracker_events_total{category=\"failure\",kind=\"github\"} 0",
                 "git_tracker_events_total{category=\"failure\",kind=\"persistence\"} 0",
+                "git_tracker_events_total{category=\"failure\",kind=\"webhook\"} 0",
                 "git_tracker_events_total{category=\"interrupted\",kind=\"execution\"} 0",
+                "git_tracker_events_total{category=\"rejected\",kind=\"webhook\"} 0",
+                "git_tracker_events_total{category=\"success\",kind=\"webhook\"} 0",
             ]
         );
 
@@ -199,7 +205,10 @@ mod tests {
             [
                 "git_tracker_events_total{category=\"failure\",kind=\"github\"} 1",
                 "git_tracker_events_total{category=\"failure\",kind=\"persistence\"} 0",
+                "git_tracker_events_total{category=\"failure\",kind=\"webhook\"} 0",
                 "git_tracker_events_total{category=\"interrupted\",kind=\"execution\"} 0",
+                "git_tracker_events_total{category=\"rejected\",kind=\"webhook\"} 0",
+                "git_tracker_events_total{category=\"success\",kind=\"webhook\"} 0",
             ]
         );
     }
