@@ -788,8 +788,9 @@ async fn fixture_with_deadlines(
                 "/repos/owner/repo/installation" => json!({"id":1}),
                 "/app/installations/1/access_tokens" => json!({"token":"installation"}),
                 "/repos/owner/repo/pulls/1" => {
-                    json!({"base":{"ref":if membership_mode == 2 {"release"} else {"main"},"sha":commit},"head":{"sha":if membership_mode == 0 {commit.clone()} else {"b".repeat(40)}}})
+                    json!({"base":{"ref":if membership_mode == 2 {"release"} else {"main"},"sha":if membership_mode == 10 {"b".repeat(40)} else {commit.clone()}},"head":{"sha":if membership_mode == 0 || membership_mode == 10 {commit.clone()} else {"b".repeat(40)},"repo":{"id":43}}})
                 }
+                p if membership_mode == 10 && p.starts_with("/repos/owner/repo/compare/") => json!({"merge_base_commit":{"sha":"b".repeat(40)}}),
                 "/repos/owner/repo/pulls/1/commits" if membership_mode == 6 => json!([{"sha":null}]),
                 "/repos/owner/repo/pulls/1/commits" if membership_mode != 0 => json!([]),
                 "/graphql" if membership_mode == 1 || membership_mode == 7 => json!({"data":{"repository":{"databaseId":42,"pullRequest":{"id":"fixture-pr","number":1,"state":"OPEN","baseRefName":"main","headRefOid":"b".repeat(40),"commits":{"totalCount":if membership_mode == 7 {1} else {0},"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}),
@@ -798,7 +799,12 @@ async fn fixture_with_deadlines(
                     json!({"ref":"refs/heads/main","object":{"type":"commit","sha":commit}})
                 }
                 p if p.starts_with("/repos/owner/repo/commits/") => {
-                    json!({"sha":if membership_mode == 4 {p.rsplit('/').next().unwrap().to_owned()} else {commit},"parents":[]})
+                    let sha = p.rsplit('/').next().unwrap();
+                    if membership_mode == 10 {
+                        json!({"sha":sha,"parents":if sha == "c".repeat(40) {json!([{"sha":"b".repeat(40)},{"sha":commit}])} else if sha == commit {json!([{"sha":"b".repeat(40)}])} else {json!([])}})
+                    } else {
+                        json!({"sha":if membership_mode == 4 {sha.to_owned()} else {commit},"parents":[]})
+                    }
                 }
                 _ => return (StatusCode::UNAUTHORIZED, Json(json!({"code":"unauthenticated"}))),
             };
@@ -869,6 +875,168 @@ async fn fixture_with_deadlines(
         finalized,
         _tasks: vec![mock_task, task],
     }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL"]
+async fn postgres_pull_request_oidc_explicit_baseline_uses_connected_repository_identity() {
+    use std::sync::atomic::Ordering;
+
+    let f = fixture().await;
+    let (status, connected) = f.connect().await;
+    assert_eq!(status, StatusCode::OK, "{connected}");
+    let repository_id = connected["repository"]["id"].as_str().unwrap();
+    f.github.membership_mode.store(10, Ordering::SeqCst);
+    let (_, issued) = f
+        .call(
+            "IssueToken",
+            "Bearer manager",
+            json!({
+                "repositoryId":repository_id,
+                "expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339()
+            }),
+        )
+        .await;
+    let repository_token = format!("Bearer {}", issued["token"].as_str().unwrap());
+    let baseline = "b".repeat(40);
+    let merge = "c".repeat(40);
+    let dataset = json!({"id":"size","name":"Size","columns":[{"id":"bytes","unit":"B","direction":"DIRECTION_LOWER"}]});
+    let baseline_context = json!({"repositoryId":repository_id,"executionId":"baseline","commit":baseline,"branch":"main"});
+    let (status, uploaded) = f.call("Upload", &repository_token, json!({
+        "context":baseline_context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"10"}}]
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{uploaded}");
+    let (status, completed) = f
+        .call(
+            "Complete",
+            &repository_token,
+            json!({"context":baseline_context}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{completed}");
+
+    let now = chrono::Utc::now().timestamp();
+    let mut claims = json!({
+        "iss":"https://token.actions.githubusercontent.com",
+        "aud":"https://git-tracker.api.delino.io",
+        "exp":now+300,"nbf":now-10,
+        "repository_id":"42","run_id":"1","run_attempt":"1",
+        "sha":merge,"ref":"refs/pull/1/merge",
+        "sub":"repo:owner/repo:pull_request","event_name":"pull_request"
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("fixture".into());
+    let sign = |claims: &Value| {
+        format!(
+            "Actions {}",
+            jsonwebtoken::encode(&header, claims, &EncodingKey::from_rsa_pem(KEY).unwrap())
+                .unwrap()
+        )
+    };
+    let mut context = json!({
+        "repositoryId":repository_id,"executionId":"42/1/1","commit":f.commit,
+        "branch":"main","pullRequest":"1","baselineCommit":baseline
+    });
+    let (status, uploaded) = f
+        .call(
+            "Upload",
+            &sign(&claims),
+            json!({
+                "context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"12"}}]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{uploaded}");
+    assert_eq!(uploaded["comparisons"][0]["baselineCommit"], baseline);
+    assert_eq!(
+        uploaded["comparisons"][0]["baselineExecutionId"],
+        "baseline"
+    );
+    let (status, saved) = f
+        .call(
+            "GetExecution",
+            "",
+            json!({
+                "repositoryId":repository_id,"executionId":"42/1/1"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["execution"]["context"]["baselineCommit"], baseline);
+    assert_eq!(saved["comparisons"][0]["baselineCommit"], baseline);
+
+    claims["repository_id"] = "43".into();
+    claims["run_id"] = "2".into();
+    context["executionId"] = "43/2/1".into();
+    let (status, denied) = f
+        .call(
+            "Upload",
+            &sign(&claims),
+            json!({
+                "context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"13"}}]
+            }),
+        )
+        .await;
+    assert!(!status.is_success(), "{denied}");
+    assert_eq!(denied["code"], "permission_denied");
+    let registered: bool = sqlx::query_scalar(&format!(
+        "SELECT jsonb_exists(state->'records',$1) FROM {}.git_tracker_repositories WHERE id=$2",
+        f.schema
+    ))
+    .bind("43/2/1")
+    .bind(uuid::Uuid::parse_str(repository_id).unwrap())
+    .fetch_one(&f.admin)
+    .await
+    .unwrap();
+    assert!(!registered);
+
+    for (rid, run) in [("42", "3"), ("43", "4")] {
+        claims["repository_id"] = rid.into();
+        claims["run_id"] = run.into();
+        context["executionId"] = format!("{rid}/{run}/1").into();
+        context["baselineCommit"] = "".into();
+        let (status, uploaded) = f.call("Upload", &sign(&claims), json!({
+            "context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"14"}}]
+        })).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "credential repository {rid}: {uploaded}"
+        );
+    }
+
+    claims["repository_id"] = "42".into();
+    claims["run_id"] = "5".into();
+    claims["sha"] = f.commit.clone().into();
+    claims["ref"] = "refs/heads/main".into();
+    claims["sub"] = "repo:owner/repo:ref:refs/heads/main".into();
+    claims["event_name"] = "push".into();
+    context["executionId"] = "42/5/1".into();
+    context["pullRequest"] = "0".into();
+    let (status, uploaded) = f
+        .call(
+            "Upload",
+            &sign(&claims),
+            json!({
+                "context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"15"}}]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{uploaded}");
+
+    context["executionId"] = "token-pr".into();
+    context["pullRequest"] = "1".into();
+    context["baselineCommit"] = baseline.into();
+    let (status, uploaded) = f
+        .call(
+            "Upload",
+            &repository_token,
+            json!({
+                "context":context,"dataset":dataset,"rows":[{"id":"one","values":{"bytes":"16"}}]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{uploaded}");
 }
 
 #[tokio::test]

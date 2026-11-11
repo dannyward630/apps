@@ -90,7 +90,7 @@ jobs:
           repository-id: '019b0000-0000-7000-8000-000000000001'
 ```
 
-Jobs independentes compartilham o ID de execução padrão, `repository_id/run_id/run_attempt`, e podem enviar linhas disjuntas. Use um novo ID de execução para reexecuções. O OIDC do Actions exige a identidade padrão; IDs de execução personalizados são para chamadas com token de repositório. Uploads via OIDC de forks são limitados ao commit head do PR e não podem fornecer substituições da referência nem gravar no histórico de pushes do repositório upstream.
+Jobs independentes compartilham o ID de execução padrão, `repository_id/run_id/run_attempt`, e podem enviar linhas disjuntas. Use um novo ID de execução para reexecuções. O OIDC do Actions exige a identidade padrão; IDs de execução personalizados são para chamadas com token de repositório. Para um job de pull request cuja credencial OIDC pertence ao repositório conectado, defina a entrada `baseline` da Action para usar um SHA completo de commit explícito. Uploads via OIDC de forks são limitados ao commit head do PR e não podem fornecer substituições da referência nem gravar no histórico de pushes do repositório upstream.
 
 Cada job de upload avalia apenas as próprias linhas enviadas. Por padrão, as regressões são relatadas sem causar falha na CI. Defina `fail-on-regression: 'true'` para fazer esse job falhar em caso de regressões. A ausência de comparações não causa falha na CI. O job de conclusão apenas informa que a medição terminou; ele não envia o status de sucesso/falha/cancelamento da CI nem aplica critérios agregados de aprovação. Uma conclusão vazia é válida quando todos os jobs foram ignorados.
 

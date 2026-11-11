@@ -90,7 +90,7 @@ jobs:
           repository-id: '019b0000-0000-7000-8000-000000000001'
 ```
 
-Unabhängige Jobs teilen sich die standardmäßige Ausführungs-ID `repository_id/run_id/run_attempt` und können disjunkte Zeilen hochladen. Verwenden Sie für Wiederholungen eine neue Ausführungs-ID. Actions OIDC erfordert die Standardidentität; benutzerdefinierte Ausführungs-IDs sind für Aufrufer mit Repository-Token vorgesehen. OIDC-Uploads aus Forks sind auf den Head des PR beschränkt und können weder Baseline-Überschreibungen angeben noch in den Upstream-Push-Verlauf schreiben.
+Unabhängige Jobs teilen sich die standardmäßige Ausführungs-ID `repository_id/run_id/run_attempt` und können disjunkte Zeilen hochladen. Verwenden Sie für Wiederholungen eine neue Ausführungs-ID. Actions OIDC erfordert die Standardidentität; benutzerdefinierte Ausführungs-IDs sind für Aufrufer mit Repository-Token vorgesehen. Legen Sie bei einem Pull-Request-Job, dessen OIDC-Zugangsdaten zum verbundenen Repository gehören, die Eingabe `baseline` der Action fest, um eine explizite vollständige Commit-SHA zu verwenden. OIDC-Uploads aus Forks sind auf den Head des PR beschränkt und können weder Baseline-Überschreibungen angeben noch in den Upstream-Push-Verlauf schreiben.
 
 Jeder Upload-Job bewertet nur seine eigenen hochgeladenen Zeilen. Regressionen werden standardmäßig gemeldet, ohne dass CI fehlschlägt. Setzen Sie `fail-on-regression: 'true'`, damit dieser Job bei Regressionen fehlschlägt. Fehlende Vergleiche lassen CI nicht fehlschlagen. Der Abschlussjob meldet lediglich, dass die Messung beendet ist; er übermittelt weder CI-Erfolg, -Fehlschlag oder -Abbruch noch führt er eine aggregierte Freigabeprüfung durch. Ein leerer Abschluss ist gültig, wenn alle Jobs übersprungen wurden.
 

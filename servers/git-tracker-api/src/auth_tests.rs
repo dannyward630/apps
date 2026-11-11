@@ -4,13 +4,19 @@
 //! A loopback TCP mock serves the JWKS with a request counter, an arrival signal and gates for
 //! the response head and the response body. A controlled monotonic clock moves the 30-second
 //! attempt interval and the 300-second snapshot freshness without sleeping.
-use crate::auth::Actions;
+use crate::{Server, auth::Actions, github::GitHub};
+use axum::{Json, Router, extract::Request, http::StatusCode};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use connectrpc::ErrorCode;
+use delino_protocol::gittracker::v1::{Context, Repository};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, jwk::JwkSet};
 use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey, traits::PublicKeyParts};
 use serde_json::{Value, json};
 use server_common::Fault;
+use server_common::{
+    authority::Authority,
+    telemetry::{Metrics, Service},
+};
 use std::{
     sync::{
         Arc, Mutex,
@@ -192,6 +198,142 @@ fn token(kid: &str) -> String {
 
 fn code(result: Result<Value, Fault>) -> ErrorCode {
     result.expect_err("verification must fail").code
+}
+
+#[tokio::test]
+async fn pull_request_oidc_baseline_uses_credential_repository_identity() {
+    const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BASE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const MERGE: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    let mock = Router::new().fallback(|request: Request| async move {
+        let path = request.uri().path();
+        let body = match path {
+            "/app/installations/1/access_tokens" => json!({"token":"fixture-installation"}),
+            "/repos/owner/repo/pulls/1" => json!({
+                "base":{"ref":"main","sha":BASE},
+                "head":{"sha":HEAD,"repo":{"id":43}}
+            }),
+            p if p.starts_with("/repos/owner/repo/commits/") => {
+                let sha = p.rsplit('/').next().unwrap();
+                json!({"sha":sha,"parents":[{"sha":BASE},{"sha":if sha == MERGE {HEAD} else {BASE}}]})
+            }
+            _ => return (StatusCode::NOT_FOUND, Json(json!({}))),
+        };
+        (StatusCode::OK, Json(body))
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let private = RsaPrivateKey::from_pkcs8_pem(std::str::from_utf8(KEY).unwrap()).unwrap();
+    let jwks: JwkSet = serde_json::from_value(json!({"keys":[{
+        "kty":"RSA","kid":"fixture","alg":"RS256","use":"sig",
+        "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+        "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())
+    }]}))
+    .unwrap();
+    let http = reqwest::Client::new();
+    let server = Server {
+        db: sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/unused")
+            .unwrap(),
+        authority: Authority::new(
+            http.clone(),
+            base.clone(),
+            format!("{base}/token"),
+            "resource".into(),
+            "client".into(),
+            "fixture".into(),
+        ),
+        github: GitHub::new(
+            http.clone(),
+            base.clone(),
+            "1".into(),
+            EncodingKey::from_rsa_pem(KEY).unwrap(),
+        ),
+        actions: Actions::new(http, format!("{base}/jwks"), jwks),
+        audit_retention: chrono::Duration::days(90),
+        webhook_secret: "fixture-only".into(),
+        metrics: Arc::new(Metrics::new(Service::GitTracker)),
+    };
+    let repository = Repository {
+        github_repository_id: "42".into(),
+        installation_id: "1".into(),
+        full_name: "owner/repo".into(),
+        connected: true,
+        ..Default::default()
+    };
+    let now = chrono::Utc::now().timestamp();
+    let base_claims = json!({
+        "iss":"https://token.actions.githubusercontent.com",
+        "aud":"https://git-tracker.api.delino.io",
+        "exp":now+300,"nbf":now-10,
+        "repository_id":"42","run_id":"1","run_attempt":"1",
+        "sha":MERGE,"ref":"refs/pull/1/merge",
+        "sub":"repo:owner/repo:pull_request","event_name":"pull_request"
+    });
+    let context = Context {
+        repository_id: "repository".into(),
+        execution_id: "42/1/1".into(),
+        commit: HEAD.into(),
+        branch: "main".into(),
+        pull_request: 1,
+        baseline_commit: BASE.into(),
+        ..Default::default()
+    };
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("fixture".into());
+    for (rid, baseline, allowed) in [
+        ("42", BASE, true),
+        ("43", BASE, false),
+        ("42", "", true),
+        ("43", "", true),
+    ] {
+        let mut claims = base_claims.clone();
+        claims["repository_id"] = rid.into();
+        let mut context = context.clone();
+        context.execution_id = format!("{rid}/1/1");
+        context.baseline_commit = baseline.into();
+        let token = sign(header.clone(), &claims);
+        let result = server.verify_actions(&token, &repository, &context).await;
+        assert_eq!(
+            result.is_ok(),
+            allowed,
+            "credential repository {rid}, baseline {baseline}"
+        );
+        if !allowed {
+            assert_eq!(result.unwrap_err().code, ErrorCode::PermissionDenied);
+        }
+    }
+    let mut denied_cases = Vec::new();
+    let mut wrong_event = base_claims.clone();
+    wrong_event["event_name"] = "push".into();
+    denied_cases.push((wrong_event, context.clone()));
+    let mut wrong_ref = base_claims.clone();
+    wrong_ref["ref"] = "refs/pull/2/merge".into();
+    denied_cases.push((wrong_ref, context.clone()));
+    let mut wrong_sub = base_claims.clone();
+    wrong_sub["sub"] = "repo:owner/repo:ref:refs/heads/main".into();
+    denied_cases.push((wrong_sub, context.clone()));
+    let mut wrong_merge = base_claims.clone();
+    wrong_merge["sha"] = "dddddddddddddddddddddddddddddddddddddddd".into();
+    denied_cases.push((wrong_merge, context.clone()));
+    let mut wrong_identity = context.clone();
+    wrong_identity.execution_id = "42/2/1".into();
+    denied_cases.push((base_claims.clone(), wrong_identity));
+    let mut wrong_base = context.clone();
+    wrong_base.branch = "release".into();
+    denied_cases.push((base_claims.clone(), wrong_base));
+    let mut wrong_repository = base_claims.clone();
+    wrong_repository["repository_id"] = "44".into();
+    let mut wrong_repository_context = context.clone();
+    wrong_repository_context.execution_id = "44/1/1".into();
+    denied_cases.push((wrong_repository, wrong_repository_context));
+    for (claims, context) in denied_cases {
+        let token = sign(header.clone(), &claims);
+        let result = server.verify_actions(&token, &repository, &context).await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::PermissionDenied);
+    }
+    task.abort();
 }
 
 #[tokio::test]

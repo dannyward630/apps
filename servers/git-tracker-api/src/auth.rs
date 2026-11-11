@@ -288,7 +288,12 @@ impl Server {
         }
         self.authority.allow(h, &r.space_id, role).await
     }
-    async fn verify_actions(&self, raw: &str, r: &Repository, c: &Context) -> Result<()> {
+    pub(crate) async fn verify_actions(
+        &self,
+        raw: &str,
+        r: &Repository,
+        c: &Context,
+    ) -> Result<()> {
         if !r.connected {
             return Err(Fault::denied());
         }
@@ -321,7 +326,7 @@ impl Server {
         }
         let p = self.github.pull(r, c.pull_request).await?;
         if c.branch != string(&p["base"], "ref")
-            || !c.baseline_commit.is_empty()
+            || (!c.baseline_commit.is_empty() && rid != r.github_repository_id)
             || (rid != r.github_repository_id
                 && rid != integer(&p["head"]["repo"], "id").to_string())
         {
