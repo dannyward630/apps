@@ -513,6 +513,138 @@ fn frozen_row_baselines_exclude_forks_and_survive_deletion() {
     );
     assert!(s.complete(&target, at).is_err());
 }
+
+#[test]
+fn bounded_ancestry_keeps_near_baselines_and_freezes_first_upload_cutoff() {
+    let mut state = State::default();
+    let at = Utc::now();
+    let dataset = dataset();
+    let sha = |index: usize| format!("{index:040x}");
+    let near = context("near", &sha(4960));
+    state
+        .upload(
+            &near,
+            &dataset,
+            &[row("near-row", "10")],
+            at,
+            vec![],
+            String::new(),
+        )
+        .unwrap();
+    state.complete(&near, at).unwrap();
+    let far = context("far", &sha(3500));
+    state
+        .upload(
+            &far,
+            &dataset,
+            &[row("far-row", "20")],
+            at,
+            vec![],
+            String::new(),
+        )
+        .unwrap();
+    state.complete(&far, at).unwrap();
+
+    let ancestors = (4000..5000).rev().map(sha).collect::<Vec<_>>();
+    let target = context("target", &sha(5000));
+    state
+        .upload(
+            &target,
+            &dataset,
+            &[row("near-row", "11")],
+            at + Duration::seconds(1),
+            ancestors.clone(),
+            String::new(),
+        )
+        .unwrap();
+    let late = context("late", &sha(4990));
+    state
+        .upload(
+            &late,
+            &dataset,
+            &[row("far-row", "25")],
+            at + Duration::seconds(2),
+            vec![],
+            String::new(),
+        )
+        .unwrap();
+    state.complete(&late, at + Duration::seconds(2)).unwrap();
+    state
+        .upload(
+            &target,
+            &dataset,
+            &[row("far-row", "21")],
+            at + Duration::seconds(3),
+            ancestors,
+            String::new(),
+        )
+        .unwrap();
+    assert_eq!(state.records["target"].ancestors.len(), 1000);
+    let comparisons = state.comparisons(&state.records["target"], None);
+    let near_comparison = comparisons
+        .iter()
+        .find(|comparison| comparison.row_id == "near-row")
+        .unwrap();
+    let far_comparison = comparisons
+        .iter()
+        .find(|comparison| comparison.row_id == "far-row")
+        .unwrap();
+    assert_eq!(near_comparison.baseline_commit, sha(4960));
+    assert_eq!(near_comparison.baseline_execution_id, "near");
+    assert_eq!(far_comparison.status, COMPARISON_STATUS_UNAVAILABLE);
+    assert!(far_comparison.baseline_execution_id.is_empty());
+}
+
+#[test]
+fn stored_ancestry_accepts_prefix_extension_but_rejects_divergence() {
+    let mut state = State::default();
+    let at = Utc::now();
+    let dataset = dataset();
+    let context = context("target", "target");
+    let prefix = (0..1000).map(|i| format!("{i:040x}")).collect::<Vec<_>>();
+    state
+        .upload(
+            &context,
+            &dataset,
+            &[row("one", "1")],
+            at,
+            prefix.clone(),
+            String::new(),
+        )
+        .unwrap();
+    let mut extended = prefix.clone();
+    extended.push(format!("{:040x}", 1000));
+    state
+        .upload(
+            &context,
+            &dataset,
+            &[row("two", "2")],
+            at,
+            extended.clone(),
+            String::new(),
+        )
+        .unwrap();
+    assert_eq!(state.records["target"].ancestors, extended);
+    let mut divergent = prefix;
+    divergent[40] = "f".repeat(40);
+    divergent.push(format!("{:040x}", 1000));
+    divergent.push(format!("{:040x}", 1001));
+    let fault = state
+        .upload(
+            &context,
+            &dataset,
+            &[row("three", "3")],
+            at,
+            divergent,
+            String::new(),
+        )
+        .unwrap_err();
+    assert_eq!(fault.message, "Git ancestry changed");
+    assert_eq!(
+        state.records["target"].execution.measurements[0].rows.len(),
+        2
+    );
+}
 #[test]
 fn current_storage_rows_round_trip() {
     let raw = serde_json::json!({"next":1,"records":{"run":{"execution":{"context":{"repositoryId":"r","executionId":"run","commit":"a","branch":"main","pullRequest":"3"},"state":"EXECUTION_STATE_MEASURING","registeredAt":"2026-01-01T00:00:00Z","registrationOrder":"00000000000000000001","measurements":[{"dataset":{"id":"d","name":"D","columns":[{"id":"size","unit":"B","direction":"DIRECTION_LOWER"}]},"rows":[{"id":"r","values":{"CamelKey":"1"}}]}]},"last_data":"2026-01-01T00:00:00Z","cutoff":"2026-01-01T00:00:00Z","ancestors":[],"removed":{},"base":{"execution":"","commit":""},"push":false,"baselines":{}}}});

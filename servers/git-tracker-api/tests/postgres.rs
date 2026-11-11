@@ -813,6 +813,12 @@ async fn fixture_with_deadlines(
                 "/repos/owner/repo/git/ref/heads/main" => {
                     json!({"ref":"refs/heads/main","object":{"type":"commit","sha":commit}})
                 }
+                "/repos/owner/repo/commits" if membership_mode == 10 => {
+                    json!([
+                        {"sha":commit,"parents":[{"sha":"b".repeat(40)}]},
+                        {"sha":"b".repeat(40),"parents":[]}
+                    ])
+                }
                 p if p.starts_with("/repos/owner/repo/commits/") => {
                     let sha = p.rsplit('/').next().unwrap();
                     if membership_mode == 10 {

@@ -6,10 +6,17 @@ use delino_protocol::gittracker::v1::{
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};
 use server_common::{Fault, Result, authority::bounded_json, integer, string};
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 /// Default wall-clock budget for one pull request membership check, covering the REST fast path
 /// and the GraphQL traversal. Expiry fails closed as unavailable; it never proves non-membership.
 pub const MEMBERSHIP_DEADLINE: Duration = Duration::from_secs(120);
+/// Maximum number of nearest first-parent commits retained for a new push execution.
+pub const MAX_ANCESTORS: usize = 1000;
+/// Wall-clock budget for collecting push ancestry, excluding branch membership verification.
+pub const ANCESTRY_DEADLINE: Duration = Duration::from_secs(20);
 /// Page size for the GraphQL pull request commit connection (the GitHub maximum).
 const COMMIT_PAGE: usize = 100;
 const COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){databaseId pullRequest(number:$number){id number state baseRefName headRefOid commits(first:100,after:$after){totalCount nodes{commit{oid}} pageInfo{hasNextPage endCursor}}}}}";
@@ -35,6 +42,7 @@ pub struct GitHub {
     pub base: String,
     pub app_id: String,
     pub membership_deadline: Duration,
+    pub ancestry_deadline: Duration,
     key: EncodingKey,
 }
 pub fn escape(s: &str) -> String {
@@ -51,6 +59,7 @@ impl GitHub {
             base,
             app_id,
             membership_deadline: MEMBERSHIP_DEADLINE,
+            ancestry_deadline: ANCESTRY_DEADLINE,
             key,
         }
     }
@@ -65,6 +74,7 @@ impl GitHub {
             base: "https://api.github.com".into(),
             app_id: required("GITHUB_APP_ID")?,
             membership_deadline: MEMBERSHIP_DEADLINE,
+            ancestry_deadline: ANCESTRY_DEADLINE,
             key: EncodingKey::from_rsa_pem(&std::fs::read(required("GITHUB_KEY_FILE")?)?)?,
         })
     }
@@ -204,6 +214,92 @@ impl GitHub {
             None,
         )
         .await
+    }
+    /// A commit list is a reachability page, not a first-parent path. Keep its verified parent
+    /// links by SHA and follow those links independently of the page order.
+    async fn ancestors(&self, r: &Repository, commit: &Value, token: &str) -> Result<Vec<String>> {
+        fn first_parent(commit: &Value) -> Result<Option<String>> {
+            let parents = commit["parents"]
+                .as_array()
+                .ok_or_else(Fault::unavailable)?;
+            parents
+                .first()
+                .map(|parent| {
+                    parent["sha"]
+                        .as_str()
+                        .filter(|sha| crate::valid_sha(sha))
+                        .map(str::to_owned)
+                        .ok_or_else(Fault::unavailable)
+                })
+                .transpose()
+        }
+
+        let mut next = first_parent(commit)?;
+        if next.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut listed = HashMap::<String, Value>::new();
+        for page in 1..=MAX_ANCESTORS / COMMIT_PAGE {
+            let rows = self
+                .call(
+                    "GET",
+                    &format!(
+                        "{}/commits?sha={}&per_page={COMMIT_PAGE}&page={page}",
+                        path(r),
+                        escape(string(commit, "sha"))
+                    ),
+                    token,
+                    None,
+                )
+                .await?;
+            let rows = rows
+                .as_array()
+                .filter(|rows| rows.len() <= COMMIT_PAGE)
+                .ok_or_else(Fault::unavailable)?;
+            for row in rows {
+                let sha = string(row, "sha");
+                if !crate::valid_sha(sha) {
+                    return Err(Fault::unavailable());
+                }
+                first_parent(row)?;
+                if sha == string(commit, "sha") && row["parents"] != commit["parents"] {
+                    return Err(Fault::unavailable());
+                }
+                if let Some(previous) = listed.insert(sha.to_owned(), row.clone())
+                    && previous["parents"] != row["parents"]
+                {
+                    return Err(Fault::unavailable());
+                }
+            }
+            if rows.len() < COMMIT_PAGE {
+                break;
+            }
+        }
+        let mut ancestors = Vec::with_capacity(MAX_ANCESTORS);
+        let mut seen = HashSet::new();
+        while let Some(sha) = next {
+            if !seen.insert(sha.clone()) {
+                return Err(Fault::unavailable());
+            }
+            let parent = if let Some(parent) = listed.get(&sha) {
+                parent.clone()
+            } else {
+                let parent = self.commit(r, &sha, token).await?;
+                if string(&parent, "sha") != sha {
+                    return Err(Fault::unavailable());
+                }
+                parent
+            };
+            next = first_parent(&parent)?;
+            ancestors.push(sha);
+            if ancestors.len() == MAX_ANCESTORS {
+                if next.is_some() {
+                    tracing::info!(category = "ancestry_truncated", depth = MAX_ANCESTORS);
+                }
+                break;
+            }
+        }
+        Ok(ancestors)
     }
     /// Loads the commit at the exact head of `branch`.
     ///
@@ -432,7 +528,7 @@ impl GitHub {
     }
     async fn resolve_inner(&self, r: &Repository, c: &Context) -> Result<(Vec<String>, String)> {
         let token = self.installation(&r.installation_id).await?;
-        let mut commit = self.commit(r, &c.commit, &token).await?;
+        let commit = self.commit(r, &c.commit, &token).await?;
         if string(&commit, "sha") != c.commit {
             return Err(Fault::unavailable());
         }
@@ -500,11 +596,19 @@ impl GitHub {
                 "commit is not on the branch first-parent path",
             ));
         }
-        let mut parents = Vec::new();
-        while let Some(sha) = commit["parents"][0]["sha"].as_str().map(str::to_owned) {
-            parents.push(sha.clone());
-            commit = self.commit(r, &sha, &token).await?;
-        }
+        let parents =
+            match tokio::time::timeout(self.ancestry_deadline, self.ancestors(r, &commit, &token))
+                .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::warn!(
+                        category = "ancestry_deadline",
+                        "push ancestry collection exceeded its deadline"
+                    );
+                    return Err(Fault::unavailable());
+                }
+            };
         Ok((parents, c.baseline_commit.clone()))
     }
     pub async fn verify_merge(&self, r: &Repository, merge: &str, head: &str) -> Result<()> {
