@@ -125,7 +125,7 @@ function findTask(tasks, taskId) {
 
 const bundleCases = [
   {
-    taskName: "build",
+    label: "shared TSX",
     sourcePath: "packages/lynx-ui/src/components/button.tsx",
     update(source, marker) {
       const originalClass = '"lui-button",';
@@ -134,7 +134,7 @@ const bundleCases = [
     },
   },
   {
-    taskName: "build:frontend",
+    label: "shared CSS",
     sourcePath: "packages/lynx-ui/src/styles.css",
     update(source, marker) {
       return `${source}\n.${marker} { --${marker}: "included"; }\n`;
@@ -268,46 +268,48 @@ test("AnyDash cached build regression", async (t) => {
     );
   }
 
-  for (const { taskName, sourcePath, update } of bundleCases) {
-    await t.test(
-      `AnyDash ${taskName} rebuilds its bundle after a shared source change`,
-      () => {
-        assertSourceClean(sourcePath);
+  for (const taskName of ["build", "build:frontend"]) {
+    for (const { label, sourcePath, update } of bundleCases) {
+      await t.test(
+        `AnyDash ${taskName} rebuilds its bundle after a ${label} change`,
+        () => {
+          assertSourceClean(sourcePath);
 
-        const sourceFile = join(repositoryRoot, sourcePath);
-        const originalSource = readFileSync(sourceFile);
-        const cacheDirectory = mkdtempSync(
-          join(tmpdir(), `turbo-${taskName.replaceAll(":", "-")}-`),
-        );
-        const marker = `turbo-cache-${taskName.replaceAll(":", "-")}-${process.pid}`;
-
-        try {
-          const baseline = runCachedBuild(taskName, cacheDirectory);
-          assert.match(baseline, /cache miss, executing/);
-
-          let repeated = runCachedBuild(taskName, cacheDirectory);
-          if (!/cache hit, replaying logs/.test(repeated)) {
-            repeated = runCachedBuild(taskName, cacheDirectory);
-          }
-          assert.match(repeated, /cache hit, replaying logs/);
-
-          const originalText = originalSource.toString("utf8");
-          const changedSource = update(originalText, marker);
-          assert.notEqual(changedSource, originalText);
-          writeFileSync(sourceFile, changedSource);
-
-          const changed = runCachedBuild(taskName, cacheDirectory);
-          assert.match(changed, /cache miss, executing/);
-          assert.ok(
-            outputContains(anydashDist, marker),
-            `Expected the rebuilt AnyDash bundle to contain ${marker}`,
+          const sourceFile = join(repositoryRoot, sourcePath);
+          const originalSource = readFileSync(sourceFile);
+          const cacheDirectory = mkdtempSync(
+            join(tmpdir(), `turbo-${taskName.replaceAll(":", "-")}-`),
           );
-        } finally {
-          writeFileSync(sourceFile, originalSource);
-          rmSync(anydashDist, { recursive: true, force: true });
-          rmSync(cacheDirectory, { recursive: true, force: true });
-        }
-      },
-    );
+          const marker = `turbo-cache-${taskName.replaceAll(":", "-")}-${label.replaceAll(" ", "-")}-${process.pid}`;
+
+          try {
+            const baseline = runCachedBuild(taskName, cacheDirectory);
+            assert.match(baseline, /cache miss, executing/);
+
+            let repeated = runCachedBuild(taskName, cacheDirectory);
+            if (!/cache hit, replaying logs/.test(repeated)) {
+              repeated = runCachedBuild(taskName, cacheDirectory);
+            }
+            assert.match(repeated, /cache hit, replaying logs/);
+
+            const originalText = originalSource.toString("utf8");
+            const changedSource = update(originalText, marker);
+            assert.notEqual(changedSource, originalText);
+            writeFileSync(sourceFile, changedSource);
+
+            const changed = runCachedBuild(taskName, cacheDirectory);
+            assert.match(changed, /cache miss, executing/);
+            assert.ok(
+              outputContains(anydashDist, marker),
+              `Expected the rebuilt AnyDash bundle to contain ${marker}`,
+            );
+          } finally {
+            writeFileSync(sourceFile, originalSource);
+            rmSync(anydashDist, { recursive: true, force: true });
+            rmSync(cacheDirectory, { recursive: true, force: true });
+          }
+        },
+      );
+    }
   }
 });
