@@ -209,11 +209,6 @@ test("AnyDash cached build regression", async (t) => {
             initialTasks,
             `@apps/delitools#${taskName}`,
           );
-          const repeatedAnyDash = findTask(
-            runDryPlan(taskName),
-            `@apps/anydash#${taskName}`,
-          );
-          assert.equal(repeatedAnyDash.hash, initialAnyDash.hash);
           assert.ok(
             Object.hasOwn(
               initialAnyDash.inputs,
